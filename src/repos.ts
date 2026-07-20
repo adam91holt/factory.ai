@@ -140,6 +140,12 @@ export function pushBranch(ws: Workspace): void {
   if (!r.ok) throw new Error(`push failed: ${r.out.slice(0, 400)}`);
 }
 
+export function mergePr(repo: string, prUrl: string): { ok: boolean; out: string } {
+  const r = spawnSync("gh", ["pr", "merge", prUrl, "--repo", repo, "--squash", "--delete-branch"],
+    { encoding: "utf8", timeout: 60_000 });
+  return { ok: r.status === 0, out: ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300) };
+}
+
 export function createPr(ws: Workspace, title: string, body: string): string {
   const r = spawnSync("gh", ["pr", "create", "--repo", ws.repo, "--head", ws.branch, "--title", title, "--body", body],
     { cwd: ws.dir, encoding: "utf8", timeout: 60_000 });

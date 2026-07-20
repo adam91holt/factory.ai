@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, testFilesRemoved, pushBranch, createPr, DIFF_FAILED, type Workspace } from "./repos.ts";
+import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { buildReport, type ReportInput } from "./report.ts";
@@ -233,6 +233,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (!config.dryRun) {
       if (guardedStop) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
+      } else if (prUrl && config.autoMergeRepos.includes(repo)) {
+        // Greenfield policy: green + unguarded → the factory merges its own PR.
+        const merged = mergePr(repo, prUrl);
+        if (merged.ok) {
+          await post(issue, `${linear.SENTINEL}\n\n**Auto-merged** (greenfield policy for ${repo}): ${prUrl}`).catch(() => {});
+          const moved = await linear.transition(issue, "done");
+          if (!moved) await linear.transition(issue, "review").catch(() => {});
+        } else {
+          await post(issue, `${linear.SENTINEL}\n\n**Auto-merge failed** (${merged.out}) — falling back to human review: ${prUrl}`).catch(() => {});
+          await linear.transition(issue, "review").catch(() => {});
+        }
       } else {
         const moved = await linear.transition(issue, "review");
         if (!moved) console.error(`[${issue.identifier}] no review-type state on team — left in working state`);

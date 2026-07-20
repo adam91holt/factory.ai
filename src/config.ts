@@ -50,7 +50,10 @@ export const config = {
     wipLimit: num("WIP_LIMIT", 4),
   },
 
-  proxyAll: (process.env.PROXY_ALL ?? "1") !== "0", // route ALL stages via CLIProxyAPI (multi-account pooling)
+  proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
+  // Repos where the factory may merge its own green, unguarded PRs (greenfield/
+  // fun). DEFAULT for every other repo: human merges — the review gate stands.
+  autoMergeRepos: (process.env.MERGE_AUTO_REPOS ?? "").split(",").map((r) => r.trim()).filter(Boolean), // route ALL stages via CLIProxyAPI (multi-account pooling)
   watchIntervalSeconds: Math.max(30, num("WATCH_INTERVAL_SECONDS", 60)),
   idleIntervalSeconds: Math.max(10, num("WATCH_INTERVAL_IDLE_SECONDS", 15)), // fast poll when nothing is in flight
   oneShot: process.argv.includes("--once"),

@@ -183,7 +183,7 @@ export async function getIssueDetail(key: string): Promise<IssueDetail> {
   };
 }
 
-export type StateKind = "queue" | "working" | "review";
+export type StateKind = "queue" | "working" | "review" | "done";
 
 /** Resolve a team state by TYPE with name as tiebreak only (C13/M4). */
 async function resolveState(issue: Issue, kind: StateKind): Promise<{ id: string; name: string } | null> {
@@ -194,6 +194,7 @@ async function resolveState(issue: Issue, kind: StateKind): Promise<{ id: string
     return states.find((s) => s.type === "unstarted" && s.name === "Todo")
       ?? states.find((s) => s.type === "unstarted") ?? null;
   }
+  if (kind === "done") return states.find((s) => s.type === "completed") ?? null;
   const started = states.filter((s) => s.type === "started").sort((a, b) => a.position - b.position);
   if (kind === "working") {
     return started.find((s) => s.name === "In Progress") ?? started[0] ?? null;
