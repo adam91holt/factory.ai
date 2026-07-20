@@ -49,3 +49,24 @@ Output: files 1–2 contract-conforming epics/tickets (game modes, polish, or fa
 ## Stop conditions & review
 
 This plan is scaffolding too. Re-read at each model generation; delete what the harness has absorbed; the charter file and merge policy are the only parts meant to be permanent.
+
+## Groundskeeper spec v2 (Adam, 2026-07-20 late — supersedes the single-loop sketch above)
+
+**Per-project loop masters, config-defined:** `groundskeepers/<name>.md` — one card per project/venture, same pattern as agent cards:
+```yaml
+---
+name: kiwi-quest
+enabled: false            # ships disabled; flipping this is a deliberate act
+schedule: "0 7 * * *"     # cron, per-groundskeeper
+team: FAC                 # Linear team it files into
+repos: [adam91holt/kiwi-quest]
+model: claude-fable-5     # the loop master's own mind
+agents: [scout, design-reviewer]   # cards it may consult during its review
+tools: [Read, Glob, Grep, WebSearch]
+budget: { perRun: 3, weekly: 15 }  # its own envelope, USD-notional
+maxTicketsPerRun: 2
+---
+<charter body: goals, taste bar, what "worth doing" means for THIS project,
+what to monitor (telemetry queries, repo health), anti-goals>
+```
+**Daemon**: a cron evaluator tick reads the registry; due + enabled groundskeepers run as a stage (Fable-class by default): review the project (repos, board, SQLite telemetry, past closeouts) → file 0..maxTickets contract-conforming tickets into its team → log "nothing worth doing" with reasoning as a first-class outcome. Governance unchanged and non-negotiable: envelope exhausted → sleep; human tickets outrank; skip run when the team's pr_open/needs_human pile exceeds the attention cap; skip + file repair tickets instead when parks spike. Absorber note: schedule layer → first-party Routines when mature; the cards and charters are the durable part.
