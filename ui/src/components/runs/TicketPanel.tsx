@@ -22,6 +22,9 @@ function Row({ item, tag }: { item: Lineage; tag: string }) {
 }
 
 export function TicketPanel({ issueKey }: { issueKey: string }) {
+  // Groundskeeper runs (GK-<card>) have no Linear issue behind them; only real
+  // ABC-123 identifiers can resolve — skip the fetch instead of 400ing.
+  const isLinearKey = /^[A-Z]+-\d+$/.test(issueKey);
   const { data, isError } = useQuery<IssueDetail>({
     queryKey: ["issue", issueKey],
     queryFn: async () => {
@@ -31,7 +34,9 @@ export function TicketPanel({ issueKey }: { issueKey: string }) {
     },
     staleTime: 60_000,
     retry: 1,
+    enabled: isLinearKey,
   });
+  if (!isLinearKey) return null;
   if (isError) return null; // endpoint absent until daemon restart — hide quietly
   if (!data) return null;
   return (

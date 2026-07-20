@@ -1,12 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace } from "./repos.ts";
+import { ensureWorkspace, resetWorkspaceToBase } from "./repos.ts";
 import { isEligible } from "./loop.ts";
-import { runStage, untrusted } from "./agents.ts";
-import { stageSpendForIssueSince, parkedRunsSince, getTelemetry } from "./db.ts";
+import { runStage, untrusted, redactSecrets } from "./agents.ts";
+import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry } from "./db.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // Groundskeepers — per-project loop MASTERS (roadmap "Groundskeeper spec v2").
@@ -87,9 +87,16 @@ function parseCard(raw: string, fallbackName: string): GroundskeeperCard | null 
   const perRun = typeof budgetRaw.perRun === "number" && Number.isFinite(budgetRaw.perRun) ? budgetRaw.perRun : 3;
   const weekly = typeof budgetRaw.weekly === "number" && Number.isFinite(budgetRaw.weekly) ? budgetRaw.weekly : 15;
   const maxTickets = Number(fields.maxTicketsPerRun);
+  // enabled: fail closed — ONLY a bare, unquoted `true` arms a card. But a
+  // silent no-op on `yes`/`1`/`"true"` is the kill-list's "owner arms a card,
+  // nothing happens, no log" — warn loudly on anything unrecognized.
+  const enabledRaw = (fields.enabled ?? "").trim();
+  if (enabledRaw !== "" && !["true", "false"].includes(enabledRaw.toLowerCase())) {
+    console.error(`[groundskeeper] ${fallbackName}: unrecognized enabled value ${JSON.stringify(enabledRaw)} — treating as FALSE (only a bare \`true\` enables)`);
+  }
   return {
     name: stripQuotes(fields.name ?? fallbackName) || fallbackName,
-    enabled: (fields.enabled ?? "").toLowerCase() === "true",
+    enabled: enabledRaw.toLowerCase() === "true",
     schedule: stripQuotes(fields.schedule ?? ""),
     team: stripQuotes(fields.team ?? ""),
     repos: parseList(fields.repos ?? "[]"),
@@ -102,6 +109,11 @@ function parseCard(raw: string, fallbackName: string): GroundskeeperCard | null 
   };
 }
 
+// card.name flows into rmSync(join(...), { recursive, force }), git branch
+// names, the state key, and the GK-<name> budget envelope — a traversal like
+// `name: ../..` would aim a recursive force-delete at $HOME. Charset-locked.
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 /** Load every groundskeepers/<name>.md. Malformed cards are skipped (logged),
  *  never fatal — a broken card must not take the daemon down. */
 export function loadGroundskeepers(): GroundskeeperCard[] {
@@ -112,11 +124,29 @@ export function loadGroundskeepers(): GroundskeeperCard[] {
     return [];
   }
   const cards: GroundskeeperCard[] = [];
+  const seen = new Set<string>();
   for (const f of files.sort()) {
     try {
       const card = parseCard(readFileSync(join(GROUNDSKEEPERS_DIR, f), "utf8"), f.slice(0, -3));
-      if (card && card.name && card.schedule && card.team) cards.push(card);
-      else console.error(`[groundskeeper] ${f}: missing name/schedule/team — skipped`);
+      if (!card || !card.name || !card.schedule || !card.team) {
+        console.error(`[groundskeeper] ${f}: missing name/schedule/team — skipped`);
+        continue;
+      }
+      if (!NAME_RE.test(card.name)) {
+        console.error(`[groundskeeper] ${f}: invalid name ${JSON.stringify(card.name)} (must match ${NAME_RE}) — skipped`);
+        continue;
+      }
+      const cronError = validateCron(card.schedule);
+      if (cronError) {
+        console.error(`[groundskeeper] ${f}: bad schedule ${JSON.stringify(card.schedule)} — ${cronError} — skipped`);
+        continue;
+      }
+      if (seen.has(card.name)) {
+        console.error(`[groundskeeper] ${f}: duplicate name "${card.name}" (state/budget keys would collide) — skipped`);
+        continue;
+      }
+      seen.add(card.name);
+      cards.push(card);
     } catch (error) {
       console.error(`[groundskeeper] failed to read ${f}: ${error instanceof Error ? error.message : error}`);
     }
@@ -137,6 +167,9 @@ export function loadGroundskeepers(): GroundskeeperCard[] {
 function fieldMatches(field: string, value: number): boolean {
   for (const part of field.split(",")) {
     const p = part.trim();
+    // Empty list elements ("9,17," / ",") must NOT match: Number("") === 0, so
+    // a trailing-comma typo would silently add midnight/Sunday firings.
+    if (p === "") continue;
     if (p === "*") return true;
     const step = p.match(/^\*\/(\d+)$/);
     if (step) {
@@ -144,10 +177,40 @@ function fieldMatches(field: string, value: number): boolean {
       if (n > 0 && value % n === 0) return true;
       continue;
     }
-    const n = Number(p);
-    if (Number.isInteger(n) && n === value) return true;
+    // Strict digits only — Number() would also accept "0x5", "1e1", "1.0".
+    if (/^\d+$/.test(p) && Number(p) === value) return true;
   }
   return false;
+}
+
+const CRON_FIELD_RANGES: ReadonlyArray<readonly [name: string, lo: number, hi: number]> = [
+  ["minute", 0, 59], ["hour", 0, 23], ["day-of-month", 1, 31], ["month", 1, 12], ["day-of-week", 0, 6],
+];
+
+/** Validate an expression against EXACTLY the grammar cronMatches implements.
+ * Anything else (ranges, names, dow 7, 6 fields, out-of-range, empty list
+ * elements) is rejected LOUDLY at card load — the alternative is an enabled
+ * card that silently never fires. Returns an error string, or null when valid. */
+export function validateCron(expr: string): string | null {
+  const fields = expr.trim().split(/\s+/);
+  if (fields.length !== 5) return `expected 5 fields, got ${fields.length}`;
+  for (let i = 0; i < 5; i++) {
+    const [name, lo, hi] = CRON_FIELD_RANGES[i]!;
+    for (const part of fields[i]!.split(",")) {
+      const p = part.trim();
+      if (p === "") return `${name}: empty list element`;
+      if (p === "*") continue;
+      const step = p.match(/^\*\/(\d+)$/);
+      if (step) {
+        if (Number(step[1]) < 1) return `${name}: */0 is invalid`;
+        continue;
+      }
+      if (!/^\d+$/.test(p)) return `${name}: unsupported token "${p}" (only *, */n, integers, comma-lists; no ranges/names)`;
+      const n = Number(p);
+      if (n < lo || n > hi) return `${name}: ${n} out of range ${lo}-${hi}`;
+    }
+  }
+  return null;
 }
 
 export function cronMatches(expr: string, date: Date): boolean {
@@ -162,33 +225,60 @@ export function cronMatches(expr: string, date: Date): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Last-run state. One minute-bucket per card, persisted under FACTORY_WORK_ROOT
-// so a card can't run twice within the same cron minute — even across restarts
-// (marked BEFORE the run, so a crash mid-run never re-fires the same window).
+// Last-run state. One minute-bucket per card plus the catch-up cursor,
+// persisted under FACTORY_WORK_ROOT so a card can't run twice within the same
+// cron minute — even across restarts (marked BEFORE the run, so a crash
+// mid-run never re-fires the same window). Writes are atomic (tmp + rename);
+// an existing-but-unreadable file fails CLOSED for the tick, never open.
 // ---------------------------------------------------------------------------
 
 interface RunState { lastRunMinute: string; lastRunAt: number }
+interface GkState {
+  /** Epoch ms of the last cron evaluation — the catch-up scan resumes here. */
+  lastEvaluatedAt: number | null;
+  cards: Record<string, RunState>;
+}
 
 function minuteBucket(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function readState(): Record<string, RunState> {
+/** Missing file → fresh state. Existing-but-unreadable file → null, and the
+ *  caller must SKIP the tick (a vanished dedupe history re-fires any matching
+ *  window — fail-open on a spend guard). Tolerates the legacy flat-map shape. */
+function readState(): GkState | null {
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(STATE_FILE, "utf8")) as unknown;
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, RunState>) : {};
+    raw = readFileSync(STATE_FILE, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { lastEvaluatedAt: null, cards: {} } : null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed.cards === "object" && parsed.cards !== null) {
+      return {
+        lastEvaluatedAt: typeof parsed.lastEvaluatedAt === "number" ? parsed.lastEvaluatedAt : null,
+        cards: parsed.cards as Record<string, RunState>,
+      };
+    }
+    return { lastEvaluatedAt: null, cards: parsed as unknown as Record<string, RunState> }; // legacy flat map
   } catch {
-    return {};
+    return null;
   }
 }
 
-function writeState(state: Record<string, RunState>): void {
+function writeState(state: GkState): boolean {
   try {
     mkdirSync(config.workRoot, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const tmp = `${STATE_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    renameSync(tmp, STATE_FILE); // atomic on the same filesystem — no torn state file
+    return true;
   } catch (error) {
     console.error(`[groundskeeper] state write failed: ${error instanceof Error ? error.message : error}`);
+    return false;
   }
 }
 
@@ -205,43 +295,95 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
   };
 }
 
+const MINUTE_MS = 60_000;
+let storeClosedWarned = false;
+
 /**
  * Evaluate the registry once per daemon tick. Returns immediately at ZERO cost
  * when the global gate is off. At most ONE loop-master STAGE runs per tick
  * (cheap governance skips fall through to the next due card), mirroring
  * stewardTick's one-heavy-op-per-tick discipline.
+ *
+ * Scheduling is CATCH-UP based: a tick can straddle a scheduled minute (model
+ * stages run for minutes; Linear backoff sleeps 300 s), so every minute since
+ * the last evaluation (capped at 24 h) is tested — a straddled window fires
+ * late instead of silently vanishing for a day/week. Multiple missed windows
+ * collapse into ONE run (newest matching minute wins).
  */
 export async function groundskeeperTick(): Promise<void> {
   if (!config.groundskeepersEnabled) return; // global kill-switch — no Linear, no db, no spend
   const cards = loadGroundskeepers().filter((c) => c.enabled);
   if (cards.length === 0) return;
 
-  const now = new Date();
-  const minute = minuteBucket(now);
-  const state = readState();
+  // Fail CLOSED when the durable event store is not open: the weekly budget
+  // envelope and parks-spike gates read from it, and a closed store would read
+  // "$0 spent, 0 parks" forever — the gates would silently vanish.
+  if (!eventStoreOpen()) {
+    if (!storeClosedWarned) {
+      storeClosedWarned = true;
+      console.error("[groundskeeper] event store closed (dashboard disabled?) — REFUSING to run: budget/parks gates unenforceable");
+    }
+    return;
+  }
 
+  const state = readState();
+  if (state === null) {
+    // Exists but unreadable: skip this tick (fail closed) and move the corrupt
+    // file aside so the next tick starts from clean, loudly-logged state.
+    console.error(`[groundskeeper] state file unreadable — skipping tick, moving it to ${STATE_FILE}.corrupt`);
+    try { renameSync(STATE_FILE, `${STATE_FILE}.corrupt`); } catch { /* next tick skips again */ }
+    return;
+  }
+
+  const nowMs = Date.now();
+  // INCLUSIVE lower bound: the minute containing lastEvaluatedAt is re-tested so
+  // a card that was due but not reached (an earlier card took the tick's one
+  // run slot) fires next tick; lastRunMinute dedupe blocks genuine re-fires.
+  // First armed tick (or a >24h gap, or a backwards clock step) scans only the
+  // current minute — never a day of history, never re-fires on clock rewind.
+  const scanFromMs = Math.min(nowMs, Math.max(state.lastEvaluatedAt ?? nowMs, nowMs - DAY_MS));
+  const firstBucket = Math.floor(scanFromMs / MINUTE_MS);
+  const lastBucket = Math.floor(nowMs / MINUTE_MS);
+  state.lastEvaluatedAt = nowMs;
+
+  let dirty = true; // cursor advanced — persist even when nothing fires
   for (const card of cards) {
-    if (!cronMatches(card.schedule, now)) continue;
-    if (state[card.name]?.lastRunMinute === minute) continue; // already handled this cron-minute
-    // Mark BEFORE running so a crash mid-run cannot re-fire this window.
-    state[card.name] = { lastRunMinute: minute, lastRunAt: Date.now() };
-    writeState(state);
+    let due: Date | null = null;
+    for (let b = lastBucket; b >= firstBucket; b--) {
+      const d = new Date(b * MINUTE_MS);
+      if (cronMatches(card.schedule, d)) { due = d; break; } // newest match wins
+    }
+    if (!due) continue;
+    const bucket = minuteBucket(due);
+    if (state.cards[card.name]?.lastRunMinute === bucket) continue; // already handled this cron-minute
+    // Mark BEFORE running so a crash mid-run cannot re-fire this window; if the
+    // mark cannot be persisted, do NOT run — an unrecorded run can double-fire.
+    state.cards[card.name] = { lastRunMinute: bucket, lastRunAt: nowMs };
+    if (!writeState(state)) {
+      console.error(`[gk:${card.name}] cannot persist run state — refusing to run unrecorded`);
+      return;
+    }
+    dirty = false;
     const ran = await runGroundskeeper(card).catch((error) => {
       console.error(`[gk:${card.name}] ${error instanceof Error ? error.message : error}`);
       return false;
     });
     if (ran) return; // one heavy run per tick
   }
+  if (dirty) writeState(state);
 }
 
 /** Returns true iff the loop-master stage actually ran (governance passed). */
 async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   const issueKey = `GK-${card.name}`;
 
-  // (a) Weekly budget envelope — this card's own run_stage_finished spend.
+  // (a) Weekly budget envelope — this card's own run_stage_finished spend, AND
+  // a pessimistic runs × perRun bound: aborted/crashed stages record costUsd 0
+  // despite real API spend, so recorded dollars alone would under-count.
   const spent = stageSpendForIssueSince(issueKey, Date.now() - WEEK_MS);
-  if (spent >= card.budget.weekly) {
-    console.log(`[gk:${card.name}] weekly budget exhausted ($${spent.toFixed(2)} of $${card.budget.weekly}) — sleeping`);
+  const runCount = stageRunCountForIssueSince(issueKey, Date.now() - WEEK_MS);
+  if (spent >= card.budget.weekly || runCount * card.budget.perRun >= card.budget.weekly) {
+    console.log(`[gk:${card.name}] weekly budget exhausted ($${spent.toFixed(2)} recorded, ${runCount} run(s) × $${card.budget.perRun} of $${card.budget.weekly}) — sleeping`);
     return false;
   }
 
@@ -253,12 +395,19 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     return false;
   }
 
-  // (c) Attention cap — don't add to a full human review pile.
-  const [needsHuman, parked, inReview] = await Promise.all([
+  // (c) Attention cap — don't add to a full human review pile. Labels survive
+  // on completed/cancelled issues, so filter to OPEN issues or six stale labels
+  // would sleep the card forever. NOTE: the in-review leg counts started-type
+  // states NAMED like "review" (fetchTeamInReview) — a team whose review column
+  // has another name contributes 0 to this leg by design.
+  const [needsHumanAll, parkedAll, inReview] = await Promise.all([
     linear.fetchByLabel(linear.NEEDS_HUMAN_LABEL, [card.team]),
     linear.fetchByLabel(linear.PARKED_LABEL, [card.team]),
     linear.fetchTeamInReview(card.team),
   ]);
+  const open = (i: linear.Issue): boolean => i.stateType !== "completed" && i.stateType !== "canceled";
+  const needsHuman = needsHumanAll.filter(open);
+  const parked = parkedAll.filter(open);
   const attention = new Set([...needsHuman, ...parked, ...inReview].map((i) => i.identifier));
   if (attention.size > 5) {
     console.log(`[gk:${card.name}] attention pile ${attention.size} > 5 — skipping`);
@@ -266,26 +415,37 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   }
 
   // (d) Parks-spike — a struggling factory files repair tickets, not ambitions.
-  const parkSpike = parkedRunsSince(Date.now() - DAY_MS) > 3;
+  const parksLast24h = parkedRunsSince(Date.now() - DAY_MS);
+  const parkSpike = parksLast24h > 3;
 
   const repo = card.repos[0] ?? "";
   const outDir = join(config.workRoot, ".groundskeeper-scratch", card.name);
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(join(outDir, "tickets"), { recursive: true });
 
-  // cwd = a throwaway worktree of the first repo (read-only; never pushed). No
-  // repo → the scratch dir, so a board/telemetry-only groundskeeper still runs.
+  // cwd = a throwaway worktree of the first repo (read-only; never pushed),
+  // hard-reset to origin's CURRENT head each run — a reused worktree must not
+  // review the frozen snapshot it was created from. Workspace failure SKIPS the
+  // run: reviewing an empty scratch dir would file tickets grounded in nothing.
+  // No repo configured → the scratch dir, so a board/telemetry-only
+  // groundskeeper still runs.
   let cwd = outDir;
   if (repo) {
     try {
-      cwd = (await ensureWorkspace(repo, `${card.name}-gk`)).dir;
+      const ws = await ensureWorkspace(repo, `${card.name}-gk`);
+      resetWorkspaceToBase(ws);
+      cwd = ws.dir;
     } catch (error) {
-      console.error(`[gk:${card.name}] workspace for ${repo} failed, using scratch cwd: ${error instanceof Error ? error.message : error}`);
+      console.error(`[gk:${card.name}] workspace for ${repo} failed — skipping run: ${error instanceof Error ? error.message : error}`);
+      return false;
     }
   }
 
-  // Read tools ∩ card list, PLUS Write (output files only — no Bash ever).
-  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), "Write"])];
+  // Read tools ∩ card list, PLUS Write SCOPED to the scratch dir (`//` = absolute
+  // path in permission-rule syntax). A bare "Write" under dontAsk would let a
+  // prompt-injected run rewrite groundskeepers/*.md (self-arming), the state
+  // file, or factory src — output files only, no Bash ever.
+  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), `Write(/${outDir}/**)`])];
 
   const tel = getTelemetry();
   const telSummary = [
@@ -293,7 +453,7 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     `Outcomes: pr_open ${tel.outcomes.pr_open}, planned ${tel.outcomes.planned}, parked ${tel.outcomes.parked}, needs_human ${tel.outcomes.needs_human}, aborted ${tel.outcomes.aborted}.`,
     tel.parkReasons.length ? `Top park reasons: ${tel.parkReasons.map((p) => `"${p.reason}" (${p.count})`).join("; ")}.` : "No park reasons recorded.",
     `Last 7 days spend: ${tel.daily.map((d) => `${d.date} $${d.costUsd.toFixed(2)}`).join(", ")}.`,
-    `Parks in last 24h: ${parkedRunsSince(Date.now() - DAY_MS)}. This card's 7-day spend: $${spent.toFixed(2)} of $${card.budget.weekly}.`,
+    `Parks in last 24h: ${parksLast24h}. This card's 7-day spend: $${spent.toFixed(2)} of $${card.budget.weekly}.`,
   ].join("\n");
   const boardSummary = [
     `Team ${card.team}: ${queue.length} unstarted ticket(s) (0 eligible+unclaimed, else this run would not happen), ${inReview.length} in review, ${parked.length} parked, ${needsHuman.length} needs-human.`,
@@ -332,7 +492,10 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   });
 
   const finish = (outcome: "planned" | "parked", reason: string): void => {
-    bus.emit({ type: "run_finished", issueKey, outcome, reason, prUrl: null,
+    // reason carries model-written decision text or error strings that can
+    // interpolate Linear HTTP bodies — redact at the emit seam like every other
+    // emitted string (§2.2).
+    bus.emit({ type: "run_finished", issueKey, outcome, reason: redactSecrets(reason).clean.slice(0, 300), prUrl: null,
       costUsd: stage.costUsd, stages: [toStageMeta(stage)], gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
   };
 
@@ -354,11 +517,29 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     if (config.dryRun) {
       console.log(`[gk:${card.name}] dry-run: would file ${Math.min(ticketFiles.length, card.maxTicketsPerRun)} ticket(s)`);
     } else {
+      // Humans-outrank is re-checked at FILE time, not only at run start — the
+      // stage can hold the token for up to 45 min, and a human ticket that
+      // arrived meanwhile must not queue behind machine-generated work.
+      const freshHuman = (await linear.fetchTeamQueue(card.team)).filter((i) => isEligible(i));
+      if (freshHuman.length > 0) {
+        const held = `held ${Math.min(ticketFiles.length, card.maxTicketsPerRun)} drafted ticket(s) — ${freshHuman.length} human ticket(s) arrived mid-run`;
+        console.log(`[gk:${card.name}] ${held}`);
+        finish("planned", held);
+        return true;
+      }
       for (const f of ticketFiles.slice(0, card.maxTicketsPerRun)) {
         const body = readFileSync(join(ticketsDir, f), "utf8").trim();
         const lines = body.split("\n");
-        const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
-        const description = lines.slice(1).join("\n").trim();
+        // Ticket files are MODEL-WRITTEN after reading untrusted repo/web
+        // content — redact like every other outbound surface (loop.ts post()),
+        // and cap lengths so a runaway file can't flood Linear.
+        const titleR = redactSecrets((lines[0] ?? "").replace(/^#\s*/, "").trim());
+        const descR = redactSecrets(lines.slice(1).join("\n").trim());
+        if (titleR.found + descR.found > 0) {
+          console.error(`[gk:${card.name}] redacted ${titleR.found + descR.found} secret-like string(s) from drafted ticket ${f}`);
+        }
+        const title = titleR.clean.slice(0, 250);
+        const description = descR.clean.slice(0, 10_000);
         if (title && description.length > 50) created.push(await linear.createIssue(card.team, title, description));
       }
     }

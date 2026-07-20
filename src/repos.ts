@@ -82,6 +82,17 @@ function buildWorkspace(repo: string, issueKey: string): Workspace {
   return { repo, dir, branch, baseRef };
 }
 
+/** Hard-reset a REUSED throwaway worktree to origin's current default head.
+ * buildWorkspace already fetched the bare repo, so baseRef is fresh; without
+ * this a long-lived worktree (the groundskeeper's `<name>-gk`) reviews the
+ * frozen snapshot it was created from forever. Never used on issue worktrees —
+ * those carry real branch work that must not be discarded. */
+export function resetWorkspaceToBase(ws: Workspace): void {
+  const reset = git(ws.dir, ["reset", "--hard", ws.baseRef]);
+  if (!reset.ok) throw new Error(`reset to ${ws.baseRef} failed: ${reset.out.slice(0, 300)}`);
+  git(ws.dir, ["clean", "-fd"]); // stale untracked files from prior runs; best-effort
+}
+
 export function commitAll(ws: Workspace, message: string): boolean {
   git(ws.dir, ["add", "-A"]);
   // --no-verify: repo-committed hooks are repo-controlled code execution in the
@@ -115,7 +126,10 @@ export function guardedPathsTouched(ws: Workspace): string[] {
   const diff = git(ws.dir, ["diff", "--name-only", base, "HEAD"]);
   if (!diff.ok) return [DIFF_FAILED];
   const files = diff.stdout.split("\n").filter(Boolean);
-  const guards = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
+  // groundskeepers/ and agents/ are the factory's own spend governors and role
+  // definitions — a PR that flips `enabled:` or raises `budget:` must never
+  // auto-merge without a human (machine self-arming).
+  const guards = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
   return files.filter((f) => guards.some((g) => g.test(f)));
 }
 

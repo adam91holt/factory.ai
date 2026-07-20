@@ -340,7 +340,10 @@ export function startDashboard(): {
 
     if (url.pathname === "/run-events") {
       const key = url.searchParams.get("key") ?? "";
-      if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
+      // Wider than /issue: groundskeeper runs use GK-<card-name> issueKeys and
+      // their events live in the same local sqlite log. /issue stays strict —
+      // it forwards to Linear, where only ABC-123 identifiers exist.
+      if (!/^[A-Z]+-[A-Za-z0-9-]{1,80}$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(issueEvents(key)));
       return;

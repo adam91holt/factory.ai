@@ -48,10 +48,17 @@ export function issueEvents(issueKey: string, limit = 2000): unknown[] {
 // Groundskeeper governance reads (owner request 2026-07-20). Read-only queries
 // over the same durable log the daemon already writes — the loop masters never
 // open their own handle, so a running daemon's factory.db is never touched by a
-// second writer. When the store is closed (dashboard disabled) these return the
-// conservative zero: budget checks see "nothing spent", the parks-spike signal
-// stays quiet. Indexed by idx_events_issue / idx_events_type.
+// second writer. NOTE: a closed store returning 0 here would be fail-OPEN for
+// the budget gate ("nothing spent" forever) — that is why groundskeeperTick
+// refuses to run at all when eventStoreOpen() is false. Indexed by
+// idx_events_issue / idx_events_type.
 // ---------------------------------------------------------------------------
+
+/** True when the durable event store is open. Budget/parks governance is only
+ *  enforceable with the store open — callers must fail CLOSED when it isn't. */
+export function eventStoreOpen(): boolean {
+  return db !== null;
+}
 
 /** Sum of run_stage_finished costUsd for one issueKey (e.g. "GK-kiwi-quest")
  *  since `sinceMs`. Backs a groundskeeper's weekly budget envelope. */
@@ -65,6 +72,18 @@ export function stageSpendForIssueSince(issueKey: string, sinceMs: number): numb
     try { total += num((JSON.parse(r.json) as { costUsd?: unknown }).costUsd); } catch { /* skip one bad row */ }
   }
   return total;
+}
+
+/** Count of run_stage_finished rows for one issueKey since `sinceMs`. Aborted/
+ *  crashed stages record costUsd 0 even though real API spend occurred, so the
+ *  weekly envelope is ALSO bounded by runs × perRun — a reliably-crashing card
+ *  cannot spend unbounded dollars while telemetry reads $0. */
+export function stageRunCountForIssueSince(issueKey: string, sinceMs: number): number {
+  if (!db) return 0;
+  const row = db.prepare(
+    "SELECT COUNT(*) AS n FROM events WHERE type = 'run_stage_finished' AND issue_key = ? AND at >= ?",
+  ).get(issueKey, sinceMs) as { n: number };
+  return row.n;
 }
 
 /** Count of real (non-dry) run_finished parked outcomes since `sinceMs` — the

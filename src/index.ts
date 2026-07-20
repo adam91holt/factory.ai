@@ -65,7 +65,14 @@ async function tick(): Promise<boolean> {
     if (isEligible(issue)) eligible.push(issue);
     else await markNeedsHuman(issue, "ticket does not meet the contract (missing sections or unparseable Repo) — see factory docs/ticket-contract.md");
   }
-  if (eligible.length === 0) { bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 }); return false; }
+  if (eligible.length === 0) {
+    bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 });
+    // Same background passes as the other two return paths — a board holding
+    // only epics/ineligible tickets must not pause steward/groundskeeper forever.
+    await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+    await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
+    return false;
+  }
 
   // Rolling WIP semaphore (owner request): claim whenever capacity exists —
   // never barrier a fast issue behind a slow sibling's completion.
