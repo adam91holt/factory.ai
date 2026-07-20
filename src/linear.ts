@@ -101,15 +101,32 @@ export async function getIssue(id: string): Promise<Issue> {
   return toIssue(data.issue);
 }
 
+const labelCache = new Map<string, string>();
+
 async function labelId(teamKey: string, name: string): Promise<string> {
+  const cached = labelCache.get(`${teamKey}/${name}`);
+  if (cached) return cached;
   const data = await gql<{ issueLabels: { nodes: Array<{ id: string; name: string; team: { key: string } | null }> } }>(
     `query($name: String!) { issueLabels(filter: { name: { eqIgnoreCase: $name } }, first: 10) {
        nodes { id name team { key } } } }`, { name });
   const scoped = data.issueLabels.nodes.find((l) => l.team?.key === teamKey) ?? data.issueLabels.nodes[0];
-  if (scoped) return scoped.id;
-  const created = await gql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
-    `mutation($name: String!) { issueLabelCreate(input: { name: $name }) { issueLabel { id } } }`, { name });
-  return created.issueLabelCreate.issueLabel.id;
+  if (scoped) { labelCache.set(`${teamKey}/${name}`, scoped.id); return scoped.id; }
+  try {
+    const created = await gql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
+      `mutation($name: String!) { issueLabelCreate(input: { name: $name }) { issueLabel { id } } }`, { name });
+    labelCache.set(`${teamKey}/${name}`, created.issueLabelCreate.issueLabel.id);
+    return created.issueLabelCreate.issueLabel.id;
+  } catch (error) {
+    // Concurrent-create race ("duplicate label name"): another claim created it
+    // between our query and create — re-query instead of failing the claim.
+    if (String(error).includes("duplicate")) {
+      const retry = await gql<{ issueLabels: { nodes: Array<{ id: string }> } }>(
+        `query($name: String!) { issueLabels(filter: { name: { eqIgnoreCase: $name } }, first: 1) { nodes { id } } }`, { name });
+      const id = retry.issueLabels.nodes[0]?.id;
+      if (id) { labelCache.set(`${teamKey}/${name}`, id); return id; }
+    }
+    throw error;
+  }
 }
 
 export async function addLabel(issue: Issue, name: string): Promise<void> {

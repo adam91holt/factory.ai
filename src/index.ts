@@ -37,10 +37,10 @@ function acquireLease(): void {
 
 let draining = false;
 
-async function tick(): Promise<void> {
+async function tick(): Promise<boolean> {
   bus.emit({ type: "tick_started" });
   const queue = await fetchQueue();
-  if (queue.length === 0) { bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 }); return; }
+  if (queue.length === 0) { bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 }); return false; }
 
   // Ineligible issues get labeled out of the queue — they never consume WIP
   // slots or starve the FIFO head (C6).
@@ -57,7 +57,7 @@ async function tick(): Promise<void> {
     if (isEligible(issue)) eligible.push(issue);
     else await markNeedsHuman(issue, "ticket does not meet the contract (missing sections or unparseable Repo) — see factory docs/ticket-contract.md");
   }
-  if (eligible.length === 0) { bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 }); return; }
+  if (eligible.length === 0) { bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 }); return false; }
 
   console.log(`[tick] ${eligible.length} eligible (${queue.length - eligible.length} marked needs-human); WIP limit ${config.caps.wipLimit}`);
   const batch = eligible.slice(0, config.caps.wipLimit);
@@ -65,6 +65,7 @@ async function tick(): Promise<void> {
     console.error(`[${issue.identifier}] unhandled: ${error instanceof Error ? error.message : error}`);
   })));
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
+  return batch.length > 0;
 }
 
 async function main(): Promise<void> {
@@ -99,8 +100,9 @@ async function main(): Promise<void> {
 
   do {
     let backoffSeconds = 0;
+    let busy = false;
     try {
-      await tick();
+      busy = await tick();
     } catch (error) {
       if (error instanceof LinearRateLimited) {
         backoffSeconds = 300; // park the whole tick cycle at window scale (C25)
@@ -115,7 +117,10 @@ async function main(): Promise<void> {
       }
     }
     if (config.oneShot || draining) break;
-    await new Promise((resolve) => setTimeout(resolve, (config.watchIntervalSeconds + backoffSeconds) * 1000));
+    // Adaptive polling: fast when idle so new tickets get picked up quickly,
+    // standard cadence while work is in flight.
+    const interval = busy ? config.watchIntervalSeconds : config.idleIntervalSeconds;
+    await new Promise((resolve) => setTimeout(resolve, (interval + backoffSeconds) * 1000));
   } while (!draining);
 
   bus.emit({ type: "daemon_stopped", reason: config.oneShot ? "one_shot" : "drained" });

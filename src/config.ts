@@ -50,7 +50,8 @@ export const config = {
   },
 
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0", // route ALL stages via CLIProxyAPI (multi-account pooling)
-  watchIntervalSeconds: Math.max(60, num("WATCH_INTERVAL_SECONDS", 60)),
+  watchIntervalSeconds: Math.max(30, num("WATCH_INTERVAL_SECONDS", 60)),
+  idleIntervalSeconds: Math.max(10, num("WATCH_INTERVAL_IDLE_SECONDS", 15)), // fast poll when nothing is in flight
   oneShot: process.argv.includes("--once"),
   dryRun: process.argv.includes("--dry-run"),
   serverOnly,
