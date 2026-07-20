@@ -1,4 +1,5 @@
 import { GitPullRequest } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
 import type { RunRecord, StageMeta } from "../../lib/events";
 import { dateTime, usd } from "../../lib/format";
 import { OutcomeBadge } from "../OutcomeBadge";
@@ -32,6 +33,7 @@ function CostSparkbar({ stages }: { stages: StageMeta[] }) {
 }
 
 export function HistoryTable({ records }: { records: RunRecord[] }) {
+  const navigate = useNavigate();
   if (records.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-line p-6 text-center font-mono text-[11px] text-fg-faint">
@@ -59,7 +61,11 @@ export function HistoryTable({ records }: { records: RunRecord[] }) {
           const turns = r.stages.reduce((s, x) => s + x.turns, 0);
           const degraded = r.stages.some((s) => s.degraded);
           return (
-            <TableRow key={`${r.issueKey}-${r.finishedAt}`} className="h-9">
+            <TableRow
+              key={`${r.issueKey}-${r.finishedAt}`}
+              className="h-9 cursor-pointer hover:bg-bg2"
+              onClick={() => void navigate({ to: "/runs/$issueKey", params: { issueKey: r.issueKey } })}
+            >
               <TableCell className="text-[11px]">{dateTime(r.finishedAt)}</TableCell>
               <TableCell className="text-fg">{r.issueKey}</TableCell>
               <TableCell>

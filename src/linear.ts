@@ -141,6 +141,38 @@ export async function removeLabel(issue: Issue, name: string): Promise<void> {
     issueRemoveLabel(id: $issueId, labelId: $labelId) { success } }`, { issueId: issue.id, labelId: id });
 }
 
+export interface IssueDetail {
+  identifier: string; title: string; description: string; url: string;
+  stateName: string; labels: string[];
+  parent: { identifier: string; title: string; stateName: string } | null;
+  children: Array<{ identifier: string; title: string; stateName: string }>;
+  siblings: Array<{ identifier: string; title: string; stateName: string }>;
+}
+
+/** Full ticket content + lineage for the dashboard's run view. */
+export async function getIssueDetail(key: string): Promise<IssueDetail> {
+  interface Node { identifier: string; title: string; state: { name: string } }
+  const data = await gql<{ issue: {
+    identifier: string; title: string; description: string | null; url: string;
+    state: { name: string }; labels: { nodes: Array<{ name: string }> };
+    parent: (Node & { children: { nodes: Node[] } }) | null;
+    children: { nodes: Node[] };
+  } }>(
+    `query($key: String!) { issue(id: $key) {
+      identifier title description url state { name } labels { nodes { name } }
+      parent { identifier title state { name } children { nodes { identifier title state { name } } } }
+      children { nodes { identifier title state { name } } } } }`, { key });
+  const i = data.issue;
+  const flat = (n: Node) => ({ identifier: n.identifier, title: n.title, stateName: n.state.name });
+  return {
+    identifier: i.identifier, title: i.title, description: i.description ?? "", url: i.url,
+    stateName: i.state.name, labels: i.labels.nodes.map((l) => l.name),
+    parent: i.parent ? flat(i.parent) : null,
+    children: i.children.nodes.map(flat),
+    siblings: (i.parent?.children.nodes ?? []).filter((n) => n.identifier !== i.identifier).map(flat),
+  };
+}
+
 export type StateKind = "queue" | "working" | "review";
 
 /** Resolve a team state by TYPE with name as tiebreak only (C13/M4). */

@@ -10,6 +10,11 @@ function currentStage(run: RunView): string {
   return run.stages.length === 0 ? "claiming" : "finishing";
 }
 
+function currentModel(run: RunView): string {
+  const open = [...run.stages].reverse().find((s) => s.finishedAt === null);
+  return open?.model ?? "";
+}
+
 export function LiveRunPill({ run }: { run: RunView }) {
   return (
     <Link
@@ -19,9 +24,12 @@ export function LiveRunPill({ run }: { run: RunView }) {
     >
       <span className="pulse-live size-1.5 shrink-0 rounded-full bg-live" />
       <span className="min-w-0 flex-1">
-        <span className="block font-mono text-xs text-fg">{run.issueKey}</span>
+        <span className="block truncate font-mono text-xs text-fg">
+          {run.issueKey}
+          <span className="ml-1.5 text-[11px] font-normal text-fg-dim">{run.title}</span>
+        </span>
         <span className="block truncate font-mono text-[10.5px] text-fg-faint">
-          {currentStage(run)}
+          {currentStage(run)}{currentModel(run) ? ` @ ${currentModel(run)}` : ""}
         </span>
       </span>
       <span className="pulse-live font-mono text-[10.5px] text-live">{usd(run.costUsd)}</span>

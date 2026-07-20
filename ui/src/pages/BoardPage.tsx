@@ -25,7 +25,7 @@ function ExecutingCard({ run, now }: { run: RunView; now: number }) {
       </div>
       <div className="mt-1 line-clamp-2 text-[12.5px] leading-snug text-fg">{run.title}</div>
       <div className="mt-2 flex items-center justify-between font-mono text-[10.5px] text-fg-faint">
-        <span className="truncate text-live/90">{stage ? stage.stage : "claiming"}</span>
+        <span className="truncate text-live/90">{stage ? `${stage.stage} · ${stage.model}` : "claiming"}</span>
         <span>{secs((now - run.startedAt) / 1000)}</span>
       </div>
     </Link>
@@ -84,9 +84,13 @@ export function BoardPage() {
   const runs = useFactory((s) => Object.values(s.mission.runs));
   const now = useNow(1000);
 
-  const todo = board.filter((i) => i.lane === "todo");
+  // An issue with a live/finished run renders in its run lane only — the queue
+  // snapshot is taken before claims land in the same tick, so without this
+  // filter a claimed issue shows doubled in Todo + Executing.
+  const runKeys = new Set(runs.map((r) => r.issueKey));
+  const todo = board.filter((i) => i.lane === "todo" && !runKeys.has(i.identifier));
   const needsHuman = board.filter((i) => i.lane === "needs_human");
-  const parked = board.filter((i) => i.lane === "parked");
+  const parked = board.filter((i) => i.lane === "parked" && !runKeys.has(i.identifier));
   const executing = runs
     .filter((r) => r.status === "active")
     .sort((a, b) => a.startedAt - b.startedAt);

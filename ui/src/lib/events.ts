@@ -37,7 +37,7 @@ export interface GateMeta {
   outputTail: string;         // last ≤400 chars of failure output, redacted; "" on pass
 }
 
-export type RunOutcome = "pr_open" | "parked" | "needs_human" | "aborted";
+export type RunOutcome = "pr_open" | "planned" | "parked" | "needs_human" | "aborted";
 export type GateStrength = "none" | "weak" | "real";
 export type DaemonMode = "watch" | "once" | "dry";
 

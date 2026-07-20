@@ -1,4 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
+import { getIssueDetail } from "./linear.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -331,6 +332,18 @@ export function startDashboard(): { close(): Promise<void> } | null {
     if (url.pathname === "/state") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(mission));
+      return;
+    }
+
+    if (url.pathname === "/issue") {
+      const key = url.searchParams.get("key") ?? "";
+      if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
+      getIssueDetail(key)
+        .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(detail)); })
+        .catch((error: unknown) => {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: String(error instanceof Error ? error.message : error).slice(0, 200) }));
+        });
       return;
     }
 

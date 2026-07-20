@@ -56,7 +56,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
   const onEvent = forwardStage(issue.identifier);
   const stages: StageResult[] = [];
 
-  const finish = (outcome: "pr_open" | "parked", reason: string): void => {
+  const finish = (outcome: "planned" | "parked", reason: string): void => {
     bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome, reason, prUrl: null,
       costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
       gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
@@ -94,7 +94,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     const children = readChildren(join(scratch, "children"));
     if (config.dryRun) {
       console.log(`[${issue.identifier}] dry-run: would create ${children.length} children: ${children.map((c) => c.title).join(" | ")}`);
-      finish("pr_open", `dry-run: planned ${children.length} children`);
+      finish("planned", `dry-run: planned ${children.length} children`);
       return;
     }
     const created: string[] = [];
@@ -111,7 +111,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     ].join("\n")).catch((e) => console.error(`[${issue.identifier}] plan comment failed: ${e}`));
     await linear.addLabel(issue, linear.PLANNED_LABEL);
     await linear.transition(issue, "working").catch(() => {});
-    finish("pr_open", `planned: ${created.length} children (${created.join(", ")})`);
+    finish("planned", `planned: ${created.length} children (${created.join(", ")})`);
     console.log(`[${issue.identifier}] planned → ${created.join(", ")}`);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);

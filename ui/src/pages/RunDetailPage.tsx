@@ -9,6 +9,7 @@ import { StageTimeline } from "../components/runs/StageTimeline";
 import { ToolFeed } from "../components/runs/ToolFeed";
 import { FindingsPanel } from "../components/runs/FindingsPanel";
 import { GatePanel } from "../components/runs/GatePanel";
+import { TicketPanel } from "../components/runs/TicketPanel";
 import { Card, CardHeader, CardTitle } from "../components/ui/card";
 import { Badge } from "../components/ui/badge";
 
@@ -18,7 +19,8 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
 
   if (!run) {
     return (
-      <div className="mx-auto max-w-xl pt-16 text-center">
+      <div className="mx-auto flex max-w-2xl flex-col gap-4 pt-8">
+        <div className="text-center">
         <div className="font-mono text-sm text-fg-dim">{issueKey}</div>
         <p className="mt-2 font-mono text-[11px] text-fg-faint">
           no run for this issue in the current daemon session — completed runs from earlier
@@ -31,6 +33,8 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
         >
           <ArrowLeft className="size-3" /> all runs
         </Link>
+        </div>
+        <TicketPanel issueKey={issueKey} />
       </div>
     );
   }
@@ -104,6 +108,7 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
               <CardTitle>Gates</CardTitle>
             </CardHeader>
             <GatePanel run={run} />
+          <TicketPanel issueKey={run.issueKey} />
           </Card>
         </div>
       </div>
