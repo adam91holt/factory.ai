@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "./agents.ts";
+import { invalidateCard } from "./catalog.ts";
 import { catalogUsage, type CardUsage } from "./db.ts";
 import { validateGroundskeeperContent, type GroundskeeperCard } from "./groundskeepers.ts";
 
@@ -199,6 +200,27 @@ export function saveCatalogEntry(input: unknown): SaveResult {
   if (kind === "groundskeeper") {
     const v = validateGroundskeeperContent(content, name);
     if (!v.ok) return bad(422, `groundskeeper card invalid: ${v.error}`);
+    // Privilege-escalation ceiling on the write route. A groundskeeper's
+    // `enabled`/`model`/`budget`/`schedule` are load-bearing at run time (unlike
+    // agent cards, whose model/tools are reference-only). ARMING is therefore an
+    // on-disk-only action: this browser-reachable route must never flip a card
+    // live ("self-arming groundskeeper via the owner's browser") nor repoint an
+    // already-armed card at a new (e.g. costlier) model. It MAY edit disabled
+    // cards freely and MAY disarm an armed one. A disabled card never runs, so
+    // its model/budget stay inert until a human arms it on disk.
+    if (v.card.enabled) {
+      let current: GroundskeeperCard | null = null;
+      try {
+        const cur = validateGroundskeeperContent(readFileSync(file, "utf8"), name);
+        if (cur.ok) current = cur.card;
+      } catch { /* no readable on-disk card → treated as not-armed below */ }
+      if (!current || !current.enabled) {
+        return bad(422, "refusing to arm a groundskeeper from the UI — set `enabled: true` by editing the card on disk. The UI may edit disabled cards and disarm armed ones, but never flip one live.");
+      }
+      if (v.card.model !== current.model) {
+        return bad(422, `refusing to change an armed groundskeeper's model via the UI (on disk it is ${JSON.stringify(current.model)}) — disarm it, change the model on disk, then re-arm on disk.`);
+      }
+    }
   } else {
     const { frontmatter, hasFrontmatter } = splitFrontmatter(content);
     if (!hasFrontmatter) return bad(422, "content must open with a YAML frontmatter block (--- ... ---)");
@@ -215,10 +237,23 @@ export function saveCatalogEntry(input: unknown): SaveResult {
   const toWrite = content.endsWith("\n") ? content : `${content}\n`;
   try {
     if (kind === "skill") mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, toWrite);
+    // Atomic write (tmp + rename, same dir/filesystem) — mirrors writeState in
+    // groundskeepers.ts. loadGroundskeepers/getCard read these files on a live
+    // tick; a plain writeFileSync could hand a concurrent reader a torn card
+    // (parse failure → skipped schedule window, or a poisoned prompt cache).
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, toWrite);
+    renameSync(tmp, file);
   } catch (error) {
     return bad(500, `write failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+
+  // The dashboard and the pipeline share a process, and getCard memoises agent
+  // prompts for the process lifetime. Drop the just-written card so the next
+  // stage renders the new prompt instead of the stale cached one (otherwise a
+  // committed edit is a silent no-op until restart). GK cards re-read disk each
+  // tick and skills are not cached, so only agent cards need this.
+  if (kind === "agent") invalidateCard(name);
 
   // git add + commit (NO push). spawnSync with array args — never a shell — so
   // `name`/`kind` (already charset-locked) cannot inject. Commit scoped to this

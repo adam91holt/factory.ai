@@ -49,6 +49,15 @@ export function getCard(name: string): Card | null {
   return card;
 }
 
+/** Drop one card from the in-process cache so the next getCard re-reads it from
+ *  disk. The dashboard and the pipeline share a process (src/index.ts), so the
+ *  catalog manager calls this after committing an agent-card edit — otherwise
+ *  the memoised prompt would keep rendering until the daemon restarts (a saved,
+ *  committed edit that the live system silently ignores). */
+export function invalidateCard(name: string): void {
+  cache.delete(name);
+}
+
 /** List the card names present on disk (for tooling/introspection). */
 export function listCards(): string[] {
   try {

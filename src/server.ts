@@ -332,6 +332,40 @@ export function startDashboard(): {
         res.end('{"error":"method not allowed"}');
         return;
       }
+      // Cross-origin / CSRF / DNS-rebinding guard. This is the ONLY mutation
+      // route and it is reachable from the owner's browser at 127.0.0.1 —
+      // loopback bind is NOT a boundary against a page the owner happens to have
+      // open (the browser runs the attacker's JS and can POST here). Require a
+      // same-origin JSON write:
+      //   • Content-Type application/json (load-bearing): the CORS-"simple"
+      //     form/text-plain vector cannot set it, and a cross-origin fetch() that
+      //     does set it triggers a preflight OPTIONS which the method guard above
+      //     answers 405 (no CORS headers) → the browser never sends the POST.
+      //   • Origin, when present, must be a LOOPBACK origin (http/https on
+      //     127.0.0.1 or localhost, any port). A page the owner visits lives on a
+      //     public origin, so this refuses every drive-by while still allowing the
+      //     built dashboard AND the vite dev proxy (its own port).
+      //   • Host, when present, must be a loopback host — kills DNS-rebinding (a
+      //     rebound attacker domain sends Host: attacker.com, not 127.0.0.1).
+      // The real UI sends content-type application/json same-origin, so nothing
+      // legitimate is affected (ui/src/lib/catalog.ts).
+      const isLoopbackHostname = (h: string): boolean => h === "127.0.0.1" || h === "localhost";
+      const origin = req.headers.origin;
+      let originOk = true;
+      if (origin !== undefined) {
+        try {
+          const u = new URL(origin);
+          originOk = (u.protocol === "http:" || u.protocol === "https:") && isLoopbackHostname(u.hostname);
+        } catch { originOk = false; }
+      }
+      const host = req.headers.host;
+      const hostOk = host === undefined || isLoopbackHostname(host.replace(/:\d+$/, "").toLowerCase());
+      const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+      if (contentType !== "application/json" || !originOk || !hostOk) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end('{"error":"cross-origin or non-JSON write refused"}');
+        return;
+      }
       void readBoundedBody(req, 256 * 1024).then((body) => {
         if (body === null) {
           res.writeHead(413, { "content-type": "application/json" });
