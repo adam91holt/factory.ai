@@ -4,6 +4,7 @@ import { config } from "./config.ts";
 import { fetchQueue, LinearRateLimited } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
 import { planIssue } from "./plan.ts";
+import { stewardTick } from "./steward.ts";
 import { EPIC_LABEL } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
@@ -40,7 +41,11 @@ let draining = false;
 async function tick(): Promise<boolean> {
   bus.emit({ type: "tick_started" });
   const queue = await fetchQueue();
-  if (queue.length === 0) { bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 }); return false; }
+  if (queue.length === 0) {
+    bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 });
+    await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+    return false;
+  }
 
   // Ineligible issues get labeled out of the queue — they never consume WIP
   // slots or starve the FIFO head (C6).
@@ -65,6 +70,7 @@ async function tick(): Promise<boolean> {
     console.error(`[${issue.identifier}] unhandled: ${error instanceof Error ? error.message : error}`);
   })));
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
+  await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
   return batch.length > 0;
 }
 

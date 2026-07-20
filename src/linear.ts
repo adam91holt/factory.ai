@@ -13,6 +13,7 @@ export const PARKED_LABEL = "Factory-Parked";
 export const NEEDS_HUMAN_LABEL = "Factory-Needs-Human";
 export const EPIC_LABEL = "Factory-Epic";
 export const PLANNED_LABEL = "Factory-Planned";
+export const STEWARDED_LABEL = "Factory-Stewarded";
 export const SENTINEL = "🤖 **Factory report**";
 
 export class LinearRateLimited extends Error {
@@ -66,6 +67,15 @@ function toIssue(raw: RawIssue): Issue {
 }
 
 const ISSUE_FIELDS = `id identifier title description url createdAt team { id key } state { name type } labels { nodes { name } }`;
+
+/** Issues in watched teams carrying a label (any state). */
+export async function fetchByLabel(label: string): Promise<Issue[]> {
+  const data = await gql<{ issues: { nodes: RawIssue[] } }>(
+    `query($teams: [String!]!, $label: String!) {
+      issues(first: 25, filter: { team: { key: { in: $teams } }, labels: { name: { eq: $label } } }) { nodes { ${ISSUE_FIELDS} } }
+    }`, { teams: config.teamKeys, label });
+  return data.issues.nodes.map(toIssue);
+}
 
 /** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first. */
 export async function fetchQueue(): Promise<Issue[]> {
@@ -145,13 +155,13 @@ export interface IssueDetail {
   identifier: string; title: string; description: string; url: string;
   stateName: string; labels: string[];
   parent: { identifier: string; title: string; stateName: string } | null;
-  children: Array<{ identifier: string; title: string; stateName: string }>;
-  siblings: Array<{ identifier: string; title: string; stateName: string }>;
+  children: Array<{ identifier: string; title: string; stateName: string; stateType?: string; labels?: string[] }>;
+  siblings: Array<{ identifier: string; title: string; stateName: string; stateType?: string; labels?: string[] }>;
 }
 
 /** Full ticket content + lineage for the dashboard's run view. */
 export async function getIssueDetail(key: string): Promise<IssueDetail> {
-  interface Node { identifier: string; title: string; state: { name: string } }
+  interface Node { identifier: string; title: string; state: { name: string; type?: string }; labels?: { nodes: Array<{ name: string }> } }
   const data = await gql<{ issue: {
     identifier: string; title: string; description: string | null; url: string;
     state: { name: string }; labels: { nodes: Array<{ name: string }> };
@@ -161,9 +171,9 @@ export async function getIssueDetail(key: string): Promise<IssueDetail> {
     `query($key: String!) { issue(id: $key) {
       identifier title description url state { name } labels { nodes { name } }
       parent { identifier title state { name } children { nodes { identifier title state { name } } } }
-      children { nodes { identifier title state { name } } } } }`, { key });
+      children { nodes { identifier title state { name type } labels { nodes { name } } } } } }`, { key });
   const i = data.issue;
-  const flat = (n: Node) => ({ identifier: n.identifier, title: n.title, stateName: n.state.name });
+  const flat = (n: Node) => ({ identifier: n.identifier, title: n.title, stateName: n.state.name, stateType: n.state.type ?? "", labels: (n.labels?.nodes ?? []).map((l) => l.name) });
   return {
     identifier: i.identifier, title: i.title, description: i.description ?? "", url: i.url,
     stateName: i.state.name, labels: i.labels.nodes.map((l) => l.name),
