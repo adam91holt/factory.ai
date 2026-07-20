@@ -6,6 +6,15 @@ export function usd(n: number): string {
   return n < 1 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
 }
 
+/** Compact counts for token/turn magnitudes: 4.18M · 210k · 940. */
+export function compact(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}k`;
+  return `${Math.round(n)}`;
+}
+
 /** Durations: 42s · 4m 12s · 1h 04m. */
 export function secs(total: number): string {
   const s = Math.max(0, Math.round(total));

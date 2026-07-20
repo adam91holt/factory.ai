@@ -1,4 +1,5 @@
 import type { FactoryEvent, FactoryEventBody, QueueIssue, RunRecord } from "./events";
+import type { Telemetry } from "./telemetry";
 
 // ---------------------------------------------------------------------------
 // Mock fixtures — ?mock=1 replays a realistic factory session through the
@@ -349,4 +350,64 @@ export function mockRunRecords(): RunRecord[] {
     },
   ];
   return rows;
+}
+
+// ---- /telemetry snapshot ----------------------------------------------------
+
+export function mockTelemetry(): Telemetry {
+  const now = new Date();
+  const daily = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (6 - i));
+    const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    // A believable ramp with one heavy day (the parked FAC-15 marathon).
+    const shape = [0.4, 1.1, 0.0, 2.3, 5.9, 1.7, 0.9][i] ?? 0;
+    return {
+      date,
+      costUsd: +(shape * 3.1).toFixed(4),
+      turns: Math.round(shape * 34),
+      tokensIn: Math.round(shape * 210_000),
+      tokensOut: Math.round(shape * 24_000),
+      cacheRead: Math.round(shape * 1_400_000),
+      runs: shape > 2 ? 2 : shape > 0.2 ? 1 : 0,
+    };
+  });
+  return {
+    generatedAt: Date.now(),
+    totals: {
+      costUsd: 62.4128, turns: 512, stageRuns: 63, runs: 11,
+      tokensIn: 4_182_400, tokensOut: 486_900, cacheRead: 31_920_000, cacheWrite: 2_140_000,
+      prOpen: 6, parked: 3, needsHuman: 1, aborted: 1, planned: 0, degradedRuns: 1,
+    },
+    perModel: [
+      { model: "sonnet", calls: 34, tokensIn: 2_910_000, tokensOut: 331_000, cacheRead: 24_600_000, cacheWrite: 1_560_000, costUsd: 38.221 },
+      { model: "opus", calls: 14, tokensIn: 742_000, tokensOut: 96_400, cacheRead: 5_820_000, cacheWrite: 402_000, costUsd: 17.844 },
+      { model: "gpt-5.6-sol", calls: 9, tokensIn: 468_400, tokensOut: 51_200, cacheRead: 1_120_000, cacheWrite: 148_000, costUsd: 5.108 },
+      { model: "claude-fable-5", calls: 6, tokensIn: 62_000, tokensOut: 8_300, cacheRead: 380_000, cacheWrite: 30_000, costUsd: 1.240 },
+    ],
+    perStage: [
+      { stage: "implementer", calls: 11, turns: 268, costUsd: 31.402, tokensIn: 2_640_000, tokensOut: 298_000 },
+      { stage: "fixer", calls: 10, turns: 154, costUsd: 14.880, tokensIn: 980_000, tokensOut: 118_000 },
+      { stage: "verify-repair-1", calls: 6, turns: 58, costUsd: 6.204, tokensIn: 280_000, tokensOut: 34_000 },
+      { stage: "reviewer-claude", calls: 11, turns: 11, costUsd: 5.611, tokensIn: 118_000, tokensOut: 14_800 },
+      { stage: "reviewer-codex", calls: 9, turns: 9, costUsd: 3.108, tokensIn: 148_400, tokensOut: 16_200 },
+      { stage: "design-reviewer", calls: 3, turns: 3, costUsd: 0.902, tokensIn: 12_400, tokensOut: 3_400 },
+      { stage: "reviewer-fallback", calls: 1, turns: 1, costUsd: 0.208, tokensIn: 5_200, tokensOut: 2_100 },
+    ],
+    daily,
+    outcomes: { pr_open: 6, planned: 0, parked: 3, needs_human: 1, aborted: 1 },
+    parkReasons: [
+      { reason: "gates still failing after 3 repair rounds", count: 2 },
+      { reason: "wall-clock cap reached", count: 1 },
+    ],
+    costPerIssue: [
+      { issueKey: "FAC-15", costUsd: 18.6212, runs: 1 },
+      { issueKey: "FAC-9", costUsd: 12.8834, runs: 1 },
+      { issueKey: "FAC-16", costUsd: 7.2143, runs: 1 },
+      { issueKey: "FAC-14", costUsd: 5.112, runs: 1 },
+      { issueKey: "FAC-20", costUsd: 4.7865, runs: 1 },
+      { issueKey: "FAC-17", costUsd: 3.9587, runs: 1 },
+      { issueKey: "FAC-11", costUsd: 3.0125, runs: 1 },
+      { issueKey: "FAC-13", costUsd: 2.4402, runs: 1 },
+    ],
+  };
 }

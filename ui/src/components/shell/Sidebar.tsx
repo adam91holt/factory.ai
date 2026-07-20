@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { Activity, Columns3, History, Inbox } from "lucide-react";
+import { Activity, BarChart3, Columns3, History, Inbox } from "lucide-react";
 import { useFactory } from "../../lib/store";
 import { usd } from "../../lib/format";
 import { LiveRunPill } from "./LiveRunPill";
@@ -11,6 +11,7 @@ const NAV = [
   { to: "/runs", label: "Runs", icon: Activity },
   { to: "/queue", label: "Queue", icon: Inbox },
   { to: "/history", label: "History", icon: History },
+  { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
 ] as const;
 
 export function Sidebar() {

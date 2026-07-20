@@ -71,7 +71,9 @@ export type FactoryEventBody =
       text: string }                                   // redacted, ≤500 chars
   | { type: "run_stage_finished"; issueKey: string; stage: string; costUsd: number;
       turns: number; wallSeconds: number; resultText: string;   // redacted, ≤4000 chars
-      error?: string; degraded?: boolean }
+      error?: string; degraded?: boolean;
+      // per-model token/cost usage (short keys: in/out/cacheRead/cacheWrite/costUsd)
+      modelUsage?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; costUsd: number }> }
   | { type: "run_gates"; issueKey: string; round: number;      // 0 = pre-repair verify
       green: boolean; strength: GateStrength; gates: GateMeta[] }
   | { type: "run_finished"; issueKey: string; outcome: RunOutcome; reason?: string;
@@ -164,7 +166,8 @@ export type AgentStreamEvent =
   | { kind: "tool_use"; stage: string; tool: string; detail: string }
   | { kind: "assistant_text"; stage: string; text: string }
   | { kind: "stage_finished"; stage: string; costUsd: number; turns: number;
-      wallSeconds: number; resultText: string; error?: string; degraded?: boolean };
+      wallSeconds: number; resultText: string; error?: string; degraded?: boolean;
+      modelUsage?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; costUsd: number }> };
 
 const SUMMARY_KEYS = ["command", "file_path", "pattern", "query", "url", "prompt", "description"] as const;
 

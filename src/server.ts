@@ -1,5 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
-import { startEventStore, issueEvents } from "./db.ts";
+import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
 import { getIssueDetail } from "./linear.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
@@ -335,6 +335,12 @@ export function startDashboard(): {
     if (url.pathname === "/state") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(mission));
+      return;
+    }
+
+    if (url.pathname === "/telemetry") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(getTelemetry()));
       return;
     }
 

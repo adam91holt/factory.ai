@@ -10,6 +10,12 @@ import { summarizeToolInput, type AgentStreamEvent } from "./events.ts";
 // per-call remaining budget (C11); abort deadline (C12); unguessable untrusted
 // markers (C16); broadened + exact-value secret redaction (C18).
 
+/** Compact per-model token/cost usage, distilled from the SDK result's
+ *  `modelUsage` record (see compactModelUsage). Keyed by model id. */
+export type ModelUsageCompact = Record<string, {
+  in: number; out: number; cacheRead: number; cacheWrite: number; costUsd: number;
+}>;
+
 export interface StageResult {
   label: string;
   text: string;
@@ -18,6 +24,7 @@ export interface StageResult {
   wallSeconds: number;
   error?: string;
   degraded?: boolean;
+  modelUsage?: ModelUsageCompact;
 }
 
 interface StageOptions {
@@ -113,6 +120,8 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     const subtypeError = subtype && subtype !== "success"
       ? redactSecrets(`${subtype}${Array.isArray(result?.errors) ? `: ${(result.errors as unknown[]).map(String).join("; ").slice(0, 300)}` : ""}`).clean
       : undefined;
+    // Per-model token/cost usage (present on both success and error results).
+    const modelUsage = compactModelUsage(result?.modelUsage);
     const out: StageResult = {
       label,
       text: typeof result?.result === "string" ? result.result : "",
@@ -120,10 +129,11 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
       turns: typeof result?.num_turns === "number" ? result.num_turns : 0,
       wallSeconds: Math.round((Date.now() - t0) / 1000),
       error: subtypeError,
+      ...(modelUsage ? { modelUsage } : {}),
     };
     opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: out.costUsd, turns: out.turns,
       wallSeconds: out.wallSeconds, resultText: redactSecrets(out.text).clean.slice(0, 4000),
-      ...(out.error ? { error: out.error } : {}) });
+      ...(out.error ? { error: out.error } : {}), ...(modelUsage ? { modelUsage } : {}) });
     return out;
   } catch (error) {
     const out: StageResult = {
@@ -138,6 +148,26 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Distill the SDK result's `modelUsage` (per-model inputTokens/outputTokens/
+ *  cacheReadInputTokens/cacheCreationInputTokens/costUSD) into the compact,
+ *  short-keyed shape the telemetry event carries. Tolerant of missing/garbage
+ *  fields (older SDKs, proxy legs); returns undefined when nothing usable. */
+function compactModelUsage(raw: unknown): ModelUsageCompact | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const out: ModelUsageCompact = {};
+  for (const [model, usage] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof usage !== "object" || usage === null) continue;
+    const u = usage as Record<string, unknown>;
+    out[model] = {
+      in: n(u.inputTokens), out: n(u.outputTokens),
+      cacheRead: n(u.cacheReadInputTokens), cacheWrite: n(u.cacheCreationInputTokens),
+      costUsd: n(u.costUSD),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Untrusted-input delimiting with an unguessable per-call marker; embedded

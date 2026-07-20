@@ -9,6 +9,7 @@ export default defineConfig({
     proxy: {
       "/events": "http://127.0.0.1:8787",
       "/state": "http://127.0.0.1:8787",
+      "/telemetry": "http://127.0.0.1:8787",
       "/runs": {
         target: "http://127.0.0.1:8787",
         // /runs is both the JSON endpoint (fetch) and a SPA route (browser

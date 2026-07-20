@@ -49,6 +49,7 @@ export const config = {
     wallMinutesPerIssue: num("MAX_WALL_MINUTES_PER_ISSUE", 45),
     budgetUsdPerIssue: num("MAX_BUDGET_USD_PER_ISSUE", 25),
     verifierIterations: num("MAX_VERIFIER_ITERATIONS", 3),
+    tasteRounds: num("TASTE_MAX_ROUNDS", 2),   // max design-review passes (≥1); fix runs between passes
     wipLimit: num("WIP_LIMIT", 4),
   },
 

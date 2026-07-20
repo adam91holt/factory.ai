@@ -65,7 +65,9 @@ export type FactoryEventBody =
       text: string }                                   // redacted, ≤500 chars
   | { type: "run_stage_finished"; issueKey: string; stage: string; costUsd: number;
       turns: number; wallSeconds: number; resultText: string;   // redacted, ≤4000 chars
-      error?: string; degraded?: boolean }
+      error?: string; degraded?: boolean;
+      // per-model token/cost usage (short keys: in/out/cacheRead/cacheWrite/costUsd)
+      modelUsage?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; costUsd: number }> }
   | { type: "run_gates"; issueKey: string; round: number;      // 0 = pre-repair verify
       green: boolean; strength: GateStrength; gates: GateMeta[] }
   | { type: "run_finished"; issueKey: string; outcome: RunOutcome; reason?: string;

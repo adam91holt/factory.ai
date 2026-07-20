@@ -51,7 +51,7 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
     else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
     // "reviewer-fallback" only runs when the Codex leg failed — mark it degraded
     // live (loop.ts sets StageResult.degraded after runStage already emitted).
-    else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.degraded || e.stage === "reviewer-fallback" ? { degraded: true } : {}) });
+    else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.degraded || e.stage === "reviewer-fallback" ? { degraded: true } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });
   };
 }
 
@@ -200,26 +200,30 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const designReviewPrompt = () => renderPrompt("design-reviewer", { spec, diff: designDiff.slice(0, 180_000) },
         `You are the design reviewer — the taste gate — with READ-ONLY worktree access (Read/Glob/Grep). Judge this UI change against docs/design-language.md and (for interactive/game-like work) skills/game-feel/SKILL.md. Reject template-default soup and any interactive screen that could be a plain form or list with no loss. For each problem: a numbered finding with the exact file and a concrete fix. End with exactly one line — "TASTE: pass" or "TASTE: fail" — followed by a one-sentence reason.\n\n${spec}\n\n<diff>\n${designDiff.slice(0, 180_000)}\n</diff>`);
       const tastePasses = (r: StageResult): boolean => r.error !== undefined || !/TASTE:\s*fail/i.test(r.text);
+      // Up to caps.tasteRounds review passes (labels design-reviewer, design-reviewer-2, …);
+      // a design-fixer round runs between failing passes (design-fixer, design-fixer-2, …).
+      // Budget/deadline is checked before each stage and each iteration; when the rounds
+      // are exhausted still failing, tasteFindings folds into the needsHuman path below.
+      const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       let design = await runStage("design-reviewer", designReviewPrompt(),
         { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
-      if (!tastePasses(design) && !budget.expired) {
-        const designFix = await runStage("design-fixer",
+      for (let round = 1; round < maxTasteRounds && !tastePasses(design) && !budget.expired; round++) {
+        const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
           { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
-        commitAll(ws, `${issue.identifier}: apply design-review feedback`);
+        commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
         try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
-        if (!budget.expired) {
-          design = await runStage("design-reviewer-2", designReviewPrompt(),
-            { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
-          stages.push(design);
-          await postStageComment(issue, design);
-        }
-        if (!tastePasses(design)) tasteFindings = design.text.slice(0, 1500);
+        if (budget.expired) break;
+        design = await runStage(`design-reviewer-${round + 1}`, designReviewPrompt(),
+          { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        stages.push(design);
+        await postStageComment(issue, design);
       }
+      if (!tastePasses(design)) tasteFindings = design.text.slice(0, 1500);
       if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "design review"); return; }
     }
 
