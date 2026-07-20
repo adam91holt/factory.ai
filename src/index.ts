@@ -37,6 +37,7 @@ function acquireLease(): void {
 }
 
 let draining = false;
+const inFlight = new Set<string>();
 
 async function tick(): Promise<boolean> {
   bus.emit({ type: "tick_started" });
@@ -64,14 +65,20 @@ async function tick(): Promise<boolean> {
   }
   if (eligible.length === 0) { bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 }); return false; }
 
-  console.log(`[tick] ${eligible.length} eligible (${queue.length - eligible.length} marked needs-human); WIP limit ${config.caps.wipLimit}`);
-  const batch = eligible.slice(0, config.caps.wipLimit);
-  await Promise.all(batch.map((issue) => processIssue(issue).catch((error) => {
-    console.error(`[${issue.identifier}] unhandled: ${error instanceof Error ? error.message : error}`);
-  })));
+  // Rolling WIP semaphore (owner request): claim whenever capacity exists —
+  // never barrier a fast issue behind a slow sibling's completion.
+  const capacity = config.caps.wipLimit - inFlight.size;
+  const batch = eligible.filter((i) => !inFlight.has(i.identifier)).slice(0, Math.max(0, capacity));
+  if (batch.length > 0) console.log(`[tick] claiming ${batch.length} (in-flight ${inFlight.size}/${config.caps.wipLimit})`);
+  for (const issue of batch) {
+    inFlight.add(issue.identifier);
+    void processIssue(issue)
+      .catch((error) => console.error(`[${issue.identifier}] unhandled: ${error instanceof Error ? error.message : error}`))
+      .finally(() => inFlight.delete(issue.identifier));
+  }
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
   await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
-  return batch.length > 0;
+  return batch.length > 0 || inFlight.size > 0;
 }
 
 async function main(): Promise<void> {
@@ -129,6 +136,10 @@ async function main(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, (interval + backoffSeconds) * 1000));
   } while (!draining);
 
+  while (inFlight.size > 0) {
+    console.log(`[drain] waiting for ${inFlight.size} in-flight issue(s)`);
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+  }
   bus.emit({ type: "daemon_stopped", reason: config.oneShot ? "one_shot" : "drained" });
   await dashboard?.close();
   rmSync(LEASE, { force: true });
