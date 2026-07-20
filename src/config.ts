@@ -33,6 +33,8 @@ export const config = {
     reviewerClaude: process.env.REVIEWER_CLAUDE_MODEL ?? "opus",
     reviewerCodex: process.env.REVIEWER_CODEX_MODEL ?? "gpt-5.6-sol",
     fixer: process.env.FIXER_MODEL ?? "sonnet",
+    scout: process.env.SCOUT_MODEL ?? "sonnet",
+    planner: process.env.PLANNER_MODEL ?? "opus",
   },
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
@@ -44,7 +46,7 @@ export const config = {
     wallMinutesPerIssue: num("MAX_WALL_MINUTES_PER_ISSUE", 45),
     budgetUsdPerIssue: num("MAX_BUDGET_USD_PER_ISSUE", 25),
     verifierIterations: num("MAX_VERIFIER_ITERATIONS", 3),
-    wipLimit: num("WIP_LIMIT", 2),
+    wipLimit: num("WIP_LIMIT", 4),
   },
 
   watchIntervalSeconds: Math.max(60, num("WATCH_INTERVAL_SECONDS", 60)),

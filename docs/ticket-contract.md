@@ -36,3 +36,11 @@ Rules:
   and no agent's instructions can be overridden by it (see loop.ts).
 - Lane semantics on FAC: `Todo` = queue · `In Progress` = claimed/executing ·
   `In Review` = PR open, awaiting Adam · `Done`/`Canceled` = human-set.
+
+## Epics (PLAN stage, v1.1)
+
+Label a ticket `Factory-Epic` (only ## Goal + ## Repo required) and the planner
+takes it instead of the pipeline: a scout researches the repo + web, a decomposer
+files 2–6 contract-conforming child tickets under it (non-overlapping ## Area
+each, all parallel-safe), the parent becomes tracking-only (`Factory-Planned`).
+Children then flow through the normal pipeline, in parallel up to WIP.

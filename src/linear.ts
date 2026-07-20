@@ -11,6 +11,8 @@ const ENDPOINT = "https://api.linear.app/graphql";
 export const EXECUTING_LABEL = "Factory-Executing";
 export const PARKED_LABEL = "Factory-Parked";
 export const NEEDS_HUMAN_LABEL = "Factory-Needs-Human";
+export const EPIC_LABEL = "Factory-Epic";
+export const PLANNED_LABEL = "Factory-Planned";
 export const SENTINEL = "🤖 **Factory report**";
 
 export class LinearRateLimited extends Error {
@@ -38,6 +40,7 @@ export interface Issue {
   description: string;
   url: string;
   teamKey: string;
+  teamId: string;
   stateName: string;
   stateType: string;
   labels: string[];
@@ -47,7 +50,7 @@ export interface Issue {
 interface RawIssue {
   id: string; identifier: string; title: string; description: string | null; url: string;
   createdAt: string;
-  team: { key: string };
+  team: { id: string; key: string };
   state: { name: string; type: string };
   labels: { nodes: Array<{ name: string }> };
 }
@@ -55,14 +58,14 @@ interface RawIssue {
 function toIssue(raw: RawIssue): Issue {
   return {
     id: raw.id, identifier: raw.identifier, title: raw.title,
-    description: raw.description ?? "", url: raw.url, teamKey: raw.team.key,
+    description: raw.description ?? "", url: raw.url, teamKey: raw.team.key, teamId: raw.team.id,
     stateName: raw.state.name, stateType: raw.state.type,
     labels: raw.labels.nodes.map((l) => l.name),
     createdAt: raw.createdAt,
   };
 }
 
-const ISSUE_FIELDS = `id identifier title description url createdAt team { key } state { name type } labels { nodes { name } }`;
+const ISSUE_FIELDS = `id identifier title description url createdAt team { id key } state { name type } labels { nodes { name } }`;
 
 /** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first. */
 export async function fetchQueue(): Promise<Issue[]> {
@@ -76,7 +79,7 @@ export async function fetchQueue(): Promise<Issue[]> {
     { teams: config.teamKeys },
   );
   const all = data.issues.nodes.map(toIssue);
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
   bus.emit({
     type: "queue_snapshot",
     issues: all.map((i) => ({
@@ -145,6 +148,18 @@ export async function transition(issue: Issue, kind: StateKind): Promise<boolean
   await gql(`mutation($id: String!, $stateId: String!) {
     issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`, { id: issue.id, stateId: state.id });
   return true;
+}
+
+/** Create a contract-conforming child under an epic (PLAN stage). Lands in the
+ * default triage-less backlog state; the factory picks it up like any ticket. */
+export async function createSubIssue(parent: Issue, title: string, description: string): Promise<string> {
+  const data = await gql<{ issueCreate: { success: boolean; issue: { identifier: string } } }>(
+    `mutation($teamId: String!, $parentId: String!, $title: String!, $description: String!) {
+      issueCreate(input: { teamId: $teamId, parentId: $parentId, title: $title, description: $description }) {
+        success issue { identifier } } }`,
+    { teamId: parent.teamId, parentId: parent.id, title, description });
+  if (!data.issueCreate.success) throw new Error(`issueCreate failed for "${title}"`);
+  return data.issueCreate.issue.identifier;
 }
 
 export async function postComment(issue: Issue, body: string): Promise<void> {
