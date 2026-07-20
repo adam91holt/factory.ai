@@ -16,6 +16,8 @@ export interface ReportInput {
   gateStrength: "none" | "weak" | "real";
   guardedPaths: string[];
   reviewFindingsSummary?: string;
+  designReview?: string;   // taste-gate findings when TASTE: fail persisted
+  verification?: string;   // tester verification report, when it ran
 }
 
 export function buildReport(input: ReportInput): string {
@@ -38,6 +40,12 @@ export function buildReport(input: ReportInput): string {
   if (degraded) lines.push("⚠️ Codex reviewer leg was down — Claude fallback reviewed (degraded).", "");
   if (input.reviewFindingsSummary) {
     lines.push("**Adversarial review:**", input.reviewFindingsSummary, "");
+  }
+  if (input.designReview) {
+    lines.push("🎨 **Design taste gate — FAILED (human review required):**", input.designReview, "");
+  }
+  if (input.verification) {
+    lines.push("**Verification (tester):**", input.verification, "");
   }
   const gateLines = input.gates.map((g) =>
     `- ${g.name}: ${g.passed === null ? "no-gate (fails on baseline)" : g.passed ? "pass" : "FAIL"}`);

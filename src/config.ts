@@ -36,6 +36,8 @@ export const config = {
     scout: process.env.SCOUT_MODEL ?? "sonnet",
     planner: process.env.PLANNER_MODEL ?? "opus",
     steward: process.env.STEWARD_MODEL ?? "claude-fable-5",
+    designReviewer: process.env.DESIGN_REVIEWER_MODEL ?? "opus",
+    tester: process.env.TESTER_MODEL ?? "sonnet",
   },
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),

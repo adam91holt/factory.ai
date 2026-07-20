@@ -51,6 +51,20 @@ export function ensureDeps(ws: Workspace): { ok: boolean; detail: string } {
   return r.ok ? { ok: true, detail: `${pm.name} ${pm.install[0]}` } : { ok: false, detail: r.out.slice(-800) };
 }
 
+/** Whether this repo can run Playwright browser checks — a dependency or a
+ * config file. The tester stage degrades to "browser verification unavailable"
+ * when this is false. */
+export function hasPlaywright(ws: Workspace): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(ws.dir, "package.json"), "utf8")) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+    if (deps["@playwright/test"] || deps["playwright"]) return true;
+  } catch {
+    // no/invalid package.json — fall through to config-file probe
+  }
+  return ["playwright.config.ts", "playwright.config.js", "playwright.config.mjs"].some((f) => existsSync(join(ws.dir, f)));
+}
+
 export function detectGates(ws: Workspace): string[] {
   const scripts = npmScripts(ws.dir);
   return CANDIDATES.filter((c) => scripts[c] && !/exit 1|no test specified/.test(scripts[c] ?? ""));

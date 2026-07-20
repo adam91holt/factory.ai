@@ -2,9 +2,10 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
-import { ensureDeps, detectGates, baseline, verify, gateSummary } from "./verify.ts";
+import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
+import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
+import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
@@ -25,6 +26,14 @@ export function missingSections(issue: linear.Issue): string[] {
 
 export function isEligible(issue: linear.Issue): boolean {
   return missingSections(issue).length === 0 && repoFromTicket(issue.description) !== null;
+}
+
+/** Tester trigger: the ticket asks for a browser check explicitly (needs:browser-test)
+ * OR its ## Verifications section names a Visual item. Gated again on hasPlaywright. */
+export function wantsBrowserVerification(description: string): boolean {
+  if (/needs:browser-test/i.test(description)) return true;
+  const idx = description.search(/##\s*Verifications/i);
+  return idx >= 0 && /visual/i.test(description.slice(idx));
 }
 
 async function post(issue: linear.Issue, body: string): Promise<void> {
@@ -131,7 +140,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- implementer
     const implementer = await runStage("implementer",
-      `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`,
+      renderPrompt("implementer", { repo, spec },
+        `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`),
       { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
     await postStageComment(issue, implementer);
@@ -148,15 +158,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const reviewPrompt = (lens: string) =>
       `You are an adversarial code reviewer in an automated pipeline. Assume the change is BROKEN until proven otherwise. Lens: ${lens}. You get ONLY the ticket and the diff — no author reasoning. For each real problem: exact input/scenario that fails, expected vs actual, responsible hunk. No praise. If nothing after genuine effort: NO-FINDINGS.\n\n${spec}\n\n<diff>\n${diff.slice(0, 180_000)}\n</diff>`;
 
+    const clampedDiff = diff.slice(0, 180_000);
+    const repoLens = "blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess";
     const [reviewClaude, reviewCodexTry] = await Promise.all([
-      runStage("reviewer-claude", reviewPrompt("spec compliance and correctness — walk every ticket requirement"),
+      runStage("reviewer-claude", renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
         { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
-      runStage("reviewer-repo", reviewPrompt("blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess"),
+      runStage("reviewer-repo", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
         { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
-      reviewCodex = await runStage("reviewer-fallback", reviewPrompt("blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess"),
+      reviewCodex = await runStage("reviewer-fallback", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
         { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
@@ -167,7 +179,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
     const fixer = await runStage("fixer",
-      `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`,
+      renderPrompt("fixer", { spec, reviews: untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`) },
+        `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`),
       { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     await postStageComment(issue, fixer);
@@ -175,6 +188,40 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     commitAll(ws, `${issue.identifier}: apply review feedback`);
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "review"); return; }
+
+    // ---- design review (taste gate): UI diffs are held to a taste bar, not
+    // just correctness. Read-only reviewer against docs/design-language.md + the
+    // juice rubric; a persistent TASTE: fail forces human review and is NEVER
+    // auto-merged, even on allowlisted repos (tasteFindings folds into needsHuman).
+    let tasteFindings: string | null = null;
+    if (uiFilesTouched(ws).length > 0 && !budget.expired) {
+      let designDiff = "";
+      try { designDiff = diffAgainstBase(ws); } catch { designDiff = ""; }
+      const designReviewPrompt = () => renderPrompt("design-reviewer", { spec, diff: designDiff.slice(0, 180_000) },
+        `You are the design reviewer — the taste gate — with READ-ONLY worktree access (Read/Glob/Grep). Judge this UI change against docs/design-language.md and (for interactive/game-like work) skills/game-feel/SKILL.md. Reject template-default soup and any interactive screen that could be a plain form or list with no loss. For each problem: a numbered finding with the exact file and a concrete fix. End with exactly one line — "TASTE: pass" or "TASTE: fail" — followed by a one-sentence reason.\n\n${spec}\n\n<diff>\n${designDiff.slice(0, 180_000)}\n</diff>`);
+      const tastePasses = (r: StageResult): boolean => r.error !== undefined || !/TASTE:\s*fail/i.test(r.text);
+      let design = await runStage("design-reviewer", designReviewPrompt(),
+        { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      stages.push(design);
+      await postStageComment(issue, design);
+      if (!tastePasses(design) && !budget.expired) {
+        const designFix = await runStage("design-fixer",
+          `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
+          { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        stages.push(designFix);
+        await postStageComment(issue, designFix);
+        commitAll(ws, `${issue.identifier}: apply design-review feedback`);
+        try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
+        if (!budget.expired) {
+          design = await runStage("design-reviewer-2", designReviewPrompt(),
+            { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          stages.push(design);
+          await postStageComment(issue, design);
+        }
+        if (!tastePasses(design)) tasteFindings = design.text.slice(0, 1500);
+      }
+      if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "design review"); return; }
+    }
 
     // ---- verify (baselined) with bounded, budgeted, deadlined repair rounds
     let results = verify(ws, gates, baselines);
@@ -199,6 +246,22 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
     if (!summary.green) { await park(issue, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
 
+    // ---- tester (after gates): executes the ticket's ## Verifications when it
+    // asks for browser/visual checks AND the repo can run Playwright. Report-only
+    // (v1) EXCEPT an explicit VERDICT: fail, which folds into needsHuman below.
+    let verificationReport: string | null = null;
+    let testerFail = false;
+    if (wantsBrowserVerification(issue.description) && hasPlaywright(ws) && !budget.expired) {
+      const tester = await runStage("tester",
+        renderPrompt("tester", { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
+          `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`),
+        { model: config.models.tester, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      stages.push(tester);
+      await postStageComment(issue, tester);
+      verificationReport = tester.text.slice(0, 2000);
+      testerFail = /VERDICT:\s*fail/i.test(tester.text);
+    }
+
     // ---- deliver (guarded paths / test deletion stop auto-advance — C17)
     const removedTests = testFilesRemoved(ws);
     if (removedTests.length > 0) { await park(issue, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`); return; }
@@ -212,18 +275,29 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       prUrl = createPr(ws, `${issue.identifier}: ${issue.title}`, prBody);
     }
 
+    // needsHuman folds every "PR opens but a human must advance it" cause into
+    // one gate: guarded paths (C17), a persistent taste-gate fail, or an explicit
+    // tester FAIL. Any of them blocks auto-merge even on allowlisted repos.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
+    const holdReasons: string[] = [];
+    if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
+    if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
+    if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
+    const needsHuman = holdReasons.length > 0;
+    const holdReason = holdReasons.join("; ");
     const report = buildReport({
       issueKey: issue.identifier, prUrl,
-      outcome: guardedStop ? "needs_human" : "pr_open",
-      reason: guardedStop ? `guarded paths touched: ${guarded.join(", ")}` : undefined,
+      outcome: needsHuman ? "needs_human" : "pr_open",
+      reason: needsHuman ? holdReason : undefined,
       stages, gates: results, gateStrength: summary.strength, guardedPaths: guarded,
       reviewFindingsSummary: fixer.text.slice(0, 1500),
+      ...(tasteFindings ? { designReview: tasteFindings } : {}),
+      ...(verificationReport ? { verification: verificationReport } : {}),
     });
 
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
-      outcome: guardedStop ? "needs_human" : "pr_open",
-      ...(guardedStop ? { reason: `guarded paths touched: ${guarded.join(", ")}`.slice(0, 500) } : {}),
+      outcome: needsHuman ? "needs_human" : "pr_open",
+      ...(needsHuman ? { reason: holdReason.slice(0, 500) } : {}),
       prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
       dryRun: config.dryRun });
@@ -231,7 +305,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // Comment is best-effort; transition/release are guaranteed (C10).
     try { await post(issue, report); } catch (e) { console.error(`[${issue.identifier}] report post failed: ${e}`); }
     if (!config.dryRun) {
-      if (guardedStop) {
+      if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
       } else if (prUrl && config.autoMergeRepos.includes(repo)) {
         // Greenfield policy: green + unguarded → the factory merges its own PR.
@@ -250,7 +324,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       }
       await linear.release(issue);
     }
-    console.log(`[${issue.identifier}] ${guardedStop ? "needs_human (guarded)" : "pr_open"} ${prUrl ?? "(dry-run)"}`);
+    console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : "pr_open"} ${prUrl ?? "(dry-run)"}`);
   } catch (error) {
     await park(issue, stages, error instanceof Error ? error.message : String(error));
   }

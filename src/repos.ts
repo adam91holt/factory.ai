@@ -119,6 +119,20 @@ export function guardedPathsTouched(ws: Workspace): string[] {
   return files.filter((f) => guards.some((g) => g.test(f)));
 }
 
+/** UI files changed by this diff — the taste-gate heuristic (name-only, same
+ * shape as guardedPathsTouched). Empty on any git failure (gate simply skips). */
+export function uiFilesTouched(ws: Workspace): string[] {
+  let base: string;
+  try {
+    base = mergeBase(ws);
+  } catch {
+    return [];
+  }
+  const diff = git(ws.dir, ["diff", "--name-only", base, "HEAD"]);
+  if (!diff.ok) return [];
+  return diff.stdout.split("\n").filter(Boolean).filter((f) => /\.(tsx|jsx|css|scss|html)$/.test(f));
+}
+
 /** Test files deleted by the change → categorical park (C17). */
 export function testFilesRemoved(ws: Workspace): string[] {
   let base: string;
