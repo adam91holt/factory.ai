@@ -16,9 +16,13 @@ function expandHome(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
 }
 
+// Dashboard-only mode: serve the mission-control UI, never poll Linear.
+// LINEAR_API_KEY is not required here because linear.ts is never exercised.
+const serverOnly = process.argv.includes("--server-only");
+
 export const config = {
   // Daemon-only secret — never passed into any worker env (ADR-0003 in plan §6.1).
-  linearApiKey: required("LINEAR_API_KEY"),
+  linearApiKey: serverOnly ? (process.env.LINEAR_API_KEY ?? "").trim() : required("LINEAR_API_KEY"),
   teamKeys: (process.env.FACTORY_TEAM_KEYS ?? "FAC").split(",").map((k) => k.trim()).filter(Boolean),
 
   proxyBaseUrl: (process.env.PROXY_BASE_URL ?? "http://127.0.0.1:8317").replace(/\/+$/, ""),
@@ -46,6 +50,7 @@ export const config = {
   watchIntervalSeconds: Math.max(60, num("WATCH_INTERVAL_SECONDS", 60)),
   oneShot: process.argv.includes("--once"),
   dryRun: process.argv.includes("--dry-run"),
+  serverOnly,
 };
 
 if (config.proxyBaseUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(config.proxyBaseUrl)) {

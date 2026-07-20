@@ -23,7 +23,7 @@ is a clear step up in polish.
 ## 1. System shape
 
 ```
-┌────────────────────────── factory daemon (node, src/) ──────────────────────────┐
+┌────────────────────────── factory daemon (Bun 1.3, src/) ───────────────────────┐
 │ index.ts ── tick loop ── loop.ts ── runStage (agents.ts) ── SDK subprocesses    │
 │     │           │            │            │                                     │
 │     └──emit─────┴───emit─────┴───onEvent──┘        linear.ts ──emit── queue     │
@@ -45,6 +45,10 @@ is a clear step up in polish.
 
 Transport is **SSE only** (no WebSockets): one `EventSource`, `id:` set to the event
 `seq`, so the browser resumes automatically after disconnects. Multiple clients supported.
+
+Runtime note: everything runs on **Bun 1.3** (`bun src/index.ts`, `bun run …`, `bunx …`).
+`node:http`/`node:` builtin imports in `src/server.ts` are fine — Bun implements them —
+but no command, script, or doc instruction may invoke `npm`, `npx`, or `node`.
 
 ---
 
@@ -88,7 +92,7 @@ export interface StageMeta {
 }
 
 export interface GateMeta {
-  name: string;               // npm script name, e.g. "typecheck", "test"
+  name: string;               // package.json script name, e.g. "typecheck", "test"
   baselinePassed: boolean;
   passed: boolean | null;     // null = no-gate (fails on clean baseline)
   outputTail: string;         // last ≤400 chars of failure output, redacted; "" on pass
@@ -102,7 +106,7 @@ export type DaemonMode = "watch" | "once" | "dry";
 export type FactoryEventBody =
   // ---- daemon lifecycle ----
   | { type: "daemon_started"; mode: DaemonMode; teamKeys: string[]; workRoot: string;
-      wipLimit: number; watchIntervalSeconds: number }
+      wipLimit: number; watchIntervalSeconds: number; budgetUsdPerIssue: number }
   | { type: "daemon_stopped"; reason: "drained" | "one_shot" | "error" }
   // ---- tick loop ----
   | { type: "tick_started" }
@@ -127,7 +131,7 @@ export type FactoryEventBody =
       green: boolean; strength: GateStrength; gates: GateMeta[] }
   | { type: "run_finished"; issueKey: string; outcome: RunOutcome; reason?: string;
       prUrl: string | null; costUsd: number; stages: StageMeta[];
-      gateStrength: GateStrength; guardedPaths: string[] };
+      gateStrength: GateStrength; guardedPaths: string[]; dryRun: boolean };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };
@@ -173,7 +177,7 @@ export interface MissionState {
   seq: number;                         // last event seq folded in
   daemon: {
     mode: DaemonMode; teamKeys: string[]; workRoot: string; wipLimit: number;
-    watchIntervalSeconds: number; startedAt: number;
+    watchIntervalSeconds: number; budgetUsdPerIssue: number; startedAt: number;
     lastTick: { at: number; queued: number; eligible: number;
                 markedNeedsHuman: number; processed: number; error?: string } | null;
     backoffSeconds: number;            // 0 unless linear_backoff seen last tick
@@ -259,7 +263,8 @@ Bus rules (server-builder):
 
 ## 3. Server — `src/server.ts`
 
-Owned by server-builder. `node:http` only — **no new npm dependencies**. Exports:
+Owned by server-builder. `node:http` only (fully supported by Bun; matches the proven
+codexProxyTest pattern) — **no new dependencies**. Exports:
 
 ```ts
 export function startDashboard(): { close(): Promise<void> } | null;
@@ -272,6 +277,13 @@ export function startDashboard(): { close(): Promise<void> } | null;
 - Set to `"0"` → return `null` (explicit off).
 - Set to anything else → `Number(...)`; if not a finite integer in 1..65535, `throw`.
 - Listen on host `"127.0.0.1"` **explicitly** — never `0.0.0.0`, never unset.
+
+**`--server-only` mode** (`bun run factory:server`): serves mission control without
+polling Linear — no `daemon_started` emit, `/state` honestly reports `daemon: null`,
+`LINEAR_API_KEY` not required. It takes **no** `.factory.pid` lease (a viewer must not
+block, or be blocked by, a real daemon — the port collision is the real guard), and a
+failed bind (`EADDRINUSE` etc.) exits the process non-zero instead of idling; in daemon
+modes a dashboard bind failure is only logged and the pipeline keeps running.
 
 **Routes** (all GET; any other method → 405; unknown path → 404):
 
@@ -287,6 +299,9 @@ export function startDashboard(): { close(): Promise<void> } | null;
   <blank line>
   ```
 
+  The response opens with a `: connected\n\n` comment so headers flush immediately —
+  with an empty history nothing else would be written until the first heartbeat,
+  leaving clients hanging on connect.
   Heartbeat `: ping\n\n` every 25s per client (clear the interval on close).
   On `req.on("close")` remove the client from the set. Live events are fanned out from a
   single `bus.subscribe` made in `startDashboard`.
@@ -296,20 +311,28 @@ export function startDashboard(): { close(): Promise<void> } | null;
   (semantics in §5.3 — the UI implements the identical fold). `seq` is the seq of the last
   folded event.
 
-- **`GET /runs`** — `application/json`, `RunRecord[]` newest-first, cap 500. Backing
+- **`GET /runs`** — `application/json`, `RunRecord[]` newest-first, cap 500.
+  Content negotiation: `/runs` is both the history API and a UI route — requests whose
+  `Accept` includes `text/html` (browser navigations) get the SPA shell instead of JSON
+  (same bypass rule as the ui/ dev proxy, §5.1). Backing
   store: `join(config.workRoot, "factory-history.jsonl")`. Inside `startDashboard`,
-  subscribe to the bus; on every `run_finished` append one line
-  `JSON.stringify({...body-fields, finishedAt: e.at})`. Append failures are
+  subscribe to the bus; on every `run_finished` **with `dryRun: false`** append one line
+  `JSON.stringify({...body-fields, finishedAt: e.at})` — dry-run rehearsals never enter
+  durable history (their outcome is `"pr_open"` with no PR). Append failures are
   `console.error`'d, never thrown. Read per-request (file is small); tolerate missing
   file (→ `[]`) and skip unparseable lines. This mirrors the factory-report YAML meta
   that lands on Linear — Linear stays the source of truth; the JSONL is the local,
   queryable copy the History page reads.
 
 - **Static UI** — `GET /` serves `ui/dist/index.html` if it exists (else a one-line
-  plain-text pointer "UI not built — run npm run build in ui/"); `GET /assets/*` serves
-  from `ui/dist/assets` with the same normalize + prefix-check path-traversal guard as
-  `codexProxyTest/src/server.ts` (lines 561–579). Content types: `.js`→`text/javascript`,
-  `.css`→`text/css`, `.svg`→`image/svg+xml`, else `application/octet-stream`.
+  plain-text pointer "UI not built — run bun run build in ui/"); `GET /assets/*` serves
+  from `ui/dist/assets` with the normalize + prefix-check path-traversal guard from
+  `codexProxyTest/src/server.ts` (lines 561–579), hardened with a trailing-separator
+  check (`full === base || full.startsWith(base + sep)`). Content types:
+  `.js`→`text/javascript`, `.css`→`text/css`, `.svg`→`image/svg+xml`, else
+  `application/octet-stream`. Any other path whose `Accept` includes `text/html` gets
+  the SPA shell when built (browser deep links like `/runs/FAC-12`, `/queue`,
+  `/history`); everything else stays a hard 404.
 
 `close()`: end all SSE clients, `server.close()`, unsubscribe bus subscriptions.
 
@@ -322,7 +345,7 @@ strings were redacted at emit time. The dashboard adds no new capability to any 
 ## 4. Surgical daemon diffs (server-builder)
 
 Baseline: current committed `src/*.ts` (line numbers below refer to it). Every change is
-additive or a minimal in-place edit; `npm run typecheck` must stay clean. **Do not**
+additive or a minimal in-place edit; `bun run typecheck` must stay clean. **Do not**
 reformat, reorder, or rewrite surrounding code.
 
 ### 4.1 `src/agents.ts`
@@ -373,8 +396,10 @@ captures `type === "result"`). Minimal change: an optional `onEvent` callback.
    `error` from the caught error.
 
    Note: `degraded` is set by loop.ts *after* `runStage` returns (fallback reviewer), so
-   `stage_finished.degraded` is never set here; the UI takes degraded from `run_finished`
-   stage metas.
+   `stage_finished.degraded` is never set here; loop.ts's `forwardStage` stamps
+   `degraded: true` on the `reviewer-fallback` stage's `run_stage_finished` (that stage
+   only ever runs as the degraded fallback), and `run_finished` stage metas remain the
+   authoritative source.
 
 ### 4.2 `src/linear.ts`
 
@@ -418,7 +443,7 @@ No description field is emitted. Behavior of the returned queue is unchanged.
        if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
        else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
        else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
-       else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}) });
+       else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.degraded || e.stage === "reviewer-fallback" ? { degraded: true } : {}) });
      };
    }
    ```
@@ -431,7 +456,7 @@ No description field is emitted. Behavior of the returned queue is unchanged.
    bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "aborted",
      reason: `moved externally during ${where}`, prUrl: null,
      costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
-     gateStrength: "none", guardedPaths: [] });
+     gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
    ```
 5. `processIssue`: immediately after the claim block (after line 82):
    ```ts
@@ -455,14 +480,15 @@ No description field is emitted. Behavior of the returned queue is unchanged.
      outcome: guardedStop ? "needs_human" : "pr_open",
      ...(guardedStop ? { reason: `guarded paths touched: ${guarded.join(", ")}`.slice(0, 500) } : {}),
      prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
-     stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded });
+     stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
+     dryRun: config.dryRun });
    ```
 9. `park` (line 200): after building `input`, before the try:
    ```ts
    bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "parked",
      reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,
      costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
-     gateStrength: "none", guardedPaths: [] });
+     gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
    ```
    Note: `park` is also reached for pre-claim failures (missing sections path calls
    `markNeedsHuman`, not park, so every `park`/delivery emit is preceded by a
@@ -477,14 +503,15 @@ No description field is emitted. Behavior of the returned queue is unchanged.
 2. `tick()` (line 35): first statement `bus.emit({ type: "tick_started" });`.
    The three exits each emit `tick_finished`:
    - line 37 → `if (queue.length === 0) { bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 }); return; }`
-   - line 47 → same pattern with `queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length` — careful: at this exit `eligible.length === 0`.
+   - line 46 (`if (eligible.length === 0) return;`) → same pattern with `queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length` — careful: at this exit `eligible.length === 0`.
    - end of `tick` → `bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });`
 3. `main()`: after `acquireLease();` (line 56): `const dashboard = startDashboard();`.
    After the `console.log` (line 57):
    ```ts
    bus.emit({ type: "daemon_started", mode: config.dryRun ? "dry" : config.oneShot ? "once" : "watch",
      teamKeys: config.teamKeys, workRoot: config.workRoot,
-     wipLimit: config.caps.wipLimit, watchIntervalSeconds: config.watchIntervalSeconds });
+     wipLimit: config.caps.wipLimit, watchIntervalSeconds: config.watchIntervalSeconds,
+     budgetUsdPerIssue: config.caps.budgetUsdPerIssue });
    ```
 4. Rate-limit branch (line 67–70): add `bus.emit({ type: "linear_backoff", seconds: backoffSeconds });`
    and the generic catch adds `bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0, error: <message.slice(0,300)> });`
@@ -502,9 +529,11 @@ Append: `# DASHBOARD_PORT=8787   # mission-control UI (127.0.0.1 only; 0 disable
 
 ## 5. UI — `factory/ui` (ui-builder)
 
-`ui/` is its **own npm package**. The root `package.json` is untouched by builders (the
-integration agent adds `ui:dev` / `ui:build` root scripts at the very end). The UI never
-imports from `../src` — the event types are the verbatim copy in `ui/src/lib/events.ts`.
+`ui/` is its **own Bun package** (`bun install` produces `ui/bun.lock`). The root
+`package.json` is untouched by builders (the integration agent adds `ui:dev` / `ui:build`
+root scripts at the very end). The UI never imports from `../src` — the event types are
+the verbatim copy in `ui/src/lib/events.ts`. All commands are `bun` / `bunx` — never
+npm/npx/node.
 
 ### 5.1 Stack & package
 
@@ -521,10 +550,10 @@ imports from `../src` — the event types are the verbatim copy in `ui/src/lib/e
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --noEmit",
-    "preview": "vite preview"
+    "dev": "bunx vite",
+    "build": "bunx tsc --noEmit && bunx vite build",
+    "typecheck": "bunx tsc --noEmit",
+    "preview": "bunx vite preview"
   },
   "dependencies": {
     "react": "^19.0.0",
@@ -551,8 +580,8 @@ imports from `../src` — the event types are the verbatim copy in `ui/src/lib/e
 }
 ```
 
-shadcn/ui components: generate with `npx shadcn@latest init` (style *new-york*, CSS
-variables on) then `npx shadcn@latest add badge card separator scroll-area table tabs
+shadcn/ui components: generate with `bunx shadcn@latest init` (style *new-york*, CSS
+variables on) then `bunx shadcn@latest add badge card separator scroll-area table tabs
 tooltip skeleton`. Generated files live in `ui/src/components/ui/` and may be edited to
 match the tokens in §6. If the CLI misbehaves offline, hand-write the same eight
 components with the standard shadcn implementations.
@@ -571,7 +600,14 @@ export default defineConfig({
     proxy: {
       "/events": "http://127.0.0.1:8787",
       "/state": "http://127.0.0.1:8787",
-      "/runs": "http://127.0.0.1:8787",
+      "/runs": {
+        target: "http://127.0.0.1:8787",
+        // /runs is both the JSON endpoint (fetch) and a SPA route (browser
+        // navigation) — only proxy non-HTML requests so page loads/reloads of
+        // /runs and /runs/$issueKey still serve the app shell.
+        bypass: (req) =>
+          req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
+      },
     },
   },
 });
@@ -606,7 +642,7 @@ ui/
       runs/ToolFeed.tsx          # live tool_use/assistant_text feed
       runs/GatePanel.tsx         # per-round gate results
       runs/FindingsPanel.tsx     # reviewer resultText + fixer disposition
-      runs/CostMeter.tsx         # spend vs $25 budget cap
+      runs/CostMeter.tsx         # spend vs budget cap (daemon_started.budgetUsdPerIssue, fallback $25)
       queue/QueueTable.tsx       # parked + needs-human with aging
       history/HistoryTable.tsx   # RunRecord rows
       OutcomeBadge.tsx           # shared outcome/status chip
@@ -639,25 +675,36 @@ Root route renders `AppShell`.
     `lastActivity = tool + " · " + detail`.
   - `run_assistant_text` → update that stage's `lastActivity = text.slice(0, 120)`.
   - `run_stage_finished` → close the matching StageView (set finishedAt/cost/turns/
-    resultText/error), add cost to `run.costUsd`.
+    resultText/error/degraded), add cost to `run.costUsd` (cost is added even when no
+    open stage matches).
   - `run_gates` → set `run.gates`.
   - `run_finished` → `status = outcome`, `finishedAt`, `prUrl`, `reason`, overwrite
     `costUsd` with the event's total; merge `degraded` flags from `e.stages` into stage
-    views by label. Synthesize the RunView if unknown.
+    views by label. Synthesize the RunView if unknown. Then prune: keep all active runs
+    plus the newest **50** finished runs (by `finishedAt`) — bounds memory in long-lived
+    daemons and long-open tabs.
+  - Any `run_*` event for an unknown issueKey synthesizes a fresh RunView
+    (`title: ""`, `status: "active"`) — both folds are tolerant, never dropping.
   - `issue_needs_human` → append to `needsHuman` (dedupe by issueKey, keep latest).
   - Every event → `mission.seq = e.seq`.
-- **Boot & resume** (`lib/sse.ts`): on app start, `fetchState()` seeds
-  `mission` (TanStack Query `queryKey: ["state"]`, then written into the store), then open
-  `new EventSource("/events?since=" + mission.seq)`. `onmessage`: parse, ignore if
-  `seq <= mission.seq`, else fold + append feeds. The browser auto-reconnects and sends
-  `Last-Event-ID`; additionally, `onerror` sets `connection: "reconnecting"`, and on the
-  next `onopen` re-run `fetchState()` and hard-reset the store if the fetched `seq` is
-  **lower** than ours (daemon restarted — seq reset). On `run_finished`, call
+- **Boot & resume** (`lib/sse.ts`): on app start, `fetchState()` seeds the store's
+  `mission` mirror, then open `new EventSource("/events?since=" + mission.seq)`.
+  `onmessage`: parse, ignore if `seq <= mission.seq`, else fold + append feeds. The
+  browser auto-reconnects and sends `Last-Event-ID`; `onerror` sets
+  `connection: "reconnecting"`. **Every** `onopen` (first connect included — the boot
+  fetch may have failed) re-runs `fetchState()`; the snapshot is a superset of anything
+  ring replay can deliver, so:
+  - `fresh.seq > ours` → forward gap (ring evicted events past the 5000 cap while the
+    tab slept, or the boot fetch failed) → `resetMission(fresh, { keepFeeds: true })`.
+  - `fresh.seq < ours` → daemon restarted (seq reset) → hard reset, feeds dropped.
+  Events arriving while the resync fetch is in flight are buffered and folded (with the
+  `seq > fresh.seq` filter) once the snapshot lands — nothing emitted between the
+  snapshot and the reset is lost. On `run_finished`, call
   `queryClient.invalidateQueries({ queryKey: ["runs"] })`.
-- **TanStack Query** owns the request/cache lifecycle for the two snapshot endpoints:
-  `["state"]` (fetched on boot/reconnect only, `staleTime: Infinity` — SSE keeps it live)
-  and `["runs"]` (History page, `staleTime: 30s`, invalidated on `run_finished`). All
-  live rendering reads the store via `useFactory`.
+- **TanStack Query** owns the request/cache lifecycle for `["runs"]` only (History page,
+  `staleTime: 30s`, invalidated on `run_finished` and reconnect resync). The `/state`
+  snapshot lives solely in the store mirror — there is no `["state"]` query. All live
+  rendering reads the store via `useFactory`.
 
 ### 5.4 Pages
 
@@ -767,12 +814,16 @@ segments, badges. Never introduce another accent.
   `src/events.ts` (plus §2.1 daemon-only additions); ui-builder copies the verbatim block
   character-for-character into `ui/src/lib/events.ts`. They are duplicated **by design** —
   no cross-package imports, ever.
-- **No new root dependencies**: the daemon side uses `node:http` only; `npm run
+- **No new root dependencies**: the daemon side uses `node:http` only; `bun run
   typecheck` (root) must pass with zero changes to `package.json`/`tsconfig.json`.
-- **UI acceptance**: `cd ui && npm run typecheck && npm run build` clean; `npm run dev`
-  against a daemon started with `DASHBOARD_PORT=8787 npm run factory:dry` shows the
-  Board hydrating from `/state` and at least `daemon_started`/`tick_*`/`queue_snapshot`
-  events streaming. (In `--dry` the dashboard is off *unless* `DASHBOARD_PORT` is set —
+- **Bun everywhere**: every command in both workstreams is `bun` / `bunx`
+  (`bun install`, `bun run <script>`, `bunx tsc`, `bunx vite`, `bunx shadcn`). Never
+  npm/npx/node. (Target client repos keep their own package manager — that is
+  `verify.ts`'s concern, not the UI's.)
+- **UI acceptance**: `cd ui && bun install && bun run typecheck && bun run build` clean;
+  `bun run dev` against a daemon started with `DASHBOARD_PORT=8787 bun run factory:dry`
+  shows the Board hydrating from `/state` and at least
+  `daemon_started`/`tick_*`/`queue_snapshot` events streaming. (In `--dry` the dashboard is off *unless* `DASHBOARD_PORT` is set —
   setting it is the supported way to develop the UI without live Linear writes.)
 - **Server acceptance**: with `DASHBOARD_PORT=8787`, `curl 127.0.0.1:8787/state` returns
   MissionState; `curl -N 127.0.0.1:8787/events` replays history then streams; a second
@@ -780,6 +831,6 @@ segments, badges. Never introduce another accent.
   events; killing the daemon closes clients cleanly and `factory-history.jsonl` contains
   one line per finished run.
 - **Integration agent (afterwards, not the builders)**: adds root scripts
-  `"ui:dev": "npm --prefix ui run dev"`, `"ui:build": "npm --prefix ui run build"`;
+  `"ui:dev": "bun run --cwd ui dev"`, `"ui:build": "bun run --cwd ui build"`;
   verifies the built `ui/dist` is served at `http://127.0.0.1:8787/`.
 - Neither builder commits, pushes, calls Linear, or binds any host other than 127.0.0.1.

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.ts";
+import { summarizeToolInput, type AgentStreamEvent } from "./events.ts";
 
 // Stage runner. Claude roles on DIRECT SDK auth; the Codex reviewer is the only
 // proxy leg. Hardened per code-review verdict 2026-07-20: whitelist-only worker
@@ -27,10 +28,12 @@ interface StageOptions {
   viaProxy?: boolean;
   budgetUsd: number;      // REMAINING issue budget, not a constant (C11)
   deadlineMs: number;     // absolute epoch ms; stage aborts at this time (C12)
+  onEvent?: (event: AgentStreamEvent) => void;   // live stage telemetry (UI observes)
 }
 
 export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
   const t0 = Date.now();
+  opts.onEvent?.({ kind: "stage_started", stage: label, model: opts.model, viaProxy: opts.viaProxy === true });
   // Whitelist ONLY. HOME is required for direct SDK auth (~/.claude); the OS
   // sandbox that would confine it is tracked hardening (C19 — interim: scoped
   // Bash allowlists set by callers, attended operation).
@@ -66,15 +69,29 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
       },
     });
     for await (const message of q) {
-      if ((message as { type?: string }).type === "result") result = message as Record<string, unknown>;
+      const m = message as { type?: string; message?: { content?: unknown } };
+      if (m.type === "assistant" && Array.isArray(m.message?.content)) {
+        for (const block of m.message.content as Array<Record<string, unknown>>) {
+          if (block.type === "tool_use" && typeof block.name === "string") {
+            opts.onEvent?.({ kind: "tool_use", stage: label, tool: block.name,
+              detail: redactSecrets(summarizeToolInput(block.input)).clean.slice(0, 160) });
+          } else if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
+            opts.onEvent?.({ kind: "assistant_text", stage: label,
+              text: redactSecrets(block.text).clean.slice(0, 500) });
+          }
+        }
+      }
+      if (m.type === "result") result = message as Record<string, unknown>;
     }
     // Non-success subtypes (error_max_turns, error_max_budget_usd, …) carry no
     // result field — they must surface as errors, not silent success (C7).
     const subtype = typeof result?.subtype === "string" ? result.subtype : undefined;
+    // SDK error strings are untrusted output — redact before they reach any
+    // event/report path (§2.2: every emitted string passes redactSecrets).
     const subtypeError = subtype && subtype !== "success"
-      ? `${subtype}${Array.isArray(result?.errors) ? `: ${(result.errors as unknown[]).map(String).join("; ").slice(0, 300)}` : ""}`
+      ? redactSecrets(`${subtype}${Array.isArray(result?.errors) ? `: ${(result.errors as unknown[]).map(String).join("; ").slice(0, 300)}` : ""}`).clean
       : undefined;
-    return {
+    const out: StageResult = {
       label,
       text: typeof result?.result === "string" ? result.result : "",
       costUsd: typeof result?.total_cost_usd === "number" ? result.total_cost_usd : 0,
@@ -82,12 +99,20 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
       wallSeconds: Math.round((Date.now() - t0) / 1000),
       error: subtypeError,
     };
+    opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: out.costUsd, turns: out.turns,
+      wallSeconds: out.wallSeconds, resultText: redactSecrets(out.text).clean.slice(0, 4000),
+      ...(out.error ? { error: out.error } : {}) });
+    return out;
   } catch (error) {
-    return {
+    const out: StageResult = {
       label, text: "", costUsd: 0, turns: 0,
       wallSeconds: Math.round((Date.now() - t0) / 1000),
-      error: error instanceof Error ? error.message : String(error),
+      error: redactSecrets(error instanceof Error ? error.message : String(error)).clean,
     };
+    opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: 0, turns: 0,
+      wallSeconds: out.wallSeconds, resultText: "",
+      ...(out.error ? { error: out.error } : {}) });
+    return out;
   } finally {
     clearTimeout(timer);
   }

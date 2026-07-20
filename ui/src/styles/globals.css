@@ -1,0 +1,121 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/space-grotesk/500.css";
+@import "@fontsource/space-grotesk/700.css";
+
+@theme {
+  --color-bg0: #0a0c10;      /* page */
+  --color-bg1: #10141b;      /* panel */
+  --color-bg2: #171d28;      /* raised / hover */
+  --color-line: #232b38;     /* hairlines */
+  --color-line2: #334054;    /* emphasized borders */
+  --color-fg: #e8edf4;
+  --color-fg-dim: #96a0b5;
+  --color-fg-faint: #5c6880;
+
+  --color-live: #ffb224;     /* running / active — instrument amber */
+  --color-ok: #3ddc97;       /* pass / pr_open */
+  --color-err: #ff5d5d;      /* fail / error */
+  --color-parked: #fb923c;   /* parked */
+  --color-human: #f472b6;    /* needs-human */
+  --color-claude: #a78bfa;   /* claude-model chip */
+  --color-codex: #22d3ee;    /* codex / viaProxy chip */
+
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-sans: "Space Grotesk", system-ui, sans-serif;
+}
+
+/* ---------------------------------------------------------------- base */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg0);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-live) 30%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line2) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-line2);
+}
+
+/* Numbers always tabular. */
+.tabular,
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------- motion (§6.3) */
+
+/* Pulse — the ONLY looping animation: 2.4s ease-in-out opacity 0.55→1. */
+@keyframes mc-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.pulse-live {
+  animation: mc-pulse 2.4s ease-in-out infinite;
+}
+
+/* Feed entries: 150ms fade + 2px rise on mount. */
+@keyframes mc-feed-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.feed-in {
+  animation: mc-feed-in 150ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-live,
+  .feed-in {
+    animation: none !important;
+  }
+}
+
+/* Section labels: 10.5px uppercase tracked, fg-faint. */
+.section-label {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-fg-faint);
+}

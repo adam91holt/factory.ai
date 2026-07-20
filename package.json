@@ -9,7 +9,10 @@
     "typecheck": "bunx tsc --noEmit",
     "factory": "bun src/index.ts",
     "factory:once": "bun src/index.ts --once",
-    "factory:dry": "bun src/index.ts --once --dry-run"
+    "factory:dry": "bun src/index.ts --once --dry-run",
+    "factory:server": "bun src/index.ts --server-only",
+    "ui:dev": "bun run --cwd ui dev",
+    "ui:build": "bun run --cwd ui build"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.215"

@@ -6,6 +6,7 @@ import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPat
 import { ensureDeps, detectGates, baseline, verify, gateSummary } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { buildReport, type ReportInput } from "./report.ts";
+import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
 // budget threaded cumulatively (C11), deadline before every stage + abort (C12),
@@ -33,8 +34,21 @@ async function post(issue: linear.Issue, body: string): Promise<void> {
   await linear.postComment(issue, clean);
 }
 
+/** Per-issue AgentStreamEvent → FactoryEvent forwarder (UI observes only). */
+function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
+  return (e) => {
+    if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+    else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
+    else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
+    // "reviewer-fallback" only runs when the Codex leg failed — mark it degraded
+    // live (loop.ts sets StageResult.degraded after runStage already emitted).
+    else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.degraded || e.stage === "reviewer-fallback" ? { degraded: true } : {}) });
+  };
+}
+
 /** Terminal "needs human" — labeled so it can never loop or spam (C6). */
 export async function markNeedsHuman(issue: linear.Issue, reason: string): Promise<void> {
+  bus.emit({ type: "issue_needs_human", issueKey: issue.identifier, reason: redactSecrets(reason).clean.slice(0, 500) });
   await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason}\n\nRemove the \`${linear.NEEDS_HUMAN_LABEL}\` label after fixing to requeue.`);
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch((e) => console.error(`[${issue.identifier}] label failed: ${e}`));
@@ -48,7 +62,11 @@ async function stillOurs(issue: linear.Issue): Promise<boolean> {
 }
 
 /** External transition detected → abandon cleanly: release + short note (C9). */
-async function abortExternal(issue: linear.Issue, where: string): Promise<void> {
+async function abortExternal(issue: linear.Issue, stages: StageResult[], where: string): Promise<void> {
+  bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "aborted",
+    reason: `moved externally during ${where}`, prUrl: null,
+    costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
+    gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
   console.error(`[${issue.identifier}] externally transitioned during ${where} — abandoning`);
   try { await post(issue, `${linear.SENTINEL}\n\n**Outcome:** aborted — issue was moved externally during ${where}; factory abandoned its attempt (worktree kept).`); }
   catch (e) { console.error(`[${issue.identifier}] abort note failed: ${e}`); }
@@ -81,6 +99,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     return;
   }
 
+  const onEvent = forwardStage(issue.identifier);
+  bus.emit({ type: "run_started", issueKey: issue.identifier, title: issue.title, repo, dryRun: config.dryRun });
+
   const stages: StageResult[] = [];
   const budget = new Budget(stages, Date.now() + config.caps.wallMinutesPerIssue * 60_000);
   const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
@@ -104,12 +125,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // ---- implementer
     const implementer = await runStage("implementer",
       `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`,
-      { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs });
+      { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
     if (implementer.error) { await park(issue, stages, `implementer: ${implementer.error}`); return; }
     if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`)) { await park(issue, stages, "implementer produced no committable changes"); return; }
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
-    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, "implementation"); return; }
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "implementation"); return; }
 
     // ---- adversarial review: framing-stripped (spec + diff ONLY), tool-less
     let diff: string;
@@ -121,14 +142,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", reviewPrompt("spec compliance and correctness — walk every ticket requirement"),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs }),
+        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-codex", reviewPrompt("hostile edge cases, regressions, and unstated assumptions"),
-        { model: config.models.reviewerCodex, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, viaProxy: true, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs }),
+        { model: config.models.reviewerCodex, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, viaProxy: true, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
       reviewCodex = await runStage("reviewer-fallback", reviewPrompt("hostile edge cases, regressions, and unstated assumptions"),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs });
+        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
@@ -137,24 +158,32 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
     const fixer = await runStage("fixer",
       `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`,
-      { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs });
+      { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     if (fixer.error) { await park(issue, stages, `fixer: ${fixer.error}`); return; }
     commitAll(ws, `${issue.identifier}: apply review feedback`);
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
-    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, "review"); return; }
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "review"); return; }
 
     // ---- verify (baselined) with bounded, budgeted, deadlined repair rounds
     let results = verify(ws, gates, baselines);
     let summary = gateSummary(results);
+    bus.emit({ type: "run_gates", issueKey: issue.identifier, round: 0,
+      green: summary.green, strength: summary.strength,
+      gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
+        outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
-        { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs });
+        { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
       results = verify(ws, gates, baselines);
       summary = gateSummary(results);
+      bus.emit({ type: "run_gates", issueKey: issue.identifier, round: i + 1,
+        green: summary.green, strength: summary.strength,
+        gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
+          outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
     }
     if (!summary.green) { await park(issue, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
 
@@ -162,7 +191,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const removedTests = testFilesRemoved(ws);
     if (removedTests.length > 0) { await park(issue, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`); return; }
     const guarded = guardedPathsTouched(ws);
-    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, "delivery"); return; }
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "delivery"); return; }
 
     let prUrl: string | null = null;
     if (!config.dryRun) {
@@ -179,6 +208,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       stages, gates: results, gateStrength: summary.strength, guardedPaths: guarded,
       reviewFindingsSummary: fixer.text.slice(0, 1500),
     });
+
+    bus.emit({ type: "run_finished", issueKey: issue.identifier,
+      outcome: guardedStop ? "needs_human" : "pr_open",
+      ...(guardedStop ? { reason: `guarded paths touched: ${guarded.join(", ")}`.slice(0, 500) } : {}),
+      prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
+      stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
+      dryRun: config.dryRun });
 
     // Comment is best-effort; transition/release are guaranteed (C10).
     try { await post(issue, report); } catch (e) { console.error(`[${issue.identifier}] report post failed: ${e}`); }
@@ -205,6 +241,10 @@ async function park(issue: linear.Issue, stages: StageResult[], reason: string):
     issueKey: issue.identifier, prUrl: null, outcome: "parked", reason,
     stages, gates: [], gateStrength: "none", guardedPaths: [],
   };
+  bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "parked",
+    reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,
+    costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
+    gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
   try { await post(issue, buildReport(input)); } catch (e) { console.error(`[${issue.identifier}] park report failed: ${e}`); }
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.PARKED_LABEL).catch((e) => console.error(`[${issue.identifier}] park label failed: ${e}`));

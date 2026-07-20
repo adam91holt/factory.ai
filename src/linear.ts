@@ -1,4 +1,5 @@
 import { config } from "./config.ts";
+import { bus } from "./events.ts";
 
 // Linear GraphQL client. Personal API keys: raw key as Authorization (no
 // "Bearer"). Hardened per code-review verdict 2026-07-20: HTTP status checks +
@@ -74,8 +75,19 @@ export async function fetchQueue(): Promise<Issue[]> {
     }`,
     { teams: config.teamKeys },
   );
+  const all = data.issues.nodes.map(toIssue);
   const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL]);
-  return data.issues.nodes.map(toIssue)
+  bus.emit({
+    type: "queue_snapshot",
+    issues: all.map((i) => ({
+      id: i.id, identifier: i.identifier, title: i.title, url: i.url, teamKey: i.teamKey,
+      stateName: i.stateName, stateType: i.stateType, labels: i.labels, createdAt: i.createdAt,
+      lane: i.labels.includes(PARKED_LABEL) ? "parked"
+        : i.labels.includes(NEEDS_HUMAN_LABEL) ? "needs_human"
+        : i.labels.includes(EXECUTING_LABEL) ? "claimed" : "todo",
+    })),
+  });
+  return all
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // FIFO regardless of server order (C21)
 }

@@ -1,0 +1,64 @@
+import {
+  createRootRoute,
+  createRoute,
+  createRouter,
+} from "@tanstack/react-router";
+import { AppShell } from "./components/shell/AppShell";
+import { BoardPage } from "./pages/BoardPage";
+import { RunsPage } from "./pages/RunsPage";
+import { RunDetailPage } from "./pages/RunDetailPage";
+import { QueuePage } from "./pages/QueuePage";
+import { HistoryPage } from "./pages/HistoryPage";
+
+const rootRoute = createRootRoute({ component: AppShell });
+
+const boardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/",
+  component: BoardPage,
+});
+
+const runsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/runs",
+  component: RunsPage,
+});
+
+const runDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/runs/$issueKey",
+  component: RunDetailRoute,
+});
+
+function RunDetailRoute() {
+  const { issueKey } = runDetailRoute.useParams();
+  return <RunDetailPage issueKey={issueKey} />;
+}
+
+const queueRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/queue",
+  component: QueuePage,
+});
+
+const historyRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/history",
+  component: HistoryPage,
+});
+
+const routeTree = rootRoute.addChildren([
+  boardRoute,
+  runsRoute,
+  runDetailRoute,
+  queueRoute,
+  historyRoute,
+]);
+
+export const router = createRouter({ routeTree });
+
+declare module "@tanstack/react-router" {
+  interface Register {
+    router: typeof router;
+  }
+}
