@@ -144,7 +144,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       runStage("reviewer-claude", reviewPrompt("spec compliance and correctness — walk every ticket requirement"),
         { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-codex", reviewPrompt("hostile edge cases, regressions, and unstated assumptions"),
-        { model: config.models.reviewerCodex, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, viaProxy: true, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerCodex, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {

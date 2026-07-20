@@ -33,7 +33,10 @@ interface StageOptions {
 
 export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
   const t0 = Date.now();
-  opts.onEvent?.({ kind: "stage_started", stage: label, model: opts.model, viaProxy: opts.viaProxy === true });
+  // Non-claude models route via the proxy automatically (any role can be either
+  // vendor); an explicit opts.viaProxy still overrides.
+  const viaProxy = opts.viaProxy ?? (!opts.model.startsWith("claude") && !["opus", "sonnet", "haiku", "fable"].includes(opts.model));
+  opts.onEvent?.({ kind: "stage_started", stage: label, model: opts.model, viaProxy });
   // Whitelist ONLY. HOME is required for direct SDK auth (~/.claude); the OS
   // sandbox that would confine it is tracked hardening (C19 — interim: scoped
   // Bash allowlists set by callers, attended operation).
@@ -48,7 +51,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     TMPDIR: process.env.TMPDIR ?? "/tmp",
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
   };
-  if (opts.viaProxy) {
+  if (viaProxy) {
     env.ANTHROPIC_BASE_URL = config.proxyBaseUrl;
     env.ANTHROPIC_AUTH_TOKEN = config.proxyAuthToken;
   }
