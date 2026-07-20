@@ -151,13 +151,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", reviewPrompt("spec compliance and correctness — walk every ticket requirement"),
         { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
-      runStage("reviewer-codex", reviewPrompt("hostile edge cases, regressions, and unstated assumptions"),
-        { model: config.models.reviewerCodex, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+      runStage("reviewer-repo", reviewPrompt("blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess"),
+        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: 25, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
-      reviewCodex = await runStage("reviewer-fallback", reviewPrompt("hostile edge cases, regressions, and unstated assumptions"),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      reviewCodex = await runStage("reviewer-fallback", reviewPrompt("blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess"),
+        { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: 25, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
