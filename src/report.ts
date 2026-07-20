@@ -1,0 +1,66 @@
+import { SENTINEL } from "./linear.ts";
+import type { StageResult } from "./agents.ts";
+import type { GateResult } from "./verify.ts";
+
+// Factory report: dual-audience — human prose + fenced YAML meta (the
+// triage-agent's parseMeta pattern). This IS the telemetry store: metrics are
+// a Linear query over these blocks. Verdict C23: reason is always queryable.
+
+export interface ReportInput {
+  issueKey: string;
+  prUrl: string | null;
+  outcome: "pr_open" | "parked" | "needs_human" | "blocked" | "aborted";
+  reason?: string;
+  stages: StageResult[];
+  gates: GateResult[];
+  gateStrength: "none" | "weak" | "real";
+  guardedPaths: string[];
+  reviewFindingsSummary?: string;
+}
+
+export function buildReport(input: ReportInput): string {
+  const totalCost = input.stages.reduce((sum, s) => sum + s.costUsd, 0);
+  const degraded = input.stages.some((s) => s.degraded);
+  const lines: string[] = [SENTINEL, ""];
+
+  if (input.outcome === "pr_open" && input.prUrl) {
+    lines.push(`PR ready for review: ${input.prUrl}`, "");
+  } else {
+    lines.push(`**Outcome:** ${input.outcome}${input.reason ? ` — ${input.reason}` : ""}`, "");
+  }
+
+  if (input.gateStrength === "none") {
+    lines.push("⚠️ **No usable verify gate in this repo** (nothing runnable, or gates fail on clean baseline). Review accordingly.", "");
+  }
+  if (input.guardedPaths.length > 0) {
+    lines.push(`🛑 **Touches guarded paths — human must advance this issue manually:** ${input.guardedPaths.join(", ")}`, "");
+  }
+  if (degraded) lines.push("⚠️ Codex reviewer leg was down — Claude fallback reviewed (degraded).", "");
+  if (input.reviewFindingsSummary) {
+    lines.push("**Adversarial review:**", input.reviewFindingsSummary, "");
+  }
+  const gateLines = input.gates.map((g) =>
+    `- ${g.name}: ${g.passed === null ? "no-gate (fails on baseline)" : g.passed ? "pass" : "FAIL"}`);
+  if (gateLines.length > 0) lines.push("**Gates:**", ...gateLines, "");
+
+  lines.push("```yaml");
+  lines.push("meta:");
+  lines.push(`  outcome: ${input.outcome}`);
+  lines.push(`  reason: ${JSON.stringify(input.reason ?? null)}`);
+  lines.push(`  pr: ${input.prUrl ?? "null"}`);
+  lines.push(`  gate_strength: ${input.gateStrength}`);
+  lines.push(`  guarded_paths: ${input.guardedPaths.length}`);
+  lines.push(`  degraded: ${degraded}`);
+  lines.push(`  cost_usd: ${totalCost.toFixed(4)}`);
+  lines.push("  stages:");
+  for (const s of input.stages) {
+    lines.push(`    - name: ${s.label}`);
+    lines.push(`      turns: ${s.turns}`);
+    lines.push(`      wall_s: ${s.wallSeconds}`);
+    lines.push(`      cost_usd: ${s.costUsd.toFixed(4)}`);
+    if (s.error) lines.push(`      error: ${JSON.stringify(s.error.slice(0, 200))}`);
+    if (s.degraded) lines.push("      degraded: true");
+  }
+  lines.push("```");
+  return lines.join("\n");
+}
