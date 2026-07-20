@@ -37,10 +37,15 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   // Whitelist ONLY. HOME is required for direct SDK auth (~/.claude); the OS
   // sandbox that would confine it is tracked hardening (C19 — interim: scoped
   // Bash allowlists set by callers, attended operation).
+  // USER/LOGNAME/TMPDIR are required for direct SDK auth on macOS (keychain
+  // lookup fails with "Not logged in" without them — verified 2026-07-20).
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
     SHELL: process.env.SHELL ?? "",
+    USER: process.env.USER ?? "",
+    LOGNAME: process.env.LOGNAME ?? process.env.USER ?? "",
+    TMPDIR: process.env.TMPDIR ?? "/tmp",
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
   };
   if (opts.viaProxy) {
