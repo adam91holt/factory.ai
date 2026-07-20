@@ -68,13 +68,38 @@ function toIssue(raw: RawIssue): Issue {
 
 const ISSUE_FIELDS = `id identifier title description url createdAt team { id key } state { name type } labels { nodes { name } }`;
 
-/** Issues in watched teams carrying a label (any state). */
-export async function fetchByLabel(label: string): Promise<Issue[]> {
+/** Issues in the given teams (default: all watched) carrying a label (any state). */
+export async function fetchByLabel(label: string, teamKeys: string[] = config.teamKeys): Promise<Issue[]> {
   const data = await gql<{ issues: { nodes: RawIssue[] } }>(
     `query($teams: [String!]!, $label: String!) {
       issues(first: 25, filter: { team: { key: { in: $teams } }, labels: { name: { eq: $label } } }) { nodes { ${ISSUE_FIELDS} } }
-    }`, { teams: config.teamKeys, label });
+    }`, { teams: teamKeys, label });
   return data.issues.nodes.map(toIssue);
+}
+
+/** The unclaimed Todo queue for ONE team — same filter as fetchQueue (unstarted
+ * minus factory-owned labels, FIFO) but scoped to a single team key and WITHOUT
+ * the queue_snapshot emit, so a groundskeeper reading the board to decide
+ * whether humans have pending work never perturbs the dashboard's snapshot. */
+export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
+  const data = await gql<{ issues: { nodes: RawIssue[] } }>(
+    `query($team: String!) {
+      issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "unstarted" } } }) { nodes { ${ISSUE_FIELDS} } }
+    }`, { team: teamKey });
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
+  return data.issues.nodes.map(toIssue)
+    .filter((issue) => !issue.labels.some((l) => skip.has(l)))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/** Issues in a review-type state for ONE team — the "PR open" leg of the
+ * groundskeeper attention cap (started-type states whose name reads "review"). */
+export async function fetchTeamInReview(teamKey: string): Promise<Issue[]> {
+  const data = await gql<{ issues: { nodes: RawIssue[] } }>(
+    `query($team: String!) {
+      issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "started" } } }) { nodes { ${ISSUE_FIELDS} } }
+    }`, { team: teamKey });
+  return data.issues.nodes.map(toIssue).filter((i) => /review/i.test(i.stateName));
 }
 
 /** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first. */
@@ -221,6 +246,43 @@ export async function createSubIssue(parent: Issue, title: string, description: 
       issueCreate(input: { teamId: $teamId, parentId: $parentId, title: $title, description: $description, stateId: $stateId }) {
         success issue { identifier } } }`,
     { teamId: parent.teamId, parentId: parent.id, title, description, stateId: queueState?.id ?? null });
+  if (!data.issueCreate.success) throw new Error(`issueCreate failed for "${title}"`);
+  return data.issueCreate.issue.identifier;
+}
+
+// Team id + queue-state resolution keyed by team KEY (createIssue has no Issue
+// object to hang off, unlike createSubIssue). Cached per key for the process.
+const teamCache = new Map<string, { id: string; queueStateId: string | null }>();
+
+async function resolveTeamByKey(teamKey: string): Promise<{ id: string; queueStateId: string | null }> {
+  const cached = teamCache.get(teamKey);
+  if (cached) return cached;
+  const data = await gql<{ teams: { nodes: Array<{ id: string; states: { nodes: Array<{ id: string; name: string; type: string; position: number }> } }> } }>(
+    `query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1) {
+       nodes { id states { nodes { id name type position } } } } }`, { key: teamKey });
+  const team = data.teams.nodes[0];
+  if (!team) throw new Error(`no Linear team with key ${teamKey}`);
+  const states = team.states.nodes;
+  // Same rule as resolveState(kind:"queue"): prefer unstarted/"Todo", else any
+  // unstarted state — issueCreate would otherwise default to Backlog, which
+  // fetchQueue deliberately never reads.
+  const queue = states.find((s) => s.type === "unstarted" && s.name === "Todo")
+    ?? states.find((s) => s.type === "unstarted") ?? null;
+  const resolved = { id: team.id, queueStateId: queue?.id ?? null };
+  teamCache.set(teamKey, resolved);
+  return resolved;
+}
+
+/** Create a top-level (non-child) contract-conforming issue in a team, pinned to
+ * the queue (unstarted/Todo) state so the factory picks it up like any ticket —
+ * the groundskeeper's ticket-filing primitive. Returns the new identifier. */
+export async function createIssue(teamKey: string, title: string, description: string): Promise<string> {
+  const team = await resolveTeamByKey(teamKey);
+  const data = await gql<{ issueCreate: { success: boolean; issue: { identifier: string } } }>(
+    `mutation($teamId: String!, $title: String!, $description: String!, $stateId: String) {
+      issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId }) {
+        success issue { identifier } } }`,
+    { teamId: team.id, title, description, stateId: team.queueStateId });
   if (!data.issueCreate.success) throw new Error(`issueCreate failed for "${title}"`);
   return data.issueCreate.issue.identifier;
 }

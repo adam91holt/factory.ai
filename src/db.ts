@@ -45,6 +45,46 @@ export function issueEvents(issueKey: string, limit = 2000): unknown[] {
 }
 
 // ---------------------------------------------------------------------------
+// Groundskeeper governance reads (owner request 2026-07-20). Read-only queries
+// over the same durable log the daemon already writes — the loop masters never
+// open their own handle, so a running daemon's factory.db is never touched by a
+// second writer. When the store is closed (dashboard disabled) these return the
+// conservative zero: budget checks see "nothing spent", the parks-spike signal
+// stays quiet. Indexed by idx_events_issue / idx_events_type.
+// ---------------------------------------------------------------------------
+
+/** Sum of run_stage_finished costUsd for one issueKey (e.g. "GK-kiwi-quest")
+ *  since `sinceMs`. Backs a groundskeeper's weekly budget envelope. */
+export function stageSpendForIssueSince(issueKey: string, sinceMs: number): number {
+  if (!db) return 0;
+  const rows = db.prepare(
+    "SELECT json FROM events WHERE type = 'run_stage_finished' AND issue_key = ? AND at >= ?",
+  ).all(issueKey, sinceMs) as Array<{ json: string }>;
+  let total = 0;
+  for (const r of rows) {
+    try { total += num((JSON.parse(r.json) as { costUsd?: unknown }).costUsd); } catch { /* skip one bad row */ }
+  }
+  return total;
+}
+
+/** Count of real (non-dry) run_finished parked outcomes since `sinceMs` — the
+ *  parks-spike signal that flips a groundskeeper into repair-only mode. */
+export function parkedRunsSince(sinceMs: number): number {
+  if (!db) return 0;
+  const rows = db.prepare(
+    "SELECT json FROM events WHERE type = 'run_finished' AND at >= ?",
+  ).all(sinceMs) as Array<{ json: string }>;
+  let n = 0;
+  for (const r of rows) {
+    try {
+      const e = JSON.parse(r.json) as { outcome?: string; dryRun?: boolean };
+      if (!e.dryRun && e.outcome === "parked") n += 1;
+    } catch { /* skip one bad row */ }
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry — aggregate spend/token/outcome stats over the whole durable event
 // log for GET /telemetry. All numbers reflect real API spend, so dry-run stage
 // costs are included in cost/token aggregates AND in per-issue leaderboard

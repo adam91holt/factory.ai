@@ -5,6 +5,7 @@ import { fetchQueue, LinearRateLimited } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
 import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
+import { groundskeeperTick } from "./groundskeepers.ts";
 import { EPIC_LABEL } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
@@ -45,6 +46,7 @@ async function tick(): Promise<boolean> {
   if (queue.length === 0) {
     bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 });
     await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+    await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
     return false;
   }
 
@@ -78,6 +80,7 @@ async function tick(): Promise<boolean> {
   }
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
   await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+  await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
   return batch.length > 0 || inFlight.size > 0;
 }
 

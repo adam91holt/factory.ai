@@ -53,6 +53,12 @@ export const config = {
     wipLimit: num("WIP_LIMIT", 4),
   },
 
+  // Global groundskeeper kill-switch (owner request 2026-07-20): the loop
+  // masters are a NEW spend source and ship OFF. Both this AND a card's own
+  // `enabled: true` must hold for any groundskeeper to run — default is OFF when
+  // the var is unset/empty so a fresh checkout never generates work unattended.
+  groundskeepersEnabled: ["1", "true", "yes", "on"].includes((process.env.GROUNDSKEEPERS_ENABLED ?? "").trim().toLowerCase()),
+
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
   // Repos where the factory may merge its own green, unguarded PRs (greenfield/
   // fun). DEFAULT for every other repo: human merges — the review gate stands.
