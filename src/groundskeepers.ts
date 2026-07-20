@@ -109,6 +109,31 @@ function parseCard(raw: string, fallbackName: string): GroundskeeperCard | null 
   };
 }
 
+/**
+ * Validate a single groundskeeper card's raw markdown the way loadGroundskeepers
+ * validates each file — same parser, same name/schedule/team presence checks,
+ * same NAME_RE, same validateCron — WITHOUT touching disk. The catalog manager
+ * runs this before writing a GK card so an unschedulable or malformed card is
+ * rejected loudly at save time instead of being silently skipped at next load.
+ * `expectedName` is the save target's name; a card whose frontmatter `name`
+ * disagrees is rejected (the write path is <dir>/<expectedName>.md).
+ */
+export function validateGroundskeeperContent(
+  raw: string,
+  expectedName: string,
+): { ok: true; card: GroundskeeperCard } | { ok: false; error: string } {
+  const card = parseCard(raw, expectedName);
+  if (!card) return { ok: false, error: "no YAML frontmatter block (--- ... ---) found" };
+  if (!card.name) return { ok: false, error: "frontmatter is missing name" };
+  if (!card.schedule) return { ok: false, error: "frontmatter is missing schedule (cron)" };
+  if (!card.team) return { ok: false, error: "frontmatter is missing team (Linear key)" };
+  if (!NAME_RE.test(card.name)) return { ok: false, error: `invalid name ${JSON.stringify(card.name)} (must match ${NAME_RE})` };
+  if (card.name !== expectedName) return { ok: false, error: `frontmatter name ${JSON.stringify(card.name)} must equal the file name ${JSON.stringify(expectedName)}` };
+  const cronError = validateCron(card.schedule);
+  if (cronError) return { ok: false, error: `bad schedule ${JSON.stringify(card.schedule)} — ${cronError}` };
+  return { ok: true, card };
+}
+
 // card.name flows into rmSync(join(...), { recursive, force }), git branch
 // names, the state key, and the GK-<name> budget envelope — a traversal like
 // `name: ../..` would aim a recursive force-delete at $HOME. Charset-locked.

@@ -24,6 +24,14 @@ export default defineConfig({
         bypass: (req) =>
           req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
       },
+      // /catalog is the JSON read endpoint AND the SPA route; /catalog/save is
+      // the POST write. Same HTML-bypass split as /runs so a page load of
+      // /catalog still serves the app shell, while fetch()/POST proxy through.
+      "/catalog": {
+        target: "http://127.0.0.1:8787",
+        bypass: (req) =>
+          req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
+      },
     },
   },
 });

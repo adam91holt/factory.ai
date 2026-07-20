@@ -104,6 +104,44 @@ export function parkedRunsSince(sinceMs: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Catalog usage (catalog-manager GET /catalog). Per-card spend/run stats folded
+// from the same run_stage_finished rows telemetry reads — agent cards key by
+// STAGE name (a card named "implementer" ⇒ stage "implementer"), groundskeeper
+// cards key by ISSUE key ("GK-<name>"). Uncapped (unlike getTelemetry's top-10
+// leaderboard) so every card gets its own honest numbers, and cheap: two grouped
+// scans over the indexed run_stage_finished rows. Returns zeroed maps when the
+// store is closed. `turns` is total across runs; the UI divides for an average.
+// ---------------------------------------------------------------------------
+
+export interface CardUsage { runs: number; costUsd: number; turns: number }
+
+export function catalogUsage(): { byStage: Record<string, CardUsage>; byIssueKey: Record<string, CardUsage> } {
+  const byStage: Record<string, CardUsage> = {};
+  const byIssueKey: Record<string, CardUsage> = {};
+  if (!db) return { byStage, byIssueKey };
+  const rows = db.prepare(
+    "SELECT json FROM events WHERE type = 'run_stage_finished'",
+  ).all() as Array<{ json: string }>;
+  for (const r of rows) {
+    let e: { costUsd?: unknown; turns?: unknown; stage?: unknown; issueKey?: unknown };
+    try { e = JSON.parse(r.json) as typeof e; } catch { continue; }
+    const cost = num(e.costUsd);
+    const turns = num(e.turns);
+    if (typeof e.stage === "string" && e.stage.trim() !== "") {
+      const s = byStage[e.stage] ?? { runs: 0, costUsd: 0, turns: 0 };
+      s.runs += 1; s.costUsd += cost; s.turns += turns;
+      byStage[e.stage] = s;
+    }
+    if (typeof e.issueKey === "string" && e.issueKey.trim() !== "") {
+      const k = byIssueKey[e.issueKey] ?? { runs: 0, costUsd: 0, turns: 0 };
+      k.runs += 1; k.costUsd += cost; k.turns += turns;
+      byIssueKey[e.issueKey] = k;
+    }
+  }
+  return { byStage, byIssueKey };
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry — aggregate spend/token/outcome stats over the whole durable event
 // log for GET /telemetry. All numbers reflect real API spend, so dry-run stage
 // costs are included in cost/token aggregates AND in per-issue leaderboard

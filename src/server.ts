@@ -1,5 +1,6 @@
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
+import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { getIssueDetail } from "./linear.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
@@ -8,10 +9,13 @@ import { config } from "./config.ts";
 import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView, type StageView } from "./events.ts";
 
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
-// Observe-only: GET routes exclusively, loopback bind exclusively, no request
-// body ever read, no env echo, no file reads outside ui/dist and
-// factory-history.jsonl. All payload strings were redacted at emit time.
-// node:http only (Bun implements it) — no new dependencies.
+// Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
+// file reads outside ui/dist and factory-history.jsonl. The SINGLE exception is
+// POST /catalog/save (the catalog manager), which reads a bounded JSON body and
+// writes ONE validated card/skill file under agents|skills|groundskeepers, then
+// commits it — a human editing the org through the loopback UI. All emitted
+// payload strings were redacted at emit time. node:http only (Bun implements
+// it) — no new dependencies.
 
 const UI_DIST = fileURLToPath(new URL("../ui/dist", import.meta.url));
 
@@ -243,6 +247,26 @@ function readRunRecords(historyPath: string): RunRecord[] {
   return records.sort((a, b) => b.finishedAt - a.finishedAt).slice(0, 500);
 }
 
+/** Read a request body with a hard byte cap (defends the one write route). The
+ *  content cap in catalog-manager is 64KB; 256KB here leaves room for JSON
+ *  escaping/whitespace while still bounding memory. Resolves null if the cap is
+ *  tripped (the stream is destroyed) or the stream errors. */
+function readBoundedBody(req: IncomingMessage, capBytes: number): Promise<string | null> {
+  return new Promise((resolveBody) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let done = false;
+    const finish = (value: string | null): void => { if (!done) { done = true; resolveBody(value); } };
+    req.on("data", (c: Buffer) => {
+      total += c.length;
+      if (total > capBytes) { req.destroy(); finish(null); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => finish(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => finish(null));
+  });
+}
+
 /** Serve ui/dist/index.html if built. Returns false (nothing written) otherwise. */
 function serveIndex(res: ServerResponse): boolean {
   const index = join(UI_DIST, "index.html");
@@ -299,6 +323,36 @@ export function startDashboard(): {
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+
+    // The one write route. Bounded JSON body → strict validation + git commit in
+    // catalog-manager. Kept ahead of the GET-only guard below.
+    if (url.pathname === "/catalog/save") {
+      if (req.method !== "POST") {
+        res.writeHead(405, { "content-type": "application/json" });
+        res.end('{"error":"method not allowed"}');
+        return;
+      }
+      void readBoundedBody(req, 256 * 1024).then((body) => {
+        if (body === null) {
+          res.writeHead(413, { "content-type": "application/json" });
+          res.end('{"error":"request body too large or unreadable"}');
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end('{"error":"invalid JSON body"}');
+          return;
+        }
+        const result = saveCatalogEntry(parsed);
+        res.writeHead(result.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(result.json));
+      });
+      return;
+    }
+
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain" });
       res.end("method not allowed");
@@ -387,6 +441,23 @@ export function startDashboard(): {
         console.error(`[dashboard] telemetry failed: ${error instanceof Error ? error.message : error}`);
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"error":"telemetry unavailable"}');
+      }
+      return;
+    }
+
+    if (url.pathname === "/catalog") {
+      // Same SPA/API split as /runs and /telemetry: browser navigations to the
+      // /catalog page get the app shell; fetch() clients get the JSON payload.
+      // A read error must 500 this request, never crash the pipeline daemon.
+      if (wantsHtml && serveIndex(res)) return;
+      try {
+        const body = JSON.stringify(readCatalog());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      } catch (error) {
+        console.error(`[dashboard] catalog failed: ${error instanceof Error ? error.message : error}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end('{"error":"catalog unavailable"}');
       }
       return;
     }
