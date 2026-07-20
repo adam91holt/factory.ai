@@ -1,4 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
+import { startEventStore, issueEvents } from "./db.ts";
 import { getIssueDetail } from "./linear.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
@@ -263,9 +264,11 @@ function contentType(path: string): string {
     : "application/octet-stream";
 }
 
-export function startDashboard(): { close(): Promise<void> } | null {
+export function startDashboard(): {
+  close(): Promise<void> } | null {
   const port = resolvePort();
   if (port === null) return null;
+  startEventStore();
 
   const historyPath = join(config.workRoot, "factory-history.jsonl");
   const clients = new Set<{ res: ServerResponse; heartbeat: ReturnType<typeof setInterval> }>();
@@ -332,6 +335,14 @@ export function startDashboard(): { close(): Promise<void> } | null {
     if (url.pathname === "/state") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(mission));
+      return;
+    }
+
+    if (url.pathname === "/run-events") {
+      const key = url.searchParams.get("key") ?? "";
+      if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(issueEvents(key)));
       return;
     }
 
