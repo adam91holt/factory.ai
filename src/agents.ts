@@ -72,12 +72,26 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads
+        includePartialMessages: true, // stream text deltas so tool-less stages (reviewers) show live activity
         env,
         abortController: abort,
       },
     });
+    let streamBuffer = "";
+    let lastStreamEmit = 0;
     for await (const message of q) {
-      const m = message as { type?: string; message?: { content?: unknown } };
+      const m = message as { type?: string; message?: { content?: unknown }; event?: { type?: string; delta?: { type?: string; text?: string } } };
+      if (m.type === "stream_event" && m.event?.type === "content_block_delta" && m.event.delta?.type === "text_delta") {
+        streamBuffer += m.event.delta.text ?? "";
+        const now = Date.now();
+        if (now - lastStreamEmit > 3000 && streamBuffer.trim() !== "") {
+          lastStreamEmit = now;
+          opts.onEvent?.({ kind: "assistant_text", stage: label,
+            text: redactSecrets(streamBuffer.slice(-500)).clean });
+          streamBuffer = "";
+        }
+        continue;
+      }
       if (m.type === "assistant" && Array.isArray(m.message?.content)) {
         for (const block of m.message.content as Array<Record<string, unknown>>) {
           if (block.type === "tool_use" && typeof block.name === "string") {
