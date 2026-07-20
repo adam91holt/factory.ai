@@ -16,7 +16,7 @@ import { buildReport, type ReportInput } from "./report.ts";
 const REQUIRED_SECTIONS = ["## Goal", "## Outcomes", "## Repo", "## Verifications"];
 
 // Interim Bash scoping for write-capable roles (C19; full OS sandbox is backlog).
-const WRITER_BASH = ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(ls:*)", "Bash(cat:*)"];
+const WRITER_BASH = ["Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(ls:*)", "Bash(cat:*)"];
 
 export function missingSections(issue: linear.Issue): string[] {
   return REQUIRED_SECTIONS.filter((s) => !issue.description.includes(s));

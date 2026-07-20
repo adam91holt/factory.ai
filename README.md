@@ -22,11 +22,11 @@ never co-runs with the ProjectManagement triage-agent).
 
 ```bash
 cp .env.example .env   # fill LINEAR_API_KEY + PROXY_AUTH_TOKEN
-npm install
-npm run typecheck
-npm run factory:dry    # one tick, no Linear writes, no PRs
-npm run factory:once   # one live tick
-npm run factory        # watch mode (60s serial ticks)
+bun install
+bun run typecheck
+bun run factory:dry    # one tick, no Linear writes, no PRs
+bun run factory:once   # one live tick
+bun run factory        # watch mode (60s serial ticks)
 ```
 
 ## How an issue flows
