@@ -11,6 +11,14 @@ let db: Database | null = null;
 
 export function startEventStore(): void {
   db = new Database(join(config.workRoot, "factory.db"));
+  // The daemon and a --server-only dashboard may share this file. Without WAL +
+  // busy_timeout a long telemetry read holds the lock, the writer's INSERT
+  // throws SQLITE_BUSY, and the subscriber catch below silently DROPS the event
+  // from the durable log.
+  db.run("PRAGMA busy_timeout = 2000");
+  try { db.run("PRAGMA journal_mode = WAL"); } catch (error) {
+    console.error(`[db] WAL switch failed (keeping default journal): ${error instanceof Error ? error.message : error}`);
+  }
   db.run(`CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     seq INTEGER, at INTEGER, type TEXT, issue_key TEXT, json TEXT)`);
@@ -39,9 +47,13 @@ export function issueEvents(issueKey: string, limit = 2000): unknown[] {
 // ---------------------------------------------------------------------------
 // Telemetry — aggregate spend/token/outcome stats over the whole durable event
 // log for GET /telemetry. All numbers reflect real API spend, so dry-run stage
-// costs are included in cost/token aggregates; dry-run *deliveries* (rehearsals)
-// are excluded from outcome/leaderboard counts. Every string is already redacted
-// at emit time. Queries are indexed by `type` (idx_events_type).
+// costs are included in cost/token aggregates AND in per-issue leaderboard
+// spend (folded from stage rows so it always reconciles with the spend totals,
+// including runs that never emitted run_finished); dry-run *deliveries*
+// (rehearsals) are excluded from run/outcome counts. Every string is already
+// redacted at emit time. Queries are indexed by `type` (idx_events_type), and
+// the computed aggregate is cached on a stage/run-row watermark so idle
+// dashboard polls don't re-scan the log.
 // ---------------------------------------------------------------------------
 
 export interface Telemetry {
@@ -64,15 +76,19 @@ export interface Telemetry {
   outcomes: { pr_open: number; planned: number; parked: number; needs_human: number; aborted: number };
   /** top-5 park reasons by frequency. */
   parkReasons: Array<{ reason: string; count: number }>;
-  /** top-10 issues by total spend. */
+  /** top-10 issues by total spend (stage-row spend; runs = non-dry deliveries). */
   costPerIssue: Array<{ issueKey: string; costUsd: number; runs: number }>;
 }
 
-type ModelUsage = { in: number; out: number; cacheRead: number; cacheWrite: number; costUsd: number };
-interface StageFinished { costUsd?: number; turns?: number; stage?: string;
-  modelUsage?: Record<string, ModelUsage> }
-interface RunFinished { outcome?: string; reason?: string; costUsd?: number; issueKey?: string;
+// Rows come back from a durable log that outlives any single daemon version —
+// field SHAPES are as untrusted as field presence. Never assume numbers.
+interface StageFinished { costUsd?: number; turns?: number; stage?: string; issueKey?: string;
+  modelUsage?: Record<string, unknown> }
+interface RunFinished { outcome?: string; reason?: string; issueKey?: string;
   dryRun?: boolean; stages?: Array<{ degraded?: boolean }> }
+
+/** Coerce a stored field to a finite number (same guard as agents.ts's writer). */
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 function dayKey(at: number): string {
   const d = new Date(at);
@@ -95,11 +111,28 @@ function emptyTelemetry(): Telemetry {
   };
 }
 
+// Cache of the last computed aggregate. The result only changes when a new
+// stage/run row lands (watermark: newest relevant row id — two index seeks) or
+// the local calendar day rolls over (the zero-filled `daily` window moves).
+let telemetryCache: { watermark: number; day: string; value: Telemetry } | null = null;
+
 /** Aggregate GET /telemetry from the durable event log. Returns a zeroed shape
  *  when the store is not open or holds no events. */
 export function getTelemetry(): Telemetry {
+  if (!db) return emptyTelemetry();
+
+  const wm = db.prepare(
+    `SELECT max(
+       COALESCE((SELECT MAX(id) FROM events WHERE type = 'run_stage_finished'), 0),
+       COALESCE((SELECT MAX(id) FROM events WHERE type = 'run_finished'), 0)
+     ) AS m`,
+  ).get() as { m: number };
+  const today = dayKey(Date.now());
+  if (telemetryCache && telemetryCache.watermark === wm.m && telemetryCache.day === today) {
+    return { ...telemetryCache.value, generatedAt: Date.now() };
+  }
+
   const t = emptyTelemetry();
-  if (!db) return t;
   const dailyByDate = new Map(t.daily.map((d) => [d.date, d]));
 
   const stageRows = db.prepare(
@@ -107,26 +140,39 @@ export function getTelemetry(): Telemetry {
   ).all() as Array<{ at: number; json: string }>;
   const perModel = new Map<string, Telemetry["perModel"][number]>();
   const perStage = new Map<string, Telemetry["perStage"][number]>();
+  const costByIssue = new Map<string, { costUsd: number; runs: number }>();
 
   for (const row of stageRows) {
     let e: StageFinished;
     try { e = JSON.parse(row.json) as StageFinished; } catch { continue; }
-    const costUsd = typeof e.costUsd === "number" ? e.costUsd : 0;
-    const turns = typeof e.turns === "number" ? e.turns : 0;
+    const costUsd = num(e.costUsd);
+    const turns = num(e.turns);
     t.totals.costUsd += costUsd;
     t.totals.turns += turns;
     t.totals.stageRuns += 1;
 
     let stageIn = 0, stageOut = 0, stageCacheRead = 0;
-    for (const [model, u] of Object.entries(e.modelUsage ?? {})) {
+    for (const [model, uRaw] of Object.entries(e.modelUsage ?? {})) {
+      if (typeof uRaw !== "object" || uRaw === null) continue; // one bad row must not kill /telemetry
+      const u = uRaw as Record<string, unknown>;
+      const uIn = num(u.in), uOut = num(u.out);
+      const uCacheRead = num(u.cacheRead), uCacheWrite = num(u.cacheWrite), uCost = num(u.costUsd);
       const pm = perModel.get(model) ?? { model, calls: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
       pm.calls += 1;
-      pm.tokensIn += u.in; pm.tokensOut += u.out;
-      pm.cacheRead += u.cacheRead; pm.cacheWrite += u.cacheWrite; pm.costUsd += u.costUsd;
+      pm.tokensIn += uIn; pm.tokensOut += uOut;
+      pm.cacheRead += uCacheRead; pm.cacheWrite += uCacheWrite; pm.costUsd += uCost;
       perModel.set(model, pm);
-      stageIn += u.in; stageOut += u.out; stageCacheRead += u.cacheRead;
-      t.totals.tokensIn += u.in; t.totals.tokensOut += u.out;
-      t.totals.cacheRead += u.cacheRead; t.totals.cacheWrite += u.cacheWrite;
+      stageIn += uIn; stageOut += uOut; stageCacheRead += uCacheRead;
+      t.totals.tokensIn += uIn; t.totals.tokensOut += uOut;
+      t.totals.cacheRead += uCacheRead; t.totals.cacheWrite += uCacheWrite;
+    }
+
+    // Leaderboard SPEND folds from stage rows so it reconciles with the spend
+    // totals above — dry-run and crashed runs included, no "?" bucket.
+    if (typeof e.issueKey === "string" && e.issueKey.trim() !== "") {
+      const cbi = costByIssue.get(e.issueKey) ?? { costUsd: 0, runs: 0 };
+      cbi.costUsd += costUsd;
+      costByIssue.set(e.issueKey, cbi);
     }
 
     const stageName = typeof e.stage === "string" ? e.stage : "unknown";
@@ -146,7 +192,6 @@ export function getTelemetry(): Telemetry {
     "SELECT at, json FROM events WHERE type = 'run_finished' ORDER BY id ASC",
   ).all() as Array<{ at: number; json: string }>;
   const parkReasons = new Map<string, number>();
-  const costByIssue = new Map<string, { costUsd: number; runs: number }>();
 
   for (const row of runRows) {
     let e: RunFinished;
@@ -164,13 +209,15 @@ export function getTelemetry(): Telemetry {
       const key = e.reason.trim().slice(0, 120);
       parkReasons.set(key, (parkReasons.get(key) ?? 0) + 1);
     }
-    if ((e.stages ?? []).some((s) => s.degraded)) t.totals.degradedRuns += 1;
+    if (Array.isArray(e.stages) && e.stages.some((s) => s?.degraded === true)) t.totals.degradedRuns += 1;
 
-    const issueKey = typeof e.issueKey === "string" ? e.issueKey : "?";
-    const cbi = costByIssue.get(issueKey) ?? { costUsd: 0, runs: 0 };
-    cbi.costUsd += typeof e.costUsd === "number" ? e.costUsd : 0;
-    cbi.runs += 1;
-    costByIssue.set(issueKey, cbi);
+    // Spend comes from stage rows above; run_finished only contributes the
+    // delivery count. Rows without a string issueKey are skipped, never "?".
+    if (typeof e.issueKey === "string" && e.issueKey.trim() !== "") {
+      const cbi = costByIssue.get(e.issueKey) ?? { costUsd: 0, runs: 0 };
+      cbi.runs += 1;
+      costByIssue.set(e.issueKey, cbi);
+    }
 
     const bucket = dailyByDate.get(dayKey(row.at));
     if (bucket) bucket.runs += 1;
@@ -186,5 +233,6 @@ export function getTelemetry(): Telemetry {
     .map(([issueKey, v]) => ({ issueKey, costUsd: v.costUsd, runs: v.runs }))
     .sort((a, b) => b.costUsd - a.costUsd)
     .slice(0, 10);
+  telemetryCache = { watermark: wm.m, day: today, value: t };
   return t;
 }

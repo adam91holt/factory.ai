@@ -338,12 +338,6 @@ export function startDashboard(): {
       return;
     }
 
-    if (url.pathname === "/telemetry") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(getTelemetry()));
-      return;
-    }
-
     if (url.pathname === "/run-events") {
       const key = url.searchParams.get("key") ?? "";
       if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
@@ -373,6 +367,24 @@ export function startDashboard(): {
       if (wantsHtml && serveIndex(res)) return;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(readRunRecords(historyPath)));
+      return;
+    }
+
+    if (url.pathname === "/telemetry") {
+      // Same SPA/API split as /runs: browser navigations (reload, bookmark,
+      // deep link) get the app shell; API clients get JSON. And the aggregate
+      // reads durable rows — a bad row or sqlite error must 500 this request,
+      // never take down the daemon serving the pipeline.
+      if (wantsHtml && serveIndex(res)) return;
+      try {
+        const body = JSON.stringify(getTelemetry());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      } catch (error) {
+        console.error(`[dashboard] telemetry failed: ${error instanceof Error ? error.message : error}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end('{"error":"telemetry unavailable"}');
+      }
       return;
     }
 

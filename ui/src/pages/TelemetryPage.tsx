@@ -54,7 +54,7 @@ export function TelemetryPage() {
       <div className="flex flex-wrap items-baseline gap-3">
         <h1 className="text-sm font-bold tracking-wide text-fg">Telemetry</h1>
         <span className="font-mono text-[11px] text-fg-faint">
-          {totals.stageRuns} stage runs · {totals.degradedRuns} degraded · updated {relTime(data.generatedAt)}
+          {totals.stageRuns} stage runs · {totals.degradedRuns} degraded runs · updated {relTime(data.generatedAt)}
         </span>
       </div>
 
@@ -72,7 +72,7 @@ export function TelemetryPage() {
           accent="claude"
         />
         <StatTile
-          label="Runs delivered"
+          label="Runs finished"
           value={totals.runs}
           sub={`${totals.prOpen} PRs open`}
           accent="ok"

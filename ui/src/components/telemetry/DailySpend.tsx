@@ -6,23 +6,26 @@ type Day = Telemetry["daily"][number];
 
 const WEEKDAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-function parts(date: string): { weekday: string; dom: string; isToday: boolean } {
+function parts(date: string): { weekday: string; dom: string } {
   const [y, m, d] = date.split("-").map(Number);
   const dt = new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1);
-  const now = new Date();
-  const isToday = dt.getFullYear() === now.getFullYear() && dt.getMonth() === now.getMonth() && dt.getDate() === now.getDate();
-  return { weekday: WEEKDAY[dt.getDay()] ?? "", dom: String(dt.getDate()), isToday };
+  return { weekday: WEEKDAY[dt.getDay()] ?? "", dom: String(dt.getDate()) };
 }
 
 export function DailySpend({ daily }: { daily: Day[] }) {
   const maxCost = Math.max(...daily.map((d) => d.costUsd), 0.0001);
   const weekTotal = daily.reduce((s, d) => s + d.costUsd, 0);
+  // Buckets are server-local calendar days; "today" is the server's newest
+  // bucket — never the browser clock (remote-TZ/midnight viewers would
+  // highlight the wrong bar, or none).
+  const todayKey = daily[daily.length - 1]?.date;
 
   return (
     <div className="flex flex-col gap-2">
       <div className="flex h-28 items-end gap-1.5">
         {daily.map((d) => {
-          const { weekday, dom, isToday } = parts(d.date);
+          const { weekday, dom } = parts(d.date);
+          const isToday = d.date === todayKey;
           const h = Math.max(2, (d.costUsd / maxCost) * 100);
           return (
             <div key={d.date} className="group flex min-w-0 flex-1 flex-col items-center gap-1">

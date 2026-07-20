@@ -159,12 +159,24 @@ function compactModelUsage(raw: unknown): ModelUsageCompact | undefined {
   const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
   const out: ModelUsageCompact = {};
   for (const [model, usage] of Object.entries(raw as Record<string, unknown>)) {
+    if (Object.keys(out).length >= 16) break; // bound entry count — durable events stay small
     if (typeof usage !== "object" || usage === null) continue;
     const u = usage as Record<string, unknown>;
-    out[model] = {
+    // Model-id KEYS are strings from the SDK result JSON — on proxy legs that
+    // is third-party output, so like every emitted string they pass
+    // redactSecrets and a length cap (§2.2). Colliding keys merge.
+    const key = redactSecrets(model).clean.slice(0, 120);
+    if (key === "") continue;
+    const entry = {
       in: n(u.inputTokens), out: n(u.outputTokens),
       cacheRead: n(u.cacheReadInputTokens), cacheWrite: n(u.cacheCreationInputTokens),
       costUsd: n(u.costUSD),
+    };
+    const prev = out[key];
+    out[key] = prev === undefined ? entry : {
+      in: prev.in + entry.in, out: prev.out + entry.out,
+      cacheRead: prev.cacheRead + entry.cacheRead, cacheWrite: prev.cacheWrite + entry.cacheWrite,
+      costUsd: prev.costUsd + entry.costUsd,
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;

@@ -11,6 +11,7 @@ function stageBar(label: string): string {
   if (label.startsWith("design")) return "bg-human/70";
   if (label === "fixer" || label.startsWith("verify-repair")) return "bg-parked/70";
   if (label === "tester") return "bg-ok/70";
+  if (label === "scout" || label === "decomposer" || label === "planner" || label === "steward") return "bg-fg-dim/60"; // planning stages — neutral slate
   return "bg-live/70"; // implementer
 }
 

@@ -11,6 +11,7 @@ function stageColor(label: string): string {
   if (label === "reviewer-codex") return "bg-codex/70";
   if (label.startsWith("reviewer")) return "bg-claude/70";
   if (label === "fixer" || label.startsWith("verify-repair")) return "bg-parked/70";
+  if (label === "scout" || label === "decomposer" || label === "planner" || label === "steward") return "bg-fg-dim/60"; // planning stages — neutral slate
   return "bg-live/70"; // implementer
 }
 
