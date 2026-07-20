@@ -1,3 +1,5 @@
+import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
@@ -17,17 +19,17 @@ interface ChildSpec {
   description: string;
 }
 
-function parseChildren(text: string): ChildSpec[] {
-  const match = text.match(/```json\s*([\s\S]*?)```/);
-  const raw = match?.[1] ?? text;
-  const start = raw.indexOf("[");
-  const end = raw.lastIndexOf("]");
-  if (start === -1 || end <= start) throw new Error("decomposer returned no JSON array");
-  const parsed = JSON.parse(raw.slice(start, end + 1)) as unknown;
-  if (!Array.isArray(parsed)) throw new Error("decomposer JSON is not an array");
-  const children = parsed.filter((c): c is ChildSpec =>
-    typeof (c as ChildSpec).title === "string" && typeof (c as ChildSpec).description === "string");
-  if (children.length < 2 || children.length > 6) throw new Error(`decomposer produced ${children.length} children (expected 2-6)`);
+/** Children are read from files the decomposer WROTE (one .md per child,
+ * first line "# Title") — no giant-JSON-in-result-text to truncate. */
+function readChildren(dir: string): ChildSpec[] {
+  const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
+  const children = files.map((f) => {
+    const body = readFileSync(join(dir, f), "utf8").trim();
+    const lines = body.split("\n");
+    const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
+    return { title, description: lines.slice(1).join("\n").trim() };
+  }).filter((c) => c.title.length > 0 && c.description.length > 50);
+  if (children.length < 2 || children.length > 6) throw new Error(`decomposer produced ${children.length} valid child files (expected 2-6)`);
   return children;
 }
 
@@ -69,21 +71,24 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     stages.push(scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
 
-    // ---- decomposer: children as JSON, every child a full ticket contract.
+    // ---- decomposer: children as FILES, every child a full ticket contract.
+    const scratch = join(config.workRoot, ".plan-scratch", issue.identifier);
+    rmSync(scratch, { recursive: true, force: true });
+    mkdirSync(join(scratch, "children"), { recursive: true });
     const decomposer = await runStage("decomposer",
       [
         "You are the decomposer in a software factory's planning stage. Using the epic and the scout's research brief, produce 2-6 child tickets that TOGETHER deliver the epic. HARD RULES:",
         '- Every child MUST be independently implementable and ALL children may run IN PARALLEL — declare a "## Area" section listing the file paths/directories that child owns, and areas MUST NOT overlap. Anything inherently sequential belongs merged into one child.',
         `- Every child description MUST contain exactly these sections: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo}), ## Verifications (Automated/Manual/Visual), ## Area, and optionally ## Implementation approach.`,
         "- Size each child to fit one implementer session (~40 turns / 45 min).",
-        'Return ONLY a JSON array in a ```json fence: [{"title": "...", "description": "..."}]',
+        'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
         "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
       ].join("\n"),
-      { model: config.models.planner, maxTurns: 4, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: config.models.planner, cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
 
-    const children = parseChildren(decomposer.text);
+    const children = readChildren(join(scratch, "children"));
     if (config.dryRun) {
       console.log(`[${issue.identifier}] dry-run: would create ${children.length} children: ${children.map((c) => c.title).join(" | ")}`);
       finish("pr_open", `dry-run: planned ${children.length} children`);
