@@ -55,6 +55,13 @@ export async function markNeedsHuman(issue: linear.Issue, reason: string): Promi
   }
 }
 
+/** Post a stage's final output onto the ticket as an audit-trail comment. */
+export async function postStageComment(issue: linear.Issue, stage: StageResult): Promise<void> {
+  const body = [`\u{1F916} **Stage: ${stage.label}** \u00b7 ${stage.turns} turns \u00b7 ${stage.wallSeconds}s \u00b7 $${stage.costUsd.toFixed(4)}${stage.degraded ? " \u00b7 DEGRADED" : ""}${stage.error ? ` \u00b7 ERROR: ${stage.error.slice(0, 200)}` : ""}`,
+    "", stage.text.slice(0, 3000) || "_(no text output)_"].join("\n");
+  await post(issue, body).catch((e) => console.error(`[${issue.identifier}] stage comment failed: ${e}`));
+}
+
 /** Re-check claim before every mutating side effect. */
 async function stillOurs(issue: linear.Issue): Promise<boolean> {
   const fresh = await linear.getIssue(issue.id);
@@ -127,6 +134,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`,
       { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
+    await postStageComment(issue, implementer);
     if (implementer.error) { await park(issue, stages, `implementer: ${implementer.error}`); return; }
     if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`)) { await park(issue, stages, "implementer produced no committable changes"); return; }
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
@@ -153,6 +161,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
+    await postStageComment(issue, reviewClaude);
+    await postStageComment(issue, reviewCodex);
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
@@ -160,6 +170,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`,
       { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
+    await postStageComment(issue, fixer);
     if (fixer.error) { await park(issue, stages, `fixer: ${fixer.error}`); return; }
     commitAll(ws, `${issue.identifier}: apply review feedback`);
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
@@ -177,6 +188,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
         { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
+    await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
       results = verify(ws, gates, baselines);
       summary = gateSummary(results);

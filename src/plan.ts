@@ -4,6 +4,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, type StageResult } from "./agents.ts";
+import { postStageComment } from "./loop.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
@@ -69,6 +70,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
       `You are the research scout in a software factory's planning stage. Investigate everything needed to break the epic below into parallel implementation tickets: read the repo in the current directory (structure, stack, conventions, reference/ material if present), and use WebSearch/WebFetch for anything external the epic depends on. Return a dense research brief: what exists, what must be built, data sources/APIs with concrete endpoints or file paths, risks, and a suggested split into independent work areas.\n\n${spec}`,
       { model: config.models.scout, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
+    await postStageComment(issue, scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
 
     // ---- decomposer: children as FILES, every child a full ticket contract.
@@ -86,6 +88,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
       ].join("\n"),
       { model: config.models.planner, cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
+    await postStageComment(issue, decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
 
     const children = readChildren(join(scratch, "children"));

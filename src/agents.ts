@@ -35,7 +35,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   const t0 = Date.now();
   // Non-claude models route via the proxy automatically (any role can be either
   // vendor); an explicit opts.viaProxy still overrides.
-  const viaProxy = opts.viaProxy ?? (!opts.model.startsWith("claude") && !["opus", "sonnet", "haiku", "fable"].includes(opts.model));
+  const viaProxy = opts.viaProxy ?? (config.proxyAll || (!opts.model.startsWith("claude") && !["opus", "sonnet", "haiku", "fable"].includes(opts.model)));
   opts.onEvent?.({ kind: "stage_started", stage: label, model: opts.model, viaProxy });
   // Whitelist ONLY. HOME is required for direct SDK auth (~/.claude); the OS
   // sandbox that would confine it is tracked hardening (C19 — interim: scoped

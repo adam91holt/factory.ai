@@ -49,6 +49,7 @@ export const config = {
     wipLimit: num("WIP_LIMIT", 4),
   },
 
+  proxyAll: (process.env.PROXY_ALL ?? "1") !== "0", // route ALL stages via CLIProxyAPI (multi-account pooling)
   watchIntervalSeconds: Math.max(60, num("WATCH_INTERVAL_SECONDS", 60)),
   oneShot: process.argv.includes("--once"),
   dryRun: process.argv.includes("--dry-run"),
