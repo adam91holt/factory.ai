@@ -153,11 +153,14 @@ export async function transition(issue: Issue, kind: StateKind): Promise<boolean
 /** Create a contract-conforming child under an epic (PLAN stage). Lands in the
  * default triage-less backlog state; the factory picks it up like any ticket. */
 export async function createSubIssue(parent: Issue, title: string, description: string): Promise<string> {
+  // Pin the queue (unstarted/Todo) state at creation — issueCreate's default is
+  // the team's Backlog state, which fetchQueue deliberately does not read.
+  const queueState = await resolveState(parent, "queue");
   const data = await gql<{ issueCreate: { success: boolean; issue: { identifier: string } } }>(
-    `mutation($teamId: String!, $parentId: String!, $title: String!, $description: String!) {
-      issueCreate(input: { teamId: $teamId, parentId: $parentId, title: $title, description: $description }) {
+    `mutation($teamId: String!, $parentId: String!, $title: String!, $description: String!, $stateId: String) {
+      issueCreate(input: { teamId: $teamId, parentId: $parentId, title: $title, description: $description, stateId: $stateId }) {
         success issue { identifier } } }`,
-    { teamId: parent.teamId, parentId: parent.id, title, description });
+    { teamId: parent.teamId, parentId: parent.id, title, description, stateId: queueState?.id ?? null });
   if (!data.issueCreate.success) throw new Error(`issueCreate failed for "${title}"`);
   return data.issueCreate.issue.identifier;
 }
