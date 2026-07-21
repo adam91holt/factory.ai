@@ -107,3 +107,15 @@ This is what lets the global default stay cheap (sonnet/opus routing) while high
 3. **Existing-complex-project resolution** — for repos that are docs hubs routing to real code (the Rapido hub → fck.mongo/service.* pattern, see rapido-operational-picture): the factory clones the hub, reads its CLAUDE.md router, and worktrees the named sibling code repos. Multi-repo tickets get an ordered PR list (the deferred changeset contract) rather than auto-merge-across-repos.
 
 Anti-goals: bootstrap must not auto-create public repos or push secrets; new repos default to private + human-gated merge until trust is earned per the merge-policy ramp; the registry never grants a project's workers ambient MCP/secrets — allowlisted per card.
+
+## Epic (high priority — robustness substrate): Linear custom fields instead of markdown-parsed metadata
+**Adam, 2026-07-21:** the machine-critical ticket data (repo, type, model, merge policy, factory state) is encoded as free-text markdown today and parsed by regex — the source of tonight's two bugs (create-then-label race; `## Repo (org/name)` parse failure when Fable formatted the section differently than Opus). Move structured metadata to **Linear custom fields** (typed: text / number / select), set/read via GraphQL, per team.
+
+Migrate:
+- **Repo** → text field (read exactly, no regex).
+- **Work Type** → select (Epic / Task / Chore) — set atomically on create, kills the create-then-label epic race.
+- **Model** → select on the epic; decomposer copies the value to each child (the per-epic model override, done robustly).
+- **Merge Policy** → select (auto / shadow / review) per issue — replaces the `.env` MERGE_AUTO_REPOS allowlist.
+- **Factory State** → select — explicit factory lifecycle instead of label archaeology (Executing/Parked/Needs-Human/Stewarded become field values or stay labels, but the load-bearing routing reads fields).
+
+The decomposer/intake WRITE typed field values; the daemon READS typed values (linear.ts gains field get/set helpers via `customFieldValues`/`attributeCreate`-style mutations). Markdown body keeps the human-readable Goal/Why/Outcomes; machine fields leave the prose. Bonus: filterable Linear views (e.g. Model=Fable, Merge=review) for free. This is the substrate the per-epic model override, merge-policy, and project-registry epics all build on — do it before them. Anti-goal: don't rip out label-based routing in one shot — add fields alongside, migrate readers, then retire the fragile parsers with the parser-hardening as the safety net during transition.
