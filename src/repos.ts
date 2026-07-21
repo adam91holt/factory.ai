@@ -29,8 +29,13 @@ export interface Workspace {
 
 /** Parse the "## Repo" section of the ticket contract (loosened per C24). */
 export function repoFromTicket(description: string): string | null {
-  const match = description.match(/##\s*Repo\s*\n+[\s>`*-]*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
-  return match?.[1] ?? null;
+  // Extract the "## Repo" section (up to the next heading), then find the first
+  // org/name anywhere in it — tolerant of "## Repo (org/name)", a bare line,
+  // backticks, or a link. (Decomposers format this inconsistently: parens on
+  // the header line vs the repo on the next line.)
+  const section = description.match(/##\s*Repo\b([\s\S]*?)(?:\n##\s|$)/);
+  const repo = section?.[1]?.match(/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/)?.[1];
+  return repo ?? null;
 }
 
 // Per-repo mutex: concurrent same-repo issues serialize workspace setup (C15).
