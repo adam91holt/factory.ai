@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
+import { listLessons, archiveLesson } from "./lessons.ts";
 import { getIssueDetail } from "./linear.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
@@ -10,12 +11,14 @@ import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView
 
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
 // Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
-// file reads outside ui/dist and factory-history.jsonl. The SINGLE exception is
-// POST /catalog/save (the catalog manager), which reads a bounded JSON body and
-// writes ONE validated card/skill file under agents|skills|groundskeepers, then
-// commits it — a human editing the org through the loopback UI. All emitted
-// payload strings were redacted at emit time. node:http only (Bun implements
-// it) — no new dependencies.
+// file reads outside ui/dist and factory-history.jsonl. The exceptions are the
+// two guarded POSTs: /catalog/save (the catalog manager), which reads a bounded
+// JSON body and writes ONE validated card/skill file under
+// agents|skills|groundskeepers, then commits it — and /lessons/archive, which
+// flips archived=1 on ONE lesson row (never a delete) — both a human editing
+// the org through the loopback UI, both behind the same guardedJsonBody()
+// CSRF/DNS-rebinding gate. All emitted payload strings were redacted at emit
+// time. node:http only (Bun implements it) — no new dependencies.
 
 const UI_DIST = fileURLToPath(new URL("../ui/dist", import.meta.url));
 
@@ -267,6 +270,71 @@ function readBoundedBody(req: IncomingMessage, capBytes: number): Promise<string
   });
 }
 
+// ---------------------------------------------------------------------------
+// guardedJsonBody — the shared gate in front of EVERY mutation route
+// (/catalog/save, /lessons/archive). Extracted, not duplicated, so the two
+// write routes cannot drift apart or silently weaken. Each write route is
+// reachable from the owner's browser at 127.0.0.1 — loopback bind is NOT a
+// boundary against a page the owner happens to have open (the browser runs the
+// attacker's JS and can POST here). Require a same-origin JSON write:
+//   • POST only — anything else is 405 (and the OPTIONS preflight a
+//     cross-origin fetch() triggers gets no CORS headers → the browser never
+//     sends the POST).
+//   • Content-Type application/json (load-bearing): the CORS-"simple"
+//     form/text-plain vector cannot set it, and setting it cross-origin forces
+//     the preflight above.
+//   • Origin, when present, must be a LOOPBACK origin (http/https on
+//     127.0.0.1 or localhost, any port). A page the owner visits lives on a
+//     public origin, so this refuses every drive-by while still allowing the
+//     built dashboard AND the vite dev proxy (its own port).
+//   • Host, when present, must be a loopback host — kills DNS-rebinding (a
+//     rebound attacker domain sends Host: attacker.com, not 127.0.0.1).
+//   • Body bounded at 256KB and parsed as JSON here, so no route ever holds
+//     an unbounded or unparsed body.
+// The real UI sends content-type application/json same-origin, so nothing
+// legitimate is affected (ui/src/lib/catalog.ts, ui/src/lib/lessons.ts).
+// Resolves { body } with the parsed JSON, or null after having written the
+// refusal response itself (wrapped so a legitimate JSON body of `null` can't
+// be mistaken for a refusal and leave the request hanging).
+// ---------------------------------------------------------------------------
+async function guardedJsonBody(req: IncomingMessage, res: ServerResponse): Promise<{ body: unknown } | null> {
+  if (req.method !== "POST") {
+    res.writeHead(405, { "content-type": "application/json" });
+    res.end('{"error":"method not allowed"}');
+    return null;
+  }
+  const isLoopbackHostname = (h: string): boolean => h === "127.0.0.1" || h === "localhost";
+  const origin = req.headers.origin;
+  let originOk = true;
+  if (origin !== undefined) {
+    try {
+      const u = new URL(origin);
+      originOk = (u.protocol === "http:" || u.protocol === "https:") && isLoopbackHostname(u.hostname);
+    } catch { originOk = false; }
+  }
+  const host = req.headers.host;
+  const hostOk = host === undefined || isLoopbackHostname(host.replace(/:\d+$/, "").toLowerCase());
+  const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  if (contentType !== "application/json" || !originOk || !hostOk) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end('{"error":"cross-origin or non-JSON write refused"}');
+    return null;
+  }
+  const body = await readBoundedBody(req, 256 * 1024);
+  if (body === null) {
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end('{"error":"request body too large or unreadable"}');
+    return null;
+  }
+  try {
+    return { body: JSON.parse(body) as unknown };
+  } catch {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end('{"error":"invalid JSON body"}');
+    return null;
+  }
+}
+
 /** Serve ui/dist/index.html if built. Returns false (nothing written) otherwise. */
 function serveIndex(res: ServerResponse): boolean {
   const index = join(UI_DIST, "index.html");
@@ -324,65 +392,45 @@ export function startDashboard(): {
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
 
-    // The one write route. Bounded JSON body → strict validation + git commit in
-    // catalog-manager. Kept ahead of the GET-only guard below.
+    // Write route: bounded JSON body → strict validation + git commit in
+    // catalog-manager. Guard semantics live in guardedJsonBody(). Kept ahead of
+    // the GET-only guard below.
     if (url.pathname === "/catalog/save") {
-      if (req.method !== "POST") {
-        res.writeHead(405, { "content-type": "application/json" });
-        res.end('{"error":"method not allowed"}');
-        return;
-      }
-      // Cross-origin / CSRF / DNS-rebinding guard. This is the ONLY mutation
-      // route and it is reachable from the owner's browser at 127.0.0.1 —
-      // loopback bind is NOT a boundary against a page the owner happens to have
-      // open (the browser runs the attacker's JS and can POST here). Require a
-      // same-origin JSON write:
-      //   • Content-Type application/json (load-bearing): the CORS-"simple"
-      //     form/text-plain vector cannot set it, and a cross-origin fetch() that
-      //     does set it triggers a preflight OPTIONS which the method guard above
-      //     answers 405 (no CORS headers) → the browser never sends the POST.
-      //   • Origin, when present, must be a LOOPBACK origin (http/https on
-      //     127.0.0.1 or localhost, any port). A page the owner visits lives on a
-      //     public origin, so this refuses every drive-by while still allowing the
-      //     built dashboard AND the vite dev proxy (its own port).
-      //   • Host, when present, must be a loopback host — kills DNS-rebinding (a
-      //     rebound attacker domain sends Host: attacker.com, not 127.0.0.1).
-      // The real UI sends content-type application/json same-origin, so nothing
-      // legitimate is affected (ui/src/lib/catalog.ts).
-      const isLoopbackHostname = (h: string): boolean => h === "127.0.0.1" || h === "localhost";
-      const origin = req.headers.origin;
-      let originOk = true;
-      if (origin !== undefined) {
-        try {
-          const u = new URL(origin);
-          originOk = (u.protocol === "http:" || u.protocol === "https:") && isLoopbackHostname(u.hostname);
-        } catch { originOk = false; }
-      }
-      const host = req.headers.host;
-      const hostOk = host === undefined || isLoopbackHostname(host.replace(/:\d+$/, "").toLowerCase());
-      const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
-      if (contentType !== "application/json" || !originOk || !hostOk) {
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end('{"error":"cross-origin or non-JSON write refused"}');
-        return;
-      }
-      void readBoundedBody(req, 256 * 1024).then((body) => {
-        if (body === null) {
-          res.writeHead(413, { "content-type": "application/json" });
-          res.end('{"error":"request body too large or unreadable"}');
-          return;
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end('{"error":"invalid JSON body"}');
-          return;
-        }
-        const result = saveCatalogEntry(parsed);
+      void guardedJsonBody(req, res).then((guarded) => {
+        if (guarded === null) return; // refusal already written
+        const result = saveCatalogEntry(guarded.body);
         res.writeHead(result.status, { "content-type": "application/json" });
         res.end(JSON.stringify(result.json));
+      });
+      return;
+    }
+
+    // Write route: human-initiated lesson prune. Same guard as /catalog/save.
+    // archiveLesson() sets archived=1 — a lesson row is NEVER hard-deleted, it
+    // just stops being listed and stops being injected into prompts.
+    if (url.pathname === "/lessons/archive") {
+      void guardedJsonBody(req, res).then((guarded) => {
+        if (guarded === null) return; // refusal already written
+        const id = (guarded.body as { id?: unknown } | null)?.id;
+        if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end('{"error":"body must be {\\"id\\": <positive integer>}"}');
+          return;
+        }
+        try {
+          const archived = archiveLesson(id);
+          if (!archived) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end('{"error":"no active lesson with that id"}');
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, id }));
+        } catch (error) {
+          console.error(`[dashboard] lesson archive failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"archive failed"}');
+        }
       });
       return;
     }
@@ -492,6 +540,30 @@ export function startDashboard(): {
         console.error(`[dashboard] catalog failed: ${error instanceof Error ? error.message : error}`);
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"error":"catalog unavailable"}');
+      }
+      return;
+    }
+
+    if (url.pathname === "/lessons") {
+      // Same SPA/API split as /runs, /telemetry and /catalog: browser
+      // navigations to the /lessons page get the app shell; fetch() clients
+      // get the JSON list. Fresh read every time — deliberately NOT the
+      // getTelemetry watermark cache (it only watches stage/run rows and would
+      // serve stale lessons after a capture or archive). A read error must 500
+      // this request, never crash the pipeline daemon; a missing table is an
+      // empty list, not an error.
+      if (wantsHtml && serveIndex(res)) return;
+      try {
+        const body = JSON.stringify({ lessons: listLessons()
+          .filter((l) => !l.archived)                                   // archive actually hides (F1)
+          .map((l) => ({ id: l.id, repo: l.repo, stage: l.stage, lesson: l.lesson,
+            createdAt: l.createdAt, sourceIssue: l.issueKey || null, sourceUrl: null })) }); // UI shape (F2)
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      } catch (error) {
+        console.error(`[dashboard] lessons failed: ${error instanceof Error ? error.message : error}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end('{"error":"lessons unavailable"}');
       }
       return;
     }

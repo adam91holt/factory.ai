@@ -38,6 +38,9 @@ export const config = {
     steward: process.env.STEWARD_MODEL ?? "claude-fable-5",
     designReviewer: process.env.DESIGN_REVIEWER_MODEL ?? "opus",
     tester: process.env.TESTER_MODEL ?? "sonnet",
+    // Lesson distiller: one cheap tool-less call per failure (park / needs-human /
+    // taste-fail) that turns the event into a one-line reusable lesson (lessons.ts).
+    distiller: process.env.DISTILLER_MODEL ?? "haiku",
   },
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
