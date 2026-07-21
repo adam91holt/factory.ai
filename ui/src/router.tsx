@@ -11,6 +11,7 @@ import { QueuePage } from "./pages/QueuePage";
 import { HistoryPage } from "./pages/HistoryPage";
 import { TelemetryPage } from "./pages/TelemetryPage";
 import { CatalogPage } from "./pages/CatalogPage";
+import { LessonsPage } from "./pages/LessonsPage";
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -61,6 +62,12 @@ const catalogRoute = createRoute({
   component: CatalogPage,
 });
 
+const lessonsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/lessons",
+  component: LessonsPage,
+});
+
 const routeTree = rootRoute.addChildren([
   boardRoute,
   runsRoute,
@@ -69,6 +76,7 @@ const routeTree = rootRoute.addChildren([
   historyRoute,
   telemetryRoute,
   catalogRoute,
+  lessonsRoute,
 ]);
 
 export const router = createRouter({ routeTree });
