@@ -6,6 +6,7 @@ import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diff
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta } from "./meta.ts";
+import { checkFreshness } from "./precondition.ts";
 import { getStageSession, recordStageSession, clearStageSession } from "./db.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
@@ -109,6 +110,35 @@ async function abortExternal(issue: linear.Issue, stages: StageResult[], where: 
   if (!config.dryRun) await linear.release(issue);
 }
 
+/** Freshness gate verdict "cancel": the ticket's premise is already satisfied —
+ *  its goal EXISTS in the world (a merged/closed PR, a path now present, a needle
+ *  already gone), so the work is moot. Unlike park (retry later, worktree kept)
+ *  this is a terminal RESOLUTION: it comments the flipped premise + evidence,
+ *  emits a "stale" outcome, labels Factory-Stale (keeps it out of every fetch
+ *  skip-set so it never requeues), moves the ticket to Done, and releases the
+ *  claim. Reversible by construction — a human removes the label / reopens to
+ *  requeue. NOT park: the goal already exists, so there is nothing for a human
+ *  to unblock. */
+async function resolveStale(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
+  void repo; // (kept in the signature for symmetry with park/abortExternal; no repo-scoped lesson — a clean idempotent no-op is not a failure to learn from)
+  bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "stale",
+    reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,
+    costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
+    gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
+  console.log(`[${issue.identifier}] stale — freshness premise already satisfied: ${reason}`);
+  try {
+    await post(issue, `${linear.SENTINEL}\n\n**Outcome:** stale — the ticket's goal already exists in the world; no work was needed.\n\nWhich premise flipped: ${reason}\n\nRemove the \`${linear.STALE_LABEL}\` label (and reopen) to requeue.`);
+  } catch (e) {
+    console.error(`[${issue.identifier}] stale note failed: ${e}`);
+  }
+  if (!config.dryRun) {
+    await linear.addLabel(issue, linear.STALE_LABEL).catch((e) => console.error(`[${issue.identifier}] stale label failed: ${e}`));
+    const moved = await linear.transition(issue, "done");
+    if (!moved) await linear.transition(issue, "review").catch(() => {});
+    await linear.release(issue);
+  }
+}
+
 class Budget {
   constructor(private stages: StageResult[], private deadline: number) {}
   get spent(): number { return this.stages.reduce((s, x) => s + x.costUsd, 0); }
@@ -172,6 +202,23 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (!deps.ok) { await park(issue, repo, stages, `dependency install failed: ${deps.detail.slice(0, 300)}`); return; }
     const gates = detectGates(ws);
     const baselines = baseline(ws, gates);
+
+    // ---- freshness / idempotency gate (Gap 4): re-validate the ticket's premise
+    // against the real world BEFORE the implementer builds — the stillOurs()
+    // pattern generalized from claim-freshness to WORLD-freshness. The implicit
+    // `undelivered factory/<key>` check stops the FAC-20 shape (grinding on an
+    // already merged/closed PR); steward-authored preconditions self-cancel when
+    // their premise is already satisfied. Runs against the FRESH base worktree
+    // (before any edit), so it tests the real pre-work world. Skipped on dry-run
+    // like every other gh/side-effecting gate. cancel → resolveStale (goal
+    // already exists → Done); park → human decides (premise can't be confirmed,
+    // or is only partially stale). A gh outage on the implicit check fails OPEN
+    // (rebuilds), so this can never wrongly freeze the queue.
+    if (!config.dryRun) {
+      const decision = await checkFreshness(issue.identifier, issue.description, { repo, worktreeDir: ws.dir });
+      if (decision.action === "cancel") { await resolveStale(issue, repo, stages, decision.reason); return; }
+      if (decision.action === "park") { await park(issue, repo, stages, `freshness: ${decision.reason}`); return; }
+    }
 
     // ---- implementer
     // Feed-forward lessons: bounded, newest-first heuristics for this repo,

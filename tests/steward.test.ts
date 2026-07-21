@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { childrenAllTerminal } from "../src/steward.ts";
+import { liftPreconditions, parsePreconditions } from "../src/precondition.ts";
+import { withFactoryMeta } from "../src/meta.ts";
 
 type Detail = Parameters<typeof childrenAllTerminal>[0];
 type Child = Detail["children"][number];
@@ -63,5 +65,37 @@ describe("childrenAllTerminal", () => {
     const c = child({ stateType: "completed", stateName: "Done" });
     delete (c as { labels?: string[] }).labels;
     expect(childrenAllTerminal(detail([c]))).toBe(true);
+  });
+});
+
+// The steward stamps each follow-up it files with a re-checkable precondition
+// lifted from the model-authored "## Precondition" section (Gap 4). This mirrors
+// steward.ts's `liftPreconditions(description)` → `withFactoryMeta({...})` path.
+describe("steward follow-up precondition stamping", () => {
+  // A realistic follow-up body the steward would write to tickets/<NN>-*.md.
+  const FOLLOWUP = [
+    "## Goal", "Resolve the merge conflict PR #4 hit against main", "",
+    "## Precondition",
+    "- pr-open acme/w#4",
+    "- (skip this bullet — not DSL, just a human note)", "",
+    "## Repo", "acme/w", "",
+    "## Verifications", "* Automated: bun test",
+  ].join("\n");
+
+  test("valid '## Precondition' entries are lifted; non-DSL bullets dropped", () => {
+    expect(liftPreconditions(FOLLOWUP)).toEqual(["pr-open acme/w#4"]);
+  });
+
+  test("a follow-up with no precondition section lifts to []", () => {
+    expect(liftPreconditions("## Goal\ndo it\n\n## Repo\nacme/w")).toEqual([]);
+  });
+
+  test("lifted preconditions survive the withFactoryMeta stamp the daemon applies", () => {
+    const preconditions = liftPreconditions(FOLLOWUP);
+    const stamped = withFactoryMeta(FOLLOWUP, { type: "task", repo: "acme/w", ...(preconditions.length ? { preconditions } : {}) });
+    // The stamped, trusted, start-anchored block carries the premise the loop
+    // will re-check when the follow-up is later picked up.
+    expect(parsePreconditions(stamped).map((p) => p.arg)).toEqual(["acme/w#4"]);
+    expect(stamped.startsWith("<!-- factory\n")).toBe(true);
   });
 });

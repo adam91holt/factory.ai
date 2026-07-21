@@ -6,6 +6,7 @@ import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
+import { liftPreconditions } from "./precondition.ts";
 import { renderPrompt } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 import { lastParkReasonForIssue } from "./db.ts";
@@ -104,6 +105,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         "OUTPUT PROTOCOL (files in your working directory):",
         "- summary.md (REQUIRED): the parent-ticket comment — outcome overview, recommended merge order with reasoning, what you decided and why, what the human must do. Write for a busy human.",
         "- tickets/<NN>-<slug>.md (OPTIONAL, 0-3): follow-up tickets you decided to file. First line '# <title>'; body MUST follow the factory ticket contract (## Goal, ## Why, ## Outcomes, ## Repo, ## Verifications; add ## Area).",
+        "  Each follow-up SHOULD carry a '## Precondition' line stating the machine-checkable premise under which it is worth running, so the factory self-cancels it if the premise is already satisfied by the time it's picked up. One per line, from this vocabulary: `pr-open <url|org/repo#N|#N>` (worth running only while that PR is still open), `path-missing <relpath>` (only while that file is still absent), `path-exists <relpath>`, `text-present <relpath>::<needle>` (only while the file still contains the needle — e.g. the bug is still there), `text-absent <relpath>::<needle>`. Omit the section if no liveness premise fits — never invent one.",
         "Reply with one line: what you decided.",
         "",
         untrusted(`EPIC: ${epic.identifier} — ${epic.title}\n\n${epic.description}`),
@@ -147,7 +149,15 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         // child inputs) so an injected repo/type/model can never be honored —
         // the same defense plan.ts gives decomposer children.
         if (title && description.length > 50) {
-          const stamped = withFactoryMeta(description, { type: "task", ...(repo ? { repo } : {}) });
+          // Gap-4: lift any model-authored "## Precondition"/"Precondition:" lines
+          // into VALIDATED DSL strings (parsePrecondition allowlist — non-DSL
+          // prose is dropped) and stamp them into the TRUSTED, start-anchored
+          // block. The loop re-checks the premise when the follow-up is later
+          // picked up and self-cancels if it's already satisfied — the race-guard
+          // that makes the steward filing a "make PR #N mergeable" follow-up safe
+          // even after a human/steward already merged it (the FAC-20 shape).
+          const preconditions = liftPreconditions(description);
+          const stamped = withFactoryMeta(description, { type: "task", ...(repo ? { repo } : {}), ...(preconditions.length ? { preconditions } : {}) });
           created.push(await linear.createSubIssue(epic, title, stamped));
         }
       }

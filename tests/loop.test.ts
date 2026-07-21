@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isEligible, missingSections, wantsBrowserVerification } from "../src/loop.ts";
+import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import type { Issue } from "../src/linear.ts";
 
 const issue = (description: string): Issue => ({
@@ -69,5 +70,37 @@ describe("wantsBrowserVerification", () => {
   test("'Visual: n/a' still triggers (gate is textual; hasPlaywright re-gates)", () => {
     // Documents current behavior: any 'visual' token inside the section counts.
     expect(wantsBrowserVerification("## Verifications\n* Visual: n/a")).toBe(true);
+  });
+});
+
+// The freshness gate the loop consults before the implementer (Gap 4). processIssue
+// maps decideFreshness's action → { cancel: resolveStale, park: park, proceed:
+// build }. We assert the mapping decision here (pure), consistent with the other
+// loop tests not spinning up the pipeline.
+describe("freshness gate decision mapping", () => {
+  const row = (raw: string, status: PerCheck) => {
+    const p = parsePrecondition(raw);
+    if (!p) throw new Error(`bad fixture: ${raw}`);
+    return { p, status, reason: `${raw}: ${status}` };
+  };
+
+  test("proceed: the normal case — branch not yet delivered, no world-premise flipped", () => {
+    expect(decideFreshness([row("undelivered factory/fac-1", "hold")]).action).toBe("proceed");
+  });
+
+  test("cancel: the ticket's own branch PR already merged (FAC-20 at ticket level) → resolveStale", () => {
+    expect(decideFreshness([row("undelivered factory/fac-1", "moot")]).action).toBe("cancel");
+  });
+
+  test("cancel: a steward follow-up whose authored premise is fully satisfied → resolveStale", () => {
+    expect(decideFreshness([row("undelivered factory/fac-99", "hold"), row("pr-open acme/w#4", "moot")]).action).toBe("cancel");
+  });
+
+  test("park: partial staleness — one premise flipped, another still holds → human decides", () => {
+    expect(decideFreshness([row("pr-open acme/w#4", "moot"), row("path-missing src/x.ts", "hold")]).action).toBe("park");
+  });
+
+  test("park: an authored premise can't be confirmed (no moot) → human decides", () => {
+    expect(decideFreshness([row("pr-open acme/w#4", "unknown"), row("path-exists src/x.ts", "hold")]).action).toBe("park");
   });
 });

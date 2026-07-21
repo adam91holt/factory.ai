@@ -14,6 +14,11 @@ export const NEEDS_HUMAN_LABEL = "Factory-Needs-Human";
 export const EPIC_LABEL = "Factory-Epic";
 export const PLANNED_LABEL = "Factory-Planned";
 export const STEWARDED_LABEL = "Factory-Stewarded";
+// Gap-4: a ticket the freshness gate auto-resolved as stale (its goal already
+// exists in the world) is moved to Done AND labeled Factory-Stale so it never
+// requeues — added to every fetch skip-set below. Reversible: a human removes
+// the label (and reopens) to requeue.
+export const STALE_LABEL = "Factory-Stale";
 export const SENTINEL = "🤖 **Factory report**";
 
 export class LinearRateLimited extends Error {
@@ -86,7 +91,7 @@ export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
     `query($team: String!) {
       issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "unstarted" } } }) { nodes { ${ISSUE_FIELDS} } }
     }`, { team: teamKey });
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL]);
   return data.issues.nodes.map(toIssue)
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -114,7 +119,7 @@ export async function fetchQueue(): Promise<Issue[]> {
     { teams: config.teamKeys },
   );
   const all = data.issues.nodes.map(toIssue);
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL]);
   bus.emit({
     type: "queue_snapshot",
     issues: all.map((i) => ({

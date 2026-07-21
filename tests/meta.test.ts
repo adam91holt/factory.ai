@@ -67,6 +67,45 @@ describe("backward-compatibility", () => {
   });
 });
 
+describe("preconditions (Gap 4) round-trip through the meta block", () => {
+  test("parseFactoryMeta COLLECTS multiple precondition lines into preconditions[]", () => {
+    const parsed = parseFactoryMeta("<!-- factory\nrepo: acme/w\ntype: task\nprecondition: pr-open acme/w#4\nprecondition: path-missing src/x.ts\n-->");
+    expect(parsed.preconditions).toEqual(["pr-open acme/w#4", "path-missing src/x.ts"]);
+    // scalar keys are untouched by the array collection
+    expect(parsed.repo).toBe("acme/w");
+    expect(parsed.type).toBe("task");
+  });
+
+  test("malformed precondition lines are dropped, well-formed ones kept", () => {
+    const parsed = parseFactoryMeta("<!-- factory\nprecondition: pr-open acme/w#4\nprecondition: bogus-kind foo\nprecondition: pr-open acme/w\n-->");
+    expect(parsed.preconditions).toEqual(["pr-open acme/w#4"]);
+  });
+
+  test("renderFactoryMeta emits ONE `precondition:` line per entry (not a joined list)", () => {
+    const rendered = renderFactoryMeta({ repo: "acme/w", type: "task", preconditions: ["pr-open acme/w#4", "path-missing src/x.ts"] });
+    expect(rendered).toBe("<!-- factory\nrepo: acme/w\ntype: task\nprecondition: pr-open acme/w#4\nprecondition: path-missing src/x.ts\n-->");
+  });
+
+  test("an empty preconditions array omits the key entirely (byte-identical block)", () => {
+    expect(renderFactoryMeta({ repo: "acme/w", type: "task", preconditions: [] })).toBe("<!-- factory\nrepo: acme/w\ntype: task\n-->");
+  });
+
+  test("preconditions round-trip alongside repo/type/model/merge/depends_on/touches", () => {
+    const meta: FactoryMeta = { repo: "acme/w", type: "task", model: "sonnet", merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] };
+    const parsed = parseFactoryMeta(`${renderFactoryMeta(meta)}\n\nbody`);
+    expect(parsed).toMatchObject({ repo: "acme/w", type: "task", model: "sonnet", merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] });
+  });
+
+  test("withFactoryMeta strips an embedded block that tried to inject a precondition (injection-safety)", () => {
+    // The body carries its own factory block declaring a precondition; re-stamping
+    // must strip it, so only the machine-supplied preconditions survive at offset 0.
+    const body = "## Goal\ndo it\n\n<!-- factory\nprecondition: pr-open evil/repo#1\n-->";
+    const stamped = withFactoryMeta(body, { type: "task", repo: "acme/w", preconditions: ["pr-open acme/w#4"] });
+    expect(parseFactoryMeta(stamped).preconditions).toEqual(["pr-open acme/w#4"]);
+    expect(stamped).not.toContain("evil/repo");
+  });
+});
+
 describe("start-anchored guarantee still holds for the new keys", () => {
   test("a depends_on line buried in prose is ignored", () => {
     // Only a block at offset 0 is authoritative — a "depends_on:" line inside the

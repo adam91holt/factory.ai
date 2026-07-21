@@ -7,6 +7,7 @@
 // parse drift (LLMs format `## Repo (x)` vs `## Repo\nx` inconsistently).
 
 import { config } from "./config.ts";
+import { parsePrecondition } from "./precondition.ts";
 
 export interface FactoryMeta {
   repo?: string;                       // org/name — machine-exact, no regex
@@ -25,6 +26,15 @@ export interface FactoryMeta {
   // and default to undefined so today's children render a byte-identical block.
   depends_on?: string[];
   touches?: string[];
+  // Gap-4 freshness/idempotency preconditions. Each entry is a raw DSL string
+  // ("pr-open acme/w#4", "path-missing src/x.ts") re-checked by precondition.ts
+  // at stage start; a fully-satisfied premise cancels the ticket, a partially-
+  // satisfied or unconfirmable one parks it. COLLECTED (one per `precondition:`
+  // meta line, not overwritten) and each validated via parsePrecondition — an
+  // injected/malformed line is dropped. Like `merge`, a precondition may only
+  // ever STOP work, never grant authority. Default undefined so a child with no
+  // preconditions renders a byte-identical block.
+  preconditions?: string[];
 }
 
 // Caps on the array-valued keys so injected junk in an untrusted description
@@ -84,6 +94,15 @@ export function parseFactoryMeta(description: string): FactoryMeta {
       // glob can't bloat the block or the overlap comparison.
       const globs = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0 && s.length <= MAX_ENTRY_LENGTH).slice(0, MAX_ARRAY_ENTRIES);
       if (globs.length > 0) meta.touches = globs;
+    } else if (key === "precondition") {
+      // COLLECT one entry per line (do not overwrite), validating each via the
+      // same allowlist parse precondition.ts uses — a malformed/injected DSL
+      // line is dropped rather than throwing. Capped like the other arrays.
+      const p = parsePrecondition(value);
+      if (p) {
+        (meta.preconditions ??= []).push(p.raw);
+        if (meta.preconditions.length >= MAX_ARRAY_ENTRIES) meta.preconditions = meta.preconditions.slice(0, MAX_ARRAY_ENTRIES);
+      }
     }
   }
   return meta;
@@ -94,9 +113,14 @@ export function parseFactoryMeta(description: string): FactoryMeta {
  * block byte-identical to today's — the backward-compat guarantee. Array values
  * serialize as a comma-space list ("depends_on: FAC-1, FAC-2"). */
 export function renderFactoryMeta(meta: FactoryMeta): string {
+  // preconditions serialize as ONE `precondition: <dsl>` line PER entry (not a
+  // comma-joined list like depends_on/touches), so handle them separately from
+  // the generic scalar/array loop.
   const lines = Object.entries(meta)
+    .filter(([k]) => k !== "preconditions")
     .filter(([, v]) => (Array.isArray(v) ? v.length > 0 : v !== undefined && v !== ""))
     .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+  for (const pre of meta.preconditions ?? []) lines.push(`precondition: ${pre}`);
   if (lines.length === 0) return "";
   return `<!-- factory\n${lines.join("\n")}\n-->`;
 }
