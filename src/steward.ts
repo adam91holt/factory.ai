@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
-import { runStage, untrusted } from "./agents.ts";
+import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { renderPrompt } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
+import { lastParkReasonForIssue } from "./db.ts";
 
 // Steward (owner request 2026-07-20): when all children of a planned epic reach
 // terminal state, a Fable session reviews the whole outcome — PR mergeability
@@ -32,16 +33,39 @@ export function childrenAllTerminal(detail: Awaited<ReturnType<typeof linear.get
   });
 }
 
+/** One child's closeout status block. Exported pure (reason lookup injectable)
+ *  so the smoke test can assert the FAC-14 contract without Linear/gh.
+ *  FAC-14 lesson: a parked/needs-human child MUST carry its recorded WHY into
+ *  closeout — "state: Todo · labels: Factory-Needs-Human" with no reason forces
+ *  a blind human escalation. Reason strings were redacted at emit, but they
+ *  outlive daemon versions in the durable log — redact again at this outbound
+ *  seam (§2.2), and say "(no reason recorded)" out loud for legacy rows rather
+ *  than silently omitting the field. */
+export function childStatusBlock(
+  c: { identifier: string; title: string; stateName: string; labels?: string[] },
+  pr: string,
+  reasonLookup: (issueKey: string) => string | null = lastParkReasonForIssue,
+): string {
+  const labels = c.labels ?? [];
+  const lines = [`### ${c.identifier} — ${c.title}`,
+    `state: ${c.stateName} · labels: ${labels.join(", ") || "none"}`];
+  if (labels.includes(linear.PARKED_LABEL) || labels.includes(linear.NEEDS_HUMAN_LABEL)) {
+    const reason = reasonLookup(c.identifier);
+    lines.push(`reason: ${reason ? redactSecrets(reason).clean.replace(/\s+/g, " ").slice(0, 300) : "(no reason recorded)"}`);
+  }
+  lines.push(`PR: ${pr}`);
+  return lines.join("\n");
+}
+
 export async function stewardEpic(epic: linear.Issue): Promise<void> {
   const detail = await linear.getIssueDetail(epic.identifier);
   if (!childrenAllTerminal(detail)) return;
   const repo = repoFromTicket(epic.description) ?? "";
   bus.emit({ type: "run_started", issueKey: epic.identifier, title: `[steward] ${epic.title}`, repo, dryRun: config.dryRun });
 
-  const childReports = detail.children.map((c) => {
-    const pr = repo ? ghPr(repo, `factory/${c.identifier.toLowerCase()}`) : "(no repo)";
-    return `### ${c.identifier} — ${c.title}\nstate: ${c.stateName} · labels: ${(c.labels ?? []).join(", ") || "none"}\nPR: ${pr}`;
-  }).join("\n\n");
+  const childReports = detail.children.map((c) =>
+    childStatusBlock(c, repo ? ghPr(repo, `factory/${c.identifier.toLowerCase()}`) : "(no repo)"),
+  ).join("\n\n");
 
   const scratch = join(config.workRoot, ".steward-scratch", epic.identifier);
   rmSync(scratch, { recursive: true, force: true });
@@ -72,7 +96,9 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
       } });
 
   const finish = (outcome: "planned" | "parked", reason: string): void => {
-    bus.emit({ type: "run_finished", issueKey: epic.identifier, outcome, reason, prUrl: null,
+    // Redact at the emit seam like loop.ts / groundskeepers.ts (§2.2) — error
+    // reasons can interpolate HTTP bodies and land verbatim in the durable log.
+    bus.emit({ type: "run_finished", issueKey: epic.identifier, outcome, reason: redactSecrets(reason).clean.slice(0, 300), prUrl: null,
       costUsd: steward.costUsd, stages: [toStageMeta(steward)], gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
   };
 
@@ -105,7 +131,9 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
       await linear.addLabel(epic, linear.STEWARDED_LABEL).catch(() => {}); // don't loop a broken steward
       await linear.addLabel(epic, linear.NEEDS_HUMAN_LABEL).catch(() => {}); // surface the failed closeout; reconcile must not auto-close over it
     }
-    await linear.postComment(epic, `${linear.SENTINEL}\n\n**Steward failed:** ${reason.slice(0, 300)} — human review needed.`).catch(() => {});
+    // Error strings can interpolate HTTP bodies — redact at the outbound seam
+    // (§2.2) so the Needs-Human label always ships with a safe, visible WHY.
+    await linear.postComment(epic, `${linear.SENTINEL}\n\n**Steward failed:** ${redactSecrets(reason).clean.slice(0, 300)} — human review needed.`).catch(() => {});
     finish("parked", reason.slice(0, 200));
     console.error(`[${epic.identifier}] steward failed: ${reason}`);
   }
