@@ -119,6 +119,18 @@ export function diffAgainstBase(ws: Workspace): string {
 
 export const DIFF_FAILED = "<diff-failed>";
 
+// groundskeepers/ and agents/ are the factory's own spend governors and role
+// definitions — a PR that flips `enabled:` or raises `budget:` must never
+// auto-merge without a human (machine self-arming).
+const GUARDED_PATH_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
+
+/** Pure guarded-path classifier: the subset of `files` that any guard regex
+ * matches. Extracted from guardedPathsTouched so the policy is unit-testable
+ * without shelling out to git — behavior identical. */
+export function classifyPaths(files: string[]): string[] {
+  return files.filter((f) => GUARDED_PATH_RES.some((g) => g.test(f)));
+}
+
 /** Guarded paths force human attention; on any git failure return a sentinel
  * that forces review rather than silently passing (C2/C17). */
 export function guardedPathsTouched(ws: Workspace): string[] {
@@ -130,12 +142,7 @@ export function guardedPathsTouched(ws: Workspace): string[] {
   }
   const diff = git(ws.dir, ["diff", "--name-only", base, "HEAD"]);
   if (!diff.ok) return [DIFF_FAILED];
-  const files = diff.stdout.split("\n").filter(Boolean);
-  // groundskeepers/ and agents/ are the factory's own spend governors and role
-  // definitions — a PR that flips `enabled:` or raises `budget:` must never
-  // auto-merge without a human (machine self-arming).
-  const guards = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
-  return files.filter((f) => guards.some((g) => g.test(f)));
+  return classifyPaths(diff.stdout.split("\n").filter(Boolean));
 }
 
 /** UI files changed by this diff — the taste-gate heuristic (name-only, same
