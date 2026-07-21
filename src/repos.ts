@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import { parseFactoryMeta } from "./meta.ts";
+import { redactSecrets } from "./agents.ts";
 
 // Worktree manager. Never touches ~/RapidoCoding (Adam's live checkouts) —
 // everything lives under FACTORY_WORK_ROOT. Hardened per code-review verdict
@@ -318,8 +319,17 @@ export function createRevertPr(ws: Workspace, mergeSha: string, why: string): st
   return (r.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => /^https?:\/\//.test(l)).pop() ?? "";
 }
 
-/** why-text for a revert PR body is model/gate output — cap it (secret scrub
- * lives at every OTHER outbound seam; a revert body carries only smoke output). */
-function redactRevertWhy(why: string): string {
-  return `Automated revert: the post-merge smoke check failed.\n\n${why.slice(0, 1500)}\n\n🤖 Post-merge auto-revert (factory Gap 5). A human reviews before this lands.`;
+/** why-text for a revert PR body is raw smoke output — scrub secrets AND cap it.
+ * Smoke commands run via runShellGate with an UNSCRUBBED env, so their stdout/
+ * stderr routinely echo credentials (e.g. a failing `curl -H "Authorization:
+ * Bearer $TOKEN"` dumping its argv). This is an outbound seam into a durable
+ * GitHub PR body, so it MUST pass redactSecrets like every other seam (loop.ts
+ * PR bodies, gate-output comments) — the redactSecrets-at-every-outbound-seam
+ * invariant. Redact BEFORE the slice so a token split across the 1500-char cut
+ * still gets scrubbed. Exported so the scrub is unit-testable without shelling
+ * out to gh (same rationale as classifyPaths) — this IS the body createRevertPr
+ * hands to `gh pr create --body`. */
+export function redactRevertWhy(why: string): string {
+  const clean = redactSecrets(why).clean.slice(0, 1500);
+  return `Automated revert: the post-merge smoke check failed.\n\n${clean}\n\n🤖 Post-merge auto-revert (factory Gap 5). A human reviews before this lands.`;
 }

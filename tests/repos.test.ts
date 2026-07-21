@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, ghRepoCreateArgs, repoFromTicket, revertMerge } from "../src/repos.ts";
+import { classifyPaths, ghRepoCreateArgs, redactRevertWhy, repoFromTicket, revertMerge } from "../src/repos.ts";
 
 describe("classifyPaths — guarded-path detection", () => {
   test("guards factory governance directories at root and nested", () => {
@@ -142,5 +142,30 @@ describe("revertMerge — reverts a merge commit (git revert -m 1)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// A revert PR body carries the RAW smoke output, which runs with an unscrubbed
+// env and routinely echoes credentials — so the body createRevertPr hands to
+// `gh pr create --body` MUST pass redactSecrets before it lands in a durable
+// GitHub PR body (the redactSecrets-at-every-outbound-seam invariant).
+// redactRevertWhy IS that body-builder (createRevertPr: `body = redactRevertWhy(why)`).
+describe("redactRevertWhy — scrubs secrets from the revert PR body (outbound seam)", () => {
+  test("a token-shaped string in smoke output is redacted from the body", () => {
+    const token = `ghp_${"A".repeat(30)}`; // gh personal-access-token shape
+    const why = `Post-merge smoke failed for abcdef123456:\ncurl -H "Authorization: Bearer ${token}" https://api.example.com\n401 Unauthorized`;
+    const body = redactRevertWhy(why);
+    expect(body).not.toContain(token);
+    expect(body).toContain("[REDACTED-SECRET]");
+  });
+
+  test("a token split across the 1500-char cut is still scrubbed (redact-before-slice)", () => {
+    const token = `ghp_${"B".repeat(30)}`;
+    // Position the token so a naive slice(0,1500) would bisect it: without
+    // redact-before-slice the trailing half would leak into the body.
+    const why = `${"x".repeat(1490)}${token}${"y".repeat(400)}`;
+    const body = redactRevertWhy(why);
+    expect(body).not.toContain(token);
+    expect(body).not.toContain("B".repeat(30));
   });
 });
