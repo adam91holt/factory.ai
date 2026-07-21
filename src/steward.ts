@@ -101,7 +101,10 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
     console.log(`[${epic.identifier}] stewarded (${created.length} follow-up tickets)`);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (!config.dryRun) await linear.addLabel(epic, linear.STEWARDED_LABEL).catch(() => {}); // don't loop a broken steward
+    if (!config.dryRun) {
+      await linear.addLabel(epic, linear.STEWARDED_LABEL).catch(() => {}); // don't loop a broken steward
+      await linear.addLabel(epic, linear.NEEDS_HUMAN_LABEL).catch(() => {}); // surface the failed closeout; reconcile must not auto-close over it
+    }
     await linear.postComment(epic, `${linear.SENTINEL}\n\n**Steward failed:** ${reason.slice(0, 300)} — human review needed.`).catch(() => {});
     finish("parked", reason.slice(0, 200));
     console.error(`[${epic.identifier}] steward failed: ${reason}`);

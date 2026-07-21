@@ -47,6 +47,7 @@ async function tick(): Promise<boolean> {
   if (queue.length === 0) {
     bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 });
     await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+    await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
     await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
     return false;
   }
@@ -71,6 +72,7 @@ async function tick(): Promise<boolean> {
     // Same background passes as the other two return paths — a board holding
     // only epics/ineligible tickets must not pause steward/groundskeeper forever.
     await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+    await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
     await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
     return false;
   }
@@ -88,6 +90,7 @@ async function tick(): Promise<boolean> {
   }
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
   await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+  await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
   await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
   return batch.length > 0 || inFlight.size > 0;
 }

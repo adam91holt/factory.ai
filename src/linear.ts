@@ -228,7 +228,13 @@ async function resolveState(issue: Issue, kind: StateKind): Promise<{ id: string
     return states.find((s) => s.type === "unstarted" && s.name === "Todo")
       ?? states.find((s) => s.type === "unstarted") ?? null;
   }
-  if (kind === "done") return states.find((s) => s.type === "completed") ?? null;
+  if (kind === "done") {
+    // Name-anchor "Done" before first-completed (mirrors queue→"Todo",
+    // working→"In Progress"): a team with multiple completed-type states (e.g.
+    // "Released" ordered before "Done") must not land closures in the wrong one.
+    return states.find((s) => s.type === "completed" && s.name === "Done")
+      ?? states.find((s) => s.type === "completed") ?? null;
+  }
   const started = states.filter((s) => s.type === "started").sort((a, b) => a.position - b.position);
   if (kind === "working") {
     return started.find((s) => s.name === "In Progress") ?? started[0] ?? null;
