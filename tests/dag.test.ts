@@ -66,6 +66,22 @@ describe("selectRunnable", () => {
     expect(blocked).toEqual(["B"]);
   });
 
+  test("(c') a CANCELED dependency satisfies the frontier (terminal, won't wedge)", () => {
+    const cands = [s("B", ["A-1"])];
+    // A-1 canceled (steward dropped it as redundant) → B must not block forever.
+    expect(selectRunnable(cands, (id) => (id === "A-1" ? "canceled" : undefined), [], 4).run).toEqual(["B"]);
+    // Mixed: one completed, one canceled → both terminal, dependent runs.
+    const two = [s("C", ["A-1", "A-2"])];
+    const state = (id: string) => (id === "A-1" ? "completed" : "canceled");
+    expect(selectRunnable(two, state, [], 4).run).toEqual(["C"]);
+  });
+
+  test("(c'') a non-terminal dep state (started/backlog) still blocks", () => {
+    const cands = [s("B", ["A-1"])];
+    expect(selectRunnable(cands, () => "backlog", [], 4).blocked).toEqual(["B"]);
+    expect(selectRunnable(cands, () => "started", [], 4).blocked).toEqual(["B"]);
+  });
+
   test("(d) two frontier-ready siblings with overlapping touches: only the FIFO-first runs", () => {
     const cands = [s("A", [], ["src/x/**"]), s("B", [], ["src/x/y.ts"])];
     const { run, deferred } = selectRunnable(cands, noDeps, [], 4); // spare capacity, still serialized

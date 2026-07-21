@@ -109,3 +109,57 @@ describe("createChildren — ordinal→identifier resolution", () => {
     expect(meta.model).toBe("sonnet");
   });
 });
+
+describe("createChildren — Gap 1 merge-race: implicit overlap edges", () => {
+  async function stampAll(children: ChildSpec[]): Promise<Map<string, string>> {
+    const stamped = new Map<string, string>();
+    let n = 100;
+    await createChildren(children, { repo: "acme/w" }, async (child, body) => {
+      const id = `FAC-${n++}`;
+      stamped.set(child.title, body);
+      return id;
+    });
+    return stamped;
+  }
+
+  test("two siblings with overlapping touches and NO declared deps: the later gains an implicit depends_on", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: ["src/x/**"] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: ["src/x/y.ts"] },
+    ];
+    const stamped = await stampAll(children);
+    // B touches a path under A's glob → B waits for A to MERGE, not merely leave inFlight.
+    expect(parseFactoryMeta(stamped.get("A")!).depends_on).toBeUndefined();
+    expect(parseFactoryMeta(stamped.get("B")!).depends_on).toEqual(["FAC-100"]);
+  });
+
+  test("non-overlapping siblings gain no implicit edge (stays parallel)", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: ["src/x/**"] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: ["src/y/**"] },
+    ];
+    const stamped = await stampAll(children);
+    expect(parseFactoryMeta(stamped.get("B")!).depends_on).toBeUndefined();
+  });
+
+  test("an explicit dep that also overlaps is listed exactly once (de-duped, sorted)", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: ["src/x/**"] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: ["src/z/**"] },
+      // C explicitly depends on B (ordinal 2) AND overlaps A (ordinal 1) via touches.
+      { title: "C", description: "body C", ordinal: 3, dependsOn: [2], touches: ["src/x/deep.ts"] },
+    ];
+    const stamped = await stampAll(children);
+    // Union of {2} explicit and {1} overlap → both, ascending, no duplicates.
+    expect(parseFactoryMeta(stamped.get("C")!).depends_on).toEqual(["FAC-100", "FAC-101"]);
+  });
+
+  test("a child with empty touches neither attracts nor gains an overlap edge", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: [] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: ["src/x/**"] },
+    ];
+    const stamped = await stampAll(children);
+    expect(parseFactoryMeta(stamped.get("B")!).depends_on).toBeUndefined();
+  });
+});

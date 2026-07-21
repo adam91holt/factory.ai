@@ -7,6 +7,7 @@ import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.t
 import { parseFactoryMeta, withFactoryMeta } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
+import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
@@ -87,7 +88,21 @@ export function readChildren(dir: string): ChildSpec[] {
  * without Linear. Because edges only ever point to strictly-lower ordinals,
  * every dependency is already in byOrdinal when its dependent is stamped —
  * single-pass, no create-then-update window. Returns the created identifiers in
- * creation (ascending-ordinal) order. */
+ * creation (ascending-ordinal) order.
+ *
+ * Gap 1 merge-race fix: the scheduler's file-mutex (busyTouches/globsOverlap)
+ * only defers overlapping siblings while they are concurrently in `inFlight`. A
+ * child leaves inFlight the moment it opens a PR, but on a human-merge repo
+ * (autoMergeRepos is empty by default, incl. factory.ai) that PR sits UNMERGED
+ * in review — so an overlapping sibling admitted on a later tick would branch
+ * from an origin/main that lacks its work, re-opening the very duplicate-file
+ * race (FAC-15/16/18) the mutex exists to kill, merely deferred from session-
+ * time to merge-time. So we serialize overlap at the DAG layer too: any child
+ * whose ## Touches overlap an EARLIER-ordinal sibling's gains an implicit
+ * depends_on edge to it. The completion-gated frontier then holds the later
+ * child until the earlier one reaches a terminal state (merged=completed, or
+ * canceled), not merely until it leaves inFlight. Edges still point only to
+ * strictly-lower ordinals, so acyclicity is preserved. */
 export async function createChildren(
   children: ChildSpec[],
   base: { repo: string; model?: string },
@@ -95,8 +110,17 @@ export async function createChildren(
 ): Promise<string[]> {
   const created: string[] = [];
   const byOrdinal = new Map<number, string>();
-  for (const child of [...children].sort((a, b) => a.ordinal - b.ordinal)) {
-    const dependsIds = child.dependsOn.map((o) => byOrdinal.get(o)!); // all lower ordinals already created
+  const sorted = [...children].sort((a, b) => a.ordinal - b.ordinal);
+  for (const child of sorted) {
+    // Union the declared edges with implicit overlap edges to lower-ordinal
+    // siblings (globsOverlap is empty-list-safe, so a child with no ## Touches
+    // adds none and attracts none — unchanged behavior). De-dup and sort so a
+    // sibling that is BOTH an explicit dep and an overlap dep is listed once.
+    const overlapOrdinals = sorted
+      .filter((s) => s.ordinal < child.ordinal && globsOverlap(child.touches, s.touches))
+      .map((s) => s.ordinal);
+    const depOrdinals = [...new Set([...child.dependsOn, ...overlapOrdinals])].sort((a, b) => a - b);
+    const dependsIds = depOrdinals.map((o) => byOrdinal.get(o)!); // all lower ordinals already created
     const stamped = withFactoryMeta(child.description, {
       repo: base.repo, type: "task",
       ...(base.model ? { model: base.model } : {}),
@@ -164,7 +188,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
         [
           "You are the decomposer in a software factory's planning stage. Using the epic and the scout's research brief, produce 2-6 child tickets that TOGETHER deliver the epic. HARD RULES:",
           '- The children form a DAG, not a flat parallel list. For any child that MUST follow another, declare a "## Depends-on" section listing the ordinals of the files it depends on (reference LOWER-NUMBERED files only, e.g. "01, 02"). A child with no ## Depends-on runs as soon as capacity allows.',
-          '- Declare a "## Touches" section listing EVERY path glob the child will modify (e.g. "src/foo/**, src/bar.ts"). Children whose ## Touches overlap are serialized automatically, so you no longer need non-overlapping areas — but you MUST declare touches honestly and completely: an omitted path reintroduces the sibling file-race. Prefer honest overlap (safe, serialized) over false independence.',
+          '- Declare a "## Touches" section listing EVERY path glob the child will modify (e.g. "src/foo/**, src/bar.ts"). Any child whose ## Touches overlap an EARLIER-numbered sibling\'s is given an implicit build-order dependency on it: the later child does not start until the earlier one has MERGED, so overlap costs parallelism (not correctness) — number overlapping children in the order they should build. You MUST declare touches honestly and completely: an omitted path reintroduces the sibling file-race. Prefer honest overlap (safe, serialized) over false independence.',
           `- Every child description MUST contain exactly these sections: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo}), ## Verifications (Automated/Manual/Visual), ## Touches, optionally ## Depends-on, and optionally ## Implementation approach.`,
           "- Size each child to fit one implementer session (~40 turns / 45 min).",
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',

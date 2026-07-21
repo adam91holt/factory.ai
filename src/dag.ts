@@ -63,9 +63,13 @@ export interface Schedulable {
 
 /** Split candidates into run / blocked / deferred for one scheduler tick.
  *
- *   blocked  — has a dependency whose live Linear state TYPE is not "completed"
- *              (or is unknown/undefined) → not on the frontier yet. Fail-closed:
- *              an unresolvable dep blocks rather than silently releasing.
+ *   blocked  — has a dependency whose live Linear state TYPE is neither
+ *              "completed" nor "canceled" (or is unknown/undefined) → not on the
+ *              frontier yet. Both are terminal (steward.ts / reconcile.ts treat
+ *              them alike); a canceled dep is "resolved, won't land" and must
+ *              satisfy the edge, else its dependents wedge forever. Fail-closed:
+ *              an unresolvable (non-terminal/unknown) dep blocks rather than
+ *              silently releasing.
  *   deferred — frontier-ready but its `touches` overlap a currently in-flight
  *              sibling (busyTouches) OR a candidate already admitted this tick.
  *   run      — admitted greedily in the candidates' (FIFO) order up to capacity,
@@ -87,7 +91,13 @@ export function selectRunnable(
   // overlapping touches never both run in the same tick.
   const admittedTouches: string[][] = [...busyTouches];
   for (const c of candidates) {
-    const onFrontier = c.dependsOn.every((dep) => depStateType(dep) === "completed");
+    // Both terminal state types satisfy a dependency: "completed" (the work
+    // landed) and "canceled" (resolved, won't land — a human/steward dropped it
+    // as redundant). Blocking on canceled would wedge every dependent forever.
+    const onFrontier = c.dependsOn.every((dep) => {
+      const t = depStateType(dep);
+      return t === "completed" || t === "canceled";
+    });
     if (!onFrontier) { blocked.push(c.identifier); continue; }
     if (run.length >= Math.max(0, capacity)) { deferred.push(c.identifier); continue; }
     if (c.touches.length > 0 && admittedTouches.some((t) => globsOverlap(c.touches, t))) {
