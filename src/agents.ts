@@ -36,6 +36,8 @@ interface StageOptions {
   budgetUsd: number;      // REMAINING issue budget, not a constant (C11)
   deadlineMs: number;     // absolute epoch ms; stage aborts at this time (C12)
   onEvent?: (event: AgentStreamEvent) => void;   // live stage telemetry (UI observes)
+  resume?: string;                               // resume a prior session (interrupted-run recovery)
+  onSessionId?: (id: string) => void;            // fired on session init — persist for resume
 }
 
 // Orchestration/team tools the ambient harness injects into SDK workers and that
@@ -91,6 +93,8 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads
         includePartialMessages: true, // stream text deltas so tool-less stages (reviewers) show live activity
+        persistSession: true, // keep the transcript so an interrupted stage can resume
+        ...(opts.resume ? { resume: opts.resume } : {}),
         env,
         abortController: abort,
       },
@@ -99,6 +103,11 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     let lastStreamEmit = 0;
     for await (const message of q) {
       const m = message as { type?: string; message?: { content?: unknown }; event?: { type?: string; delta?: { type?: string; text?: string } } };
+      if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
+        const sid = (m as { session_id?: string }).session_id;
+        if (sid) opts.onSessionId?.(sid);
+        continue;
+      }
       if (m.type === "stream_event" && m.event?.type === "content_block_delta" && m.event.delta?.type === "text_delta") {
         streamBuffer += m.event.delta.text ?? "";
         const now = Date.now();

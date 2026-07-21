@@ -15,6 +15,9 @@ export function startEventStore(): void {
   // busy_timeout a long telemetry read holds the lock, the writer's INSERT
   // throws SQLITE_BUSY, and the subscriber catch below silently DROPS the event
   // from the durable log.
+  db.run(`CREATE TABLE IF NOT EXISTS stage_sessions (
+    issue_key TEXT NOT NULL, stage TEXT NOT NULL, session_id TEXT NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (issue_key, stage))`);
   db.run("PRAGMA busy_timeout = 2000");
   try { db.run("PRAGMA journal_mode = WAL"); } catch (error) {
     console.error(`[db] WAL switch failed (keeping default journal): ${error instanceof Error ? error.message : error}`);
@@ -418,4 +421,24 @@ export function lessonRowCountSince(sinceMs: number): number {
   if (!db) return 0;
   const row = db.prepare("SELECT COUNT(*) AS n FROM lessons WHERE created_at >= ?").get(sinceMs) as { n: number };
   return row.n;
+}
+
+
+/** Resume support: persist the SDK session_id for an in-flight stage so a
+ * cut-off run (process killed mid-stage) can resume its actual conversation
+ * on re-claim instead of starting over. Recorded on session init, cleared when
+ * the stage returns normally — so a lingering row == the stage was interrupted. */
+export function recordStageSession(issueKey: string, stage: string, sessionId: string): void {
+  if (!db || !issueKey || !stage || !sessionId) return;
+  try { db.prepare("INSERT OR REPLACE INTO stage_sessions (issue_key, stage, session_id, at) VALUES (?, ?, ?, ?)")
+    .run(issueKey, stage, sessionId, Date.now()); } catch { /* best-effort */ }
+}
+export function getStageSession(issueKey: string, stage: string): string | null {
+  if (!db) return null;
+  try { const r = db.prepare("SELECT session_id FROM stage_sessions WHERE issue_key = ? AND stage = ?").get(issueKey, stage) as { session_id?: string } | null;
+    return r?.session_id ?? null; } catch { return null; }
+}
+export function clearStageSession(issueKey: string, stage: string): void {
+  if (!db) return;
+  try { db.prepare("DELETE FROM stage_sessions WHERE issue_key = ? AND stage = ?").run(issueKey, stage); } catch { /* best-effort */ }
 }

@@ -6,6 +6,7 @@ import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diff
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta } from "./meta.ts";
+import { getStageSession, recordStageSession, clearStageSession } from "./db.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -166,10 +167,22 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // prepended to stage prompts as non-authoritative DATA (caps in lessons.ts:
     // ≤5 lessons / ≤1000 chars; "" when none, so prompts are unchanged).
     const lessonsBlock = buildLessonsBlock(lessonsForRepo(repo).map((r) => r.lesson));
-    const implementer = await runStage("implementer",
-      lessonsBlock + renderPrompt("implementer", { repo, spec },
-        `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`),
-      { model: implModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+    const implPrompt = lessonsBlock + renderPrompt("implementer", { repo, spec },
+        `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`);
+    const implOpts = { model: implModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+      onSessionId: (id: string) => recordStageSession(issue.identifier, "implementer", id) };
+    // Resume an interrupted implementer: a lingering session row means the prior
+    // run was cut off mid-build (process killed) — pick up its actual conversation
+    // rather than starting over. Falls back to a fresh session if resume fails
+    // (e.g. an evicted session or the proxy-resume path).
+    const priorSession = getStageSession(issue.identifier, "implementer");
+    if (priorSession) console.log(`[${issue.identifier}] resuming interrupted implementer session`);
+    let implementer = await runStage("implementer", implPrompt, { ...implOpts, ...(priorSession ? { resume: priorSession } : {}) });
+    if (priorSession && implementer.error) {
+      console.error(`[${issue.identifier}] resume failed (${implementer.error}); retrying fresh`);
+      implementer = await runStage("implementer", implPrompt, implOpts);
+    }
+    clearStageSession(issue.identifier, "implementer"); // stage returned → not cut off
     stages.push(implementer);
     await postStageComment(issue, implementer);
     if (implementer.error) { await park(issue, repo, stages, `implementer: ${implementer.error}`); return; }
