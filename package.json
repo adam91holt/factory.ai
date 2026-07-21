@@ -10,6 +10,7 @@
   },
   "scripts": {
     "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
     "factory": "bun src/index.ts",
     "factory:once": "bun src/index.ts --once",
     "factory:dry": "bun src/index.ts --once --dry-run",

@@ -1,0 +1,5 @@
+# Test harness bootstrap. src/config.ts throws at import time when
+# LINEAR_API_KEY is unset (and agents.ts / loop.ts / groundskeepers.ts import
+# it transitively), so every bun test run preloads the dummy-env stub first.
+[test]
+preload = "./tests/setup.ts"
