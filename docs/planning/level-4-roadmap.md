@@ -87,3 +87,11 @@ Today the catalog has flat role cards (implementer/reviewer/…) with `model/too
 Result: a **dispatchable worker pool** — the factory selects the right specialist (own model, tools, MCP, skills) per job, code or non-code. Governance carries over: MCP servers per card are an allowlist (no ambient MCP), read-only where possible, secrets never in worker env, cards editable only via the catalog manager's git-committed, validated saves.
 
 Decompose (foundation-first): (1) extend the card schema + loader for `mcpServers` + validate against an allowlist; (2) thread per-card MCP/tool/skill config through `runStage`; (3) worker-selection in plan/loop (label wins, else classify by when-to-use); (4) 1–2 real specialist cards proving a non-code MCP path (e.g. a read-only data-analyst); (5) catalog-manager UI support for MCP fields. Anti-goals: no ambient/unrestricted MCP; no write-capable MCP without human-review gating; don't let a card grant itself Bash/bypass via save (the catalog manager's immutable-armed-fields rule already guards this — extend it to MCP).
+
+### Worker-pool addition: per-epic (and per-ticket) model override
+**Adam, 2026-07-21:** model choice is a global env var today — an epic can only run on a premium model by flipping the global switch, which affects all other work and is fragile. Add epic-scoped model routing as part of the worker-pool epic:
+- An epic carries a model directive (a `Factory-Model:<id>` label, or a `## Model` line the decomposer reads).
+- The **decomposer propagates it to every child** it files (stamps the same label / a frontmatter field).
+- The **pipeline reads the per-ticket override** and applies it to that ticket's stages (implementer/fixer/reviewers), falling back to the global default when absent.
+- Generalizes to per-ticket: any ticket can request a specific model/worker; the override is a ceiling the governance still bounds (budget caps unchanged).
+This is what lets the global default stay cheap (sonnet/opus routing) while high-stakes epics (like FAC-14 self-improvement) opt into Fable end-to-end without a global flip. Until it exists, premium epics require a temporary global change + revert.
