@@ -73,3 +73,17 @@ what to monitor (telemetry queries, repo health), anti-goals>
 
 ## Queued build: catalog manager UI (after telemetry + groundskeeper)
 Mission-control page for managing the org: list/edit agent cards (`agents/*.md`), skills (`skills/*/SKILL.md`), and groundskeeper cards — frontmatter as a form (model, tools, effort, schedule, enabled, budget), prompt/charter as an editor, diff preview before save. Server: read/write endpoints restricted to those directories (path-traversal guarded), every save = a git commit (audit trail; the factory's own guarded-path rule applies — catalog edits via UI are human acts, so direct commit is correct). Show per-card usage stats from telemetry (runs, cost, findings) so pruning weak cards is evidence-based.
+
+## Next epic (after FAC-14 lands — same subsystem, must not run concurrently): Worker pool — specialists with bundled capabilities
+
+**Adam, 2026-07-21:** the factory should call on specific worker agents for particular purposes, each given its own skills, MCP servers, and tools. This is the deferred "crews" concept made concrete, and it's what lets the factory work beyond code.
+
+Today the catalog has flat role cards (implementer/reviewer/…) with `model/tools/effort/skills`. Extend cards into **capability-bundled worker specialists**:
+- **MCP servers per card** — a card declares which MCP servers it gets (SDK `mcpServers` per query). e.g. a `data-analyst` worker gets a read-only Mongo MCP; a `researcher` gets web/search; a `support-triage` worker gets ZohoDesk; a Rapido worker gets Linear + client Mongo. This connects the factory to Adam's real ventures, not just repos.
+- **Richer tools** — built-in tools + custom in-process SDK MCP tools (the `proxy_models` pattern from codexProxyTest).
+- **Skills** (already on cards) — grow the skills library, attach per worker.
+- **Purpose-routing** — the planner/decomposer (or a ticket label / classifier) picks the right worker for each child by matching work-type to the card's `when-to-use`, so a child gets a specialist with exactly the tools/MCP/skills it needs. This is classify-and-act from the dynamic-workflows templates.
+
+Result: a **dispatchable worker pool** — the factory selects the right specialist (own model, tools, MCP, skills) per job, code or non-code. Governance carries over: MCP servers per card are an allowlist (no ambient MCP), read-only where possible, secrets never in worker env, cards editable only via the catalog manager's git-committed, validated saves.
+
+Decompose (foundation-first): (1) extend the card schema + loader for `mcpServers` + validate against an allowlist; (2) thread per-card MCP/tool/skill config through `runStage`; (3) worker-selection in plan/loop (label wins, else classify by when-to-use); (4) 1–2 real specialist cards proving a non-code MCP path (e.g. a read-only data-analyst); (5) catalog-manager UI support for MCP fields. Anti-goals: no ambient/unrestricted MCP; no write-capable MCP without human-review gating; don't let a card grant itself Bash/bypass via save (the catalog manager's immutable-armed-fields rule already guards this — extend it to MCP).
