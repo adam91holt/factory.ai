@@ -1,5 +1,6 @@
 import type { FactoryEvent, FactoryEventBody, QueueIssue, RunRecord } from "./events";
 import type { Telemetry } from "./telemetry";
+import type { Lesson } from "./lessons";
 
 // ---------------------------------------------------------------------------
 // Mock fixtures — ?mock=1 replays a realistic factory session through the
@@ -350,6 +351,59 @@ export function mockRunRecords(): RunRecord[] {
     },
   ];
   return rows;
+}
+
+// ---- /lessons — what the factory has learned (and can be told to forget) ----
+
+export function mockLessons(): Lesson[] {
+  const now = Date.now();
+  return [
+    {
+      id: 7,
+      repo: "rapido/api",
+      stage: "verify-repair-1",
+      lesson: "bun test loads .env.test automatically — seeding fixtures via a hand-rolled dotenv loader double-applies overrides and flakes the auth suite. Rely on Bun's loader; never re-parse env files in test setup.",
+      sourceIssue: "FAC-15",
+      sourceUrl: "https://linear.app/rapido/issue/FAC-15",
+      createdAt: now - 4 * HOUR,
+    },
+    {
+      id: 6,
+      repo: "rapido/portal",
+      stage: "implementer",
+      lesson: "The portal's vite build fails on imports with explicit .ts extensions (bundler resolution, allowImportingTsExtensions off). Import without extensions in ui code even though the server code uses them.",
+      sourceIssue: "FAC-13",
+      sourceUrl: "https://linear.app/rapido/issue/FAC-13",
+      createdAt: now - 26 * HOUR,
+    },
+    {
+      id: 5,
+      repo: "rapido/api",
+      stage: "fixer",
+      lesson: "Express is behind the gateway with trust proxy set — req.ip is the LB address unless X-Forwarded-For depth is configured. Key any per-client logic on the auth middleware's resolved client IP.",
+      sourceIssue: "FAC-20",
+      sourceUrl: "https://linear.app/rapido/issue/FAC-20",
+      createdAt: now - 2 * DAY,
+    },
+    {
+      id: 3,
+      repo: "adam91holt/factory.ai",
+      stage: "implementer",
+      lesson: "ui/ and src/ have separate tsconfigs — `bun run typecheck` at the root does NOT cover ui/. Run `bun run --cwd ui typecheck` too before calling gates green.",
+      sourceIssue: "FAC-9",
+      sourceUrl: "https://linear.app/rapido/issue/FAC-9",
+      createdAt: now - 3 * DAY - 5 * HOUR,
+    },
+    {
+      id: 2,
+      repo: "rapido/portal",
+      stage: "verify-repair-2",
+      lesson: "Playwright smoke tests race the SSE reconnect on cold start — await the ': connected' comment frame before asserting on live regions, or the first assertion lands on an empty store.",
+      sourceIssue: null,
+      sourceUrl: null,
+      createdAt: now - 5 * DAY,
+    },
+  ];
 }
 
 // ---- /telemetry snapshot ----------------------------------------------------
