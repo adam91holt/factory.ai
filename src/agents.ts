@@ -38,6 +38,16 @@ interface StageOptions {
   onEvent?: (event: AgentStreamEvent) => void;   // live stage telemetry (UI observes)
 }
 
+// Orchestration/team tools the ambient harness injects into SDK workers and that
+// allowedTools does NOT confine (friction audit 2026-07-21: a read-only reviewer
+// spawned 13-subagent swarms = 42% of spend). Hard-denied on every worker — no
+// factory stage legitimately spawns subagents, messages a team, or sets cron.
+const DENY_ORCHESTRATION = [
+  "Agent", "Task", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput",
+  "TaskStop", "SendMessage", "CronCreate", "CronList", "CronDelete", "Skill",
+  "Workflow", "ReportFindings", "PushNotification", "ScheduleWakeup",
+];
+
 export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
   const t0 = Date.now();
   // Non-claude models route via the proxy automatically (any role can be either
@@ -73,6 +83,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
         model: opts.model,
         cwd: opts.cwd,
         allowedTools: opts.allowedTools ?? [],
+        disallowedTools: DENY_ORCHESTRATION,
         permissionMode: "dontAsk", // enforces the allowlist (triage-agent lesson)
         maxTurns: opts.maxTurns,
         maxBudgetUsd: Math.max(0.5, opts.budgetUsd),

@@ -19,7 +19,7 @@ import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 const REQUIRED_SECTIONS = ["## Goal", "## Outcomes", "## Repo", "## Verifications"];
 
 // Interim Bash scoping for write-capable roles (C19; full OS sandbox is backlog).
-const WRITER_BASH = ["Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(ls:*)", "Bash(cat:*)"];
+const WRITER_BASH = ["Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git rm:*)", "Bash(ls:*)", "Bash(cat:*)"];
 
 export function missingSections(issue: linear.Issue): string[] {
   return REQUIRED_SECTIONS.filter((s) => !issue.description.includes(s));
@@ -177,12 +177,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       runStage("reviewer-claude", renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
         { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
       reviewCodex = await runStage("reviewer-fallback", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
@@ -219,7 +219,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       // are exhausted still failing, tasteFindings folds into the needsHuman path below.
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       let design = await runStage("design-reviewer", designReviewPrompt(),
-        { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
       for (let round = 1; round < maxTasteRounds && !tastePasses(design) && !budget.expired; round++) {
@@ -232,7 +232,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
         if (budget.expired) break;
         design = await runStage(`design-reviewer-${round + 1}`, designReviewPrompt(),
-          { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(design);
         await postStageComment(issue, design);
       }
