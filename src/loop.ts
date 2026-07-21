@@ -110,6 +110,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     return;
   }
 
+  // Defensive: an issue that became a Factory-Epic between fetchQueue and now
+  // (create-then-label race) must go to the planner, never the implementer.
+  const preCheck = await linear.getIssue(issue.id).catch(() => null);
+  if (preCheck?.labels.includes(linear.EPIC_LABEL)) {
+    console.error(`[${issue.identifier}] is a Factory-Epic — skipping implement path (planner will take it)`);
+    return;
+  }
   if (!config.dryRun && !(await linear.claim(issue))) {
     console.error(`[${issue.identifier}] claim failed or lost race — skipping`);
     return;
