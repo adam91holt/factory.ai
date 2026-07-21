@@ -72,6 +72,17 @@ export function parseSecurityVerdict(text: string): "pass" | "fail" {
   return /SECURITY:\s*fail/i.test(text) ? "fail" : "pass";
 }
 
+/** A security review was WARRANTED (the diff is non-trivial) but no verdict exists
+ * — the stage was skipped by budget/deadline expiry, or it errored. This is the
+ * fail-open hole Gap 2 must close: decideMerge blocks only on an explicit "fail",
+ * so a null verdict would otherwise let an earned auto tier merge a large diff with
+ * the security gate silently skipped. The loop folds a true result into needsHuman
+ * (fail-closed for the merge ACTION), degrading the PR to human review — it never
+ * parks the pipeline on this alone. */
+export function securityReviewOutstanding(diffLines: number, securityVerdict: "pass" | "fail" | null): boolean {
+  return diffLines >= SECURITY_REVIEW_MIN_DIFF_LINES && securityVerdict === null;
+}
+
 async function post(issue: linear.Issue, body: string): Promise<void> {
   const { clean, found } = redactSecrets(body);
   if (found > 0) console.error(`[${issue.identifier}] redacted ${found} secret-like strings from outbound comment`);
@@ -406,8 +417,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // ---- security review (Gap 2): a read-only, cross-vendor pass over the FINAL
     // diff + ticket (both untrusted — no author reasoning, no merge authority
     // from ticket text) on non-trivial changes. Ends "SECURITY: pass|fail"; a
-    // fail folds into needsHuman below and blocks auto-merge. Degrades on error
-    // (verdict null = not run) rather than parking.
+    // fail folds into needsHuman below and blocks auto-merge. The stage can leave
+    // securityVerdict null when it was WARRANTED but never completed — budget
+    // expiry in this window, or a stage error. A null verdict must NOT reach the
+    // merge decision as "not a fail" and slip past decideMerge (which only blocks
+    // on "fail"): a warranted-but-absent security pass folds into needsHuman below
+    // (fail-closed for the merge ACTION), so the PR still opens for a human rather
+    // than auto-merging a large diff with the gate silently skipped. The pipeline
+    // itself degrades (PR opens), never parks, on an absent verdict.
     let finalDiff = "";
     try { finalDiff = diffAgainstBase(ws); } catch { finalDiff = ""; }
     const diffLines = countDiffLines(finalDiff);
@@ -438,14 +455,21 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // needsHuman folds every "PR opens but a human must advance it" cause into
     // one gate: guarded paths (C17), a persistent taste-gate fail, an explicit
-    // tester FAIL, or a security-review FAIL. Any of them blocks auto-merge even
-    // on enrolled repos.
+    // tester FAIL, a security-review FAIL, or a WARRANTED-but-absent security pass
+    // (a non-trivial diff whose security review never completed — budget expiry or
+    // stage error left securityVerdict null). Any of them blocks auto-merge even
+    // on enrolled repos. The security-absent fold is fail-closed for the merge
+    // action: without it, a null verdict slips past decideMerge (which blocks only
+    // on "fail"), letting an earned auto tier merge a large diff with the security
+    // gate silently skipped — the exact gate Gap 2 introduced.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
+    const securityWarrantedButAbsent = securityReviewOutstanding(diffLines, securityVerdict);
     const holdReasons: string[] = [];
     if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
     if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
+    if (securityWarrantedButAbsent) holdReasons.push(`security review did not complete on a ${diffLines}-line diff (${budget.expired ? budget.expiredReason : "stage error"}) — cannot auto-merge unreviewed`);
     const needsHuman = holdReasons.length > 0;
     const holdReason = holdReasons.join("; ");
 

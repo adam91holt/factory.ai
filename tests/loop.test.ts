@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, countDiffLines } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -137,6 +137,40 @@ describe("parseSecurityVerdict", () => {
   test("anything else is pass (a missing verdict must not silently block)", () => {
     expect(parseSecurityVerdict("no issues found\nSECURITY: pass")).toBe("pass");
     expect(parseSecurityVerdict("no line at all")).toBe("pass");
+  });
+});
+
+// Gap-2 fail-open fix: a security review that was WARRANTED (non-trivial diff) but
+// never produced a verdict (budget/deadline expiry or a stage error left it null)
+// must block the merge ACTION, not slip past decideMerge (which blocks only on an
+// explicit "fail"). The loop folds a true result into needsHuman so the PR degrades
+// to human review instead of auto-merging with the security gate silently skipped.
+describe("securityReviewOutstanding", () => {
+  test("non-trivial diff with a null verdict is outstanding (blocks auto-merge)", () => {
+    expect(securityReviewOutstanding(20, null)).toBe(true);
+    expect(securityReviewOutstanding(500, null)).toBe(true);
+  });
+
+  test("a completed verdict (pass or fail) is NOT outstanding — it already gated", () => {
+    expect(securityReviewOutstanding(500, "pass")).toBe(false);
+    expect(securityReviewOutstanding(500, "fail")).toBe(false);
+  });
+
+  test("a trivial diff below the threshold never warranted a review → not outstanding", () => {
+    expect(securityReviewOutstanding(19, null)).toBe(false);
+    expect(securityReviewOutstanding(0, null)).toBe(false);
+  });
+
+  test("an outstanding review folds into needsHuman → decideMerge cannot act", () => {
+    // The loop passes needsHuman:true when securityReviewOutstanding is true; assert
+    // that this alone forces wouldMerge=false even at the most permissive tier.
+    const ev = buildMergeEvidence({
+      summary: { green: true, strength: "strong" }, guarded: [], needsHuman: true,
+      security: null, browser: "not-required", diffLines: 500,
+    });
+    const d = decideMerge("auto", ev, { lowRiskMaxDiff: 40 });
+    expect(d.wouldMerge).toBe(false);
+    expect(d.act).toBe(false);
   });
 });
 
