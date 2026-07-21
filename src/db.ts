@@ -25,6 +25,19 @@ export function startEventStore(): void {
   db.run("CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_key, id)");
   // Telemetry aggregation scans by event type (run_stage_finished / run_finished).
   db.run("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, id)");
+  // Durable, repo-scoped lessons distilled from failures (park / needs-human /
+  // taste-fail) — the self-improvement flywheel's memory (level-4-roadmap.md,
+  // principle 7). Same shared handle as the event log: never a second writer
+  // against a running daemon (see governance note below). All reads/writes go
+  // through the row helpers here, and ONLY src/lessons.ts calls those — other
+  // modules consume the lessons.ts API, never SQL.
+  db.run(`CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER,
+    repo TEXT, stage TEXT, issue_key TEXT,
+    lesson TEXT, source_reason TEXT,
+    archived INTEGER DEFAULT 0)`);
+  db.run("CREATE INDEX IF NOT EXISTS idx_lessons_repo ON lessons(repo, archived, id)");
   const insert = db.prepare("INSERT INTO events (seq, at, type, issue_key, json) VALUES (?, ?, ?, ?, ?)");
   bus.subscribe((e: FactoryEvent) => {
     try {
@@ -332,4 +345,77 @@ export function getTelemetry(): Telemetry {
     .slice(0, 10);
   telemetryCache = { watermark: wm.m, day: today, value: t };
   return t;
+}
+
+// ---------------------------------------------------------------------------
+// Lessons rows — thin shared-handle accessors consumed ONLY by src/lessons.ts
+// (which owns validation, redaction, caps, and the distillation step). Keeping
+// them here honors the single-writer rule: the daemon's one Database handle is
+// the only writer factory.db ever sees. Each returns a safe zero value when the
+// store is closed (--once / DASHBOARD_PORT=0) — lessons capture is best-effort
+// and must never throw into the pipeline.
+// ---------------------------------------------------------------------------
+
+export interface LessonRow {
+  id: number;
+  createdAt: number;
+  repo: string;
+  stage: string;
+  issueKey: string;
+  lesson: string;
+  sourceReason: string;
+  archived: boolean;
+}
+
+interface RawLessonRow { id: number; created_at: number; repo: string; stage: string;
+  issue_key: string; lesson: string; source_reason: string; archived: number }
+
+function toLessonRow(r: RawLessonRow): LessonRow {
+  return { id: r.id, createdAt: r.created_at, repo: r.repo, stage: r.stage,
+    issueKey: r.issue_key, lesson: r.lesson, sourceReason: r.source_reason,
+    archived: r.archived !== 0 };
+}
+
+/** Insert one lesson row. Returns false (no throw) when the store is closed. */
+export function insertLessonRow(row: { createdAt: number; repo: string; stage: string;
+  issueKey: string; lesson: string; sourceReason: string }): boolean {
+  if (!db) return false;
+  db.prepare(
+    "INSERT INTO lessons (created_at, repo, stage, issue_key, lesson, source_reason, archived) VALUES (?, ?, ?, ?, ?, ?, 0)",
+  ).run(row.createdAt, row.repo, row.stage, row.issueKey, row.lesson, row.sourceReason);
+  return true;
+}
+
+/** Newest-first active (archived = 0) lessons for one repo, capped by `limit`. */
+export function activeLessonRowsForRepo(repo: string, limit: number): LessonRow[] {
+  if (!db) return [];
+  const rows = db.prepare(
+    "SELECT id, created_at, repo, stage, issue_key, lesson, source_reason, archived FROM lessons WHERE repo = ? AND archived = 0 ORDER BY id DESC LIMIT ?",
+  ).all(repo, limit) as RawLessonRow[];
+  return rows.map(toLessonRow);
+}
+
+/** Every lesson row (archived included), newest first, bounded. */
+export function allLessonRows(limit: number): LessonRow[] {
+  if (!db) return [];
+  const rows = db.prepare(
+    "SELECT id, created_at, repo, stage, issue_key, lesson, source_reason, archived FROM lessons ORDER BY id DESC LIMIT ?",
+  ).all(limit) as RawLessonRow[];
+  return rows.map(toLessonRow);
+}
+
+/** Human-initiated archive (sets archived = 1 — rows are never deleted).
+ *  Returns true when a row actually changed. */
+export function archiveLessonRow(id: number): boolean {
+  if (!db) return false;
+  const res = db.prepare("UPDATE lessons SET archived = 1 WHERE id = ? AND archived = 0").run(id);
+  return res.changes > 0;
+}
+
+/** Count of lessons written since `sinceMs` — backs the distillation spend
+ *  guard (per-day cap on distiller calls). */
+export function lessonRowCountSince(sinceMs: number): number {
+  if (!db) return 0;
+  const row = db.prepare("SELECT COUNT(*) AS n FROM lessons WHERE created_at >= ?").get(sinceMs) as { n: number };
+  return row.n;
 }

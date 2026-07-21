@@ -8,6 +8,7 @@ import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.t
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
+import { captureLesson } from "./lessons.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
 // budget threaded cumulatively (C11), deadline before every stage + abort (C12),
@@ -55,13 +56,19 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
   };
 }
 
-/** Terminal "needs human" — labeled so it can never loop or spam (C6). */
-export async function markNeedsHuman(issue: linear.Issue, reason: string): Promise<void> {
+/** Terminal "needs human" — labeled so it can never loop or spam (C6).
+ *  `repo` (when the caller knows it) scopes the distilled lesson; contract
+ *  failures before repo parsing pass nothing and the lesson stays repo-less. */
+export async function markNeedsHuman(issue: linear.Issue, reason: string, repo?: string): Promise<void> {
   bus.emit({ type: "issue_needs_human", issueKey: issue.identifier, reason: redactSecrets(reason).clean.slice(0, 500) });
   await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason}\n\nRemove the \`${linear.NEEDS_HUMAN_LABEL}\` label after fixing to requeue.`);
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch((e) => console.error(`[${issue.identifier}] label failed: ${e}`));
   }
+  // Distill the intervention into a durable lesson (best-effort, never throws;
+  // no-op on dry-run / closed store).
+  await captureLesson({ repo: repo ?? "", stage: "triage", issueKey: issue.identifier,
+    outcome: "needs_human", reason });
 }
 
 /** Post a stage's final output onto the ticket as an audit-trail comment. */
@@ -136,12 +143,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     try {
       ws = await ensureWorkspace(repo, issue.identifier);
     } catch (error) {
-      await park(issue, stages, `workspace: ${error instanceof Error ? error.message : error}`);
+      await park(issue, repo, stages, `workspace: ${error instanceof Error ? error.message : error}`);
       return;
     }
 
     const deps = ensureDeps(ws);
-    if (!deps.ok) { await park(issue, stages, `dependency install failed: ${deps.detail.slice(0, 300)}`); return; }
+    if (!deps.ok) { await park(issue, repo, stages, `dependency install failed: ${deps.detail.slice(0, 300)}`); return; }
     const gates = detectGates(ws);
     const baselines = baseline(ws, gates);
 
@@ -152,15 +159,15 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
     await postStageComment(issue, implementer);
-    if (implementer.error) { await park(issue, stages, `implementer: ${implementer.error}`); return; }
-    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`)) { await park(issue, stages, "implementer produced no committable changes"); return; }
-    if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
+    if (implementer.error) { await park(issue, repo, stages, `implementer: ${implementer.error}`); return; }
+    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`)) { await park(issue, repo, stages, "implementer produced no committable changes"); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "implementation"); return; }
 
     // ---- adversarial review: framing-stripped (spec + diff ONLY), tool-less
     let diff: string;
     try { diff = diffAgainstBase(ws); }
-    catch (error) { await park(issue, stages, `diff failed: ${error instanceof Error ? error.message : error}`); return; }
+    catch (error) { await park(issue, repo, stages, `diff failed: ${error instanceof Error ? error.message : error}`); return; }
 
     const reviewPrompt = (lens: string) =>
       `You are an adversarial code reviewer in an automated pipeline. Assume the change is BROKEN until proven otherwise. Lens: ${lens}. You get ONLY the ticket and the diff — no author reasoning. For each real problem: exact input/scenario that fails, expected vs actual, responsible hunk. No praise. If nothing after genuine effort: NO-FINDINGS.\n\n${spec}\n\n<diff>\n${diff.slice(0, 180_000)}\n</diff>`;
@@ -182,7 +189,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     stages.push(reviewClaude, reviewCodex);
     await postStageComment(issue, reviewClaude);
     await postStageComment(issue, reviewCodex);
-    if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
     const fixer = await runStage("fixer",
@@ -191,9 +198,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     await postStageComment(issue, fixer);
-    if (fixer.error) { await park(issue, stages, `fixer: ${fixer.error}`); return; }
+    if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`); return; }
     commitAll(ws, `${issue.identifier}: apply review feedback`);
-    if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "review"); return; }
 
     // ---- design review (taste gate): UI diffs are held to a taste bar, not
@@ -255,7 +262,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
           outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
     }
-    if (!summary.green) { await park(issue, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
+    if (!summary.green) { await park(issue, repo, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
 
     // ---- tester (after gates): executes the ticket's ## Verifications when it
     // asks for browser/visual checks AND the repo can run Playwright. Report-only
@@ -275,7 +282,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- deliver (guarded paths / test deletion stop auto-advance — C17)
     const removedTests = testFilesRemoved(ws);
-    if (removedTests.length > 0) { await park(issue, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`); return; }
+    if (removedTests.length > 0) { await park(issue, repo, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`); return; }
     const guarded = guardedPathsTouched(ws);
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "delivery"); return; }
 
@@ -313,6 +320,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
       dryRun: config.dryRun });
 
+    // Distill the human-gate fold into a durable lesson (best-effort, never
+    // throws; no-op on dry-run / closed store). A persistent taste-gate fail is
+    // its own outcome so the lesson names the design failure, not just "held".
+    if (needsHuman) {
+      await captureLesson({ repo, issueKey: issue.identifier,
+        stage: tasteFindings ? "design-reviewer" : "deliver",
+        outcome: tasteFindings ? "taste_fail" : "needs_human",
+        reason: holdReason,
+        ...(tasteFindings ? { tasteFindings } : {}) });
+    }
+
     // Comment is best-effort; transition/release are guaranteed (C10).
     try { await post(issue, report); } catch (e) { console.error(`[${issue.identifier}] report post failed: ${e}`); }
     if (!config.dryRun) {
@@ -337,14 +355,15 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
     console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : "pr_open"} ${prUrl ?? "(dry-run)"}`);
   } catch (error) {
-    await park(issue, stages, error instanceof Error ? error.message : String(error));
+    await park(issue, repo, stages, error instanceof Error ? error.message : String(error));
   }
 }
 
-async function park(issue: linear.Issue, stages: StageResult[], reason: string): Promise<void> {
+async function park(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
   // Caps and failures PARK, never destroy: worktree kept, Factory-Parked label
   // keeps it out of the queue until a human clears it (C6); comment best-effort,
-  // label/release guaranteed (C10).
+  // label/release guaranteed (C10). `repo` is threaded in from processIssue so
+  // the distilled lesson is repo-scoped (run_finished doesn't carry repo).
   const input: ReportInput = {
     issueKey: issue.identifier, prUrl: null, outcome: "parked", reason,
     stages, gates: [], gateStrength: "none", guardedPaths: [],
@@ -360,4 +379,10 @@ async function park(issue: linear.Issue, stages: StageResult[], reason: string):
     await linear.release(issue);
   }
   console.error(`[${issue.identifier}] parked: ${reason}`);
+  // Distill the park into a durable, repo-scoped lesson (best-effort, never
+  // throws; no-op on dry-run / closed store).
+  const failed = stages.filter((s) => s.error !== undefined);
+  await captureLesson({ repo, stage: stages.at(-1)?.label ?? "pipeline",
+    issueKey: issue.identifier, outcome: "parked", reason,
+    ...(failed.length > 0 ? { stageErrors: failed.map((s) => `${s.label}: ${s.error}`) } : {}) });
 }
