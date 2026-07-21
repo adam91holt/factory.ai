@@ -139,6 +139,39 @@ export async function fetchIssuesByStateType(stateType: string, teamKey: string)
   return data.issues.nodes.map(toIssue);
 }
 
+/** Resolve a set of sibling identifiers (e.g. ["FAC-123","FAC-124"]) to their
+ * current state TYPE (identifier → "completed" | "started" | …). One GraphQL
+ * query filtering by team key + issue number; the returned identifier is
+ * authoritative so cross-team number collisions can't mismap. The scheduler
+ * calls this each tick to test the DAG frontier against LIVE Linear state (the
+ * stillOurs() freshness pattern generalized to dependencies — Gap 4). An
+ * identifier that resolves to nothing is simply absent from the map, which the
+ * scheduler treats as "not completed" (fail-closed). Tolerates the
+ * LinearRateLimited path like every other query — it throws up to tick()'s
+ * existing backoff. */
+export async function fetchStatesByIdentifiers(ids: string[]): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  // Parse TEAM-123 → { key, number }; drop anything malformed so a junk id
+  // never reaches the query. Collect the distinct team keys and numbers.
+  const numbers: number[] = [];
+  const teamKeys = new Set<string>();
+  for (const id of ids) {
+    const m = id.match(/^([A-Z][A-Z0-9]*)-(\d+)$/);
+    if (!m) continue;
+    teamKeys.add(m[1]!);
+    numbers.push(Number(m[2]!));
+  }
+  if (numbers.length === 0) return result;
+  const data = await gql<{ issues: { nodes: Array<{ identifier: string; state: { type: string } }> } }>(
+    `query($teams: [String!]!, $numbers: [Float!]!) {
+      issues(first: 100, filter: { team: { key: { in: $teams } }, number: { in: $numbers } }) {
+        nodes { identifier state { type } } } }`,
+    { teams: [...teamKeys], numbers },
+  );
+  for (const node of data.issues.nodes) result.set(node.identifier, node.state.type);
+  return result;
+}
+
 export async function getIssue(id: string): Promise<Issue> {
   const data = await gql<{ issue: RawIssue }>(
     `query($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`, { id });

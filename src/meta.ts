@@ -17,7 +17,25 @@ export interface FactoryMeta {
   // only WITHHOLD auto-merge, never GRANT it — untrusted text must not confer
   // merge authority on a repo the operator did not allowlist.
   merge?: "auto" | "shadow" | "review";
+  // Gap-1 DAG scheduling. depends_on carries sibling identifiers (e.g.
+  // ["FAC-123","FAC-124"]) that must all reach a completed state before this
+  // child is claimed (the topological frontier); touches carries the path globs
+  // this child will modify — the file-level mutex key that serializes any two
+  // children whose globs overlap. Both are set only by the decomposer (plan.ts)
+  // and default to undefined so today's children render a byte-identical block.
+  depends_on?: string[];
+  touches?: string[];
 }
+
+// Caps on the array-valued keys so injected junk in an untrusted description
+// can't bloat the block or the per-tick dependency query (touches feeds a glob
+// comparison, depends_on feeds a Linear number:{in:[…]} filter).
+const MAX_ARRAY_ENTRIES = 32;
+const MAX_ENTRY_LENGTH = 200;
+// A Linear identifier: TEAM-123 (uppercase team key, digits). Anything that
+// doesn't match is dropped from depends_on — an injected or malformed id must
+// never become a phantom dependency that blocks a child forever.
+const IDENTIFIER = /^[A-Z][A-Z0-9]*-\d+$/;
 
 // Authoritative read is START-ANCHORED: only a factory block at the very start
 // of the description is honored. A block buried in prose, a quoted example, or
@@ -47,7 +65,9 @@ export function parseFactoryMeta(description: string): FactoryMeta {
   if (!block?.[1]) return {};
   const meta: FactoryMeta = {};
   for (const line of block[1].split("\n")) {
-    const kv = line.match(/^\s*([a-z]+)\s*:\s*(.+?)\s*$/i);
+    // [a-z_] (not [a-z]) so snake_case keys like "depends_on" parse — the
+    // scalar keys (repo/type/model/merge) are single-word and unaffected.
+    const kv = line.match(/^\s*([a-z_]+)\s*:\s*(.+?)\s*$/i);
     if (!kv) continue;
     const key = kv[1]!.toLowerCase();
     const value = kv[2]!.replace(/^["'`]|["'`]$/g, "").trim();
@@ -55,15 +75,28 @@ export function parseFactoryMeta(description: string): FactoryMeta {
     else if (key === "type" && (value === "epic" || value === "task")) meta.type = value;
     else if (key === "model" && value && isKnownModel(value)) meta.model = value;
     else if (key === "merge" && (value === "auto" || value === "shadow" || value === "review")) meta.merge = value;
+    else if (key === "depends_on") {
+      // Split, trim, drop empties, keep only well-formed identifiers, cap count.
+      const ids = value.split(",").map((s) => s.trim()).filter((s) => IDENTIFIER.test(s)).slice(0, MAX_ARRAY_ENTRIES);
+      if (ids.length > 0) meta.depends_on = ids;
+    } else if (key === "touches") {
+      // Split, trim, drop empties, cap count and per-entry length so an injected
+      // glob can't bloat the block or the overlap comparison.
+      const globs = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0 && s.length <= MAX_ENTRY_LENGTH).slice(0, MAX_ARRAY_ENTRIES);
+      if (globs.length > 0) meta.touches = globs;
+    }
   }
   return meta;
 }
 
-/** Render a metadata block to prepend to a ticket description. Omits empty keys. */
+/** Render a metadata block to prepend to a ticket description. Omits empty keys
+ * (scalar undefined/"" AND empty arrays) so a child with no DAG data renders a
+ * block byte-identical to today's — the backward-compat guarantee. Array values
+ * serialize as a comma-space list ("depends_on: FAC-1, FAC-2"). */
 export function renderFactoryMeta(meta: FactoryMeta): string {
   const lines = Object.entries(meta)
-    .filter(([, v]) => v !== undefined && v !== "")
-    .map(([k, v]) => `${k}: ${v}`);
+    .filter(([, v]) => (Array.isArray(v) ? v.length > 0 : v !== undefined && v !== ""))
+    .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
   if (lines.length === 0) return "";
   return `<!-- factory\n${lines.join("\n")}\n-->`;
 }

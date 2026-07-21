@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
-import { fetchQueue, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
+import { fetchQueue, fetchStatesByIdentifiers, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
 import { repoFromTicket } from "./repos.ts";
 import { planIssue } from "./plan.ts";
@@ -10,6 +10,7 @@ import { reconcileTick } from "./reconcile.ts";
 import { groundskeeperTick } from "./groundskeepers.ts";
 import { EPIC_LABEL } from "./linear.ts";
 import { parseFactoryMeta } from "./meta.ts";
+import { selectRunnable, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
@@ -42,7 +43,10 @@ function acquireLease(): void {
 }
 
 let draining = false;
-const inFlight = new Set<string>();
+// identifier → its declared `touches` globs (the file-mutex key). Was a Set;
+// now a Map so the scheduler can read in-flight children's touches to serialize
+// any candidate whose globs would overlap. .size/.has/.delete are unchanged.
+const inFlight = new Map<string, string[]>();
 
 async function tick(): Promise<boolean> {
   bus.emit({ type: "tick_started" });
@@ -84,12 +88,33 @@ async function tick(): Promise<boolean> {
   }
 
   // Rolling WIP semaphore (owner request): claim whenever capacity exists —
-  // never barrier a fast issue behind a slow sibling's completion.
+  // never barrier a fast issue behind a slow sibling's completion. Gap 1 layers
+  // DAG scheduling on top: a candidate is claimed only when its declared
+  // dependencies are all completed (topological frontier) and its `touches`
+  // globs don't collide with an in-flight or already-admitted sibling (file
+  // mutex). A child that declares neither behaves exactly as before.
   const capacity = config.caps.wipLimit - inFlight.size;
-  const batch = eligible.filter((i) => !inFlight.has(i.identifier)).slice(0, Math.max(0, capacity));
+  const candidates = eligible
+    .filter((i) => !inFlight.has(i.identifier))
+    .map((issue) => {
+      const meta = parseFactoryMeta(issue.description);
+      const schedulable: Schedulable = { identifier: issue.identifier, dependsOn: meta.depends_on ?? [], touches: meta.touches ?? [] };
+      return { issue, schedulable };
+    });
+  // One dependency-state query per tick, and only when some candidate declares
+  // deps — negligible rate-limit impact. It re-validates the frontier against
+  // LIVE Linear state each tick (the freshness pattern), so a dep merged/closed
+  // out-of-band immediately unblocks its dependents. A LinearRateLimited here
+  // propagates up to tick()'s existing backoff, like every other query.
+  const depIds = [...new Set(candidates.flatMap((c) => c.schedulable.dependsOn))];
+  const depTypes = depIds.length > 0 ? await fetchStatesByIdentifiers(depIds) : new Map<string, string>();
+  const busyTouches = [...inFlight.values()];
+  const { run } = selectRunnable(candidates.map((c) => c.schedulable), (id) => depTypes.get(id), busyTouches, capacity);
+  const runSet = new Set(run);
+  const batch = candidates.filter((c) => runSet.has(c.schedulable.identifier));
   if (batch.length > 0) console.log(`[tick] claiming ${batch.length} (in-flight ${inFlight.size}/${config.caps.wipLimit})`);
-  for (const issue of batch) {
-    inFlight.add(issue.identifier);
+  for (const { issue, schedulable } of batch) {
+    inFlight.set(issue.identifier, schedulable.touches);
     void processIssue(issue)
       .catch((error) => console.error(`[${issue.identifier}] unhandled: ${error instanceof Error ? error.message : error}`))
       .finally(() => inFlight.delete(issue.identifier));
