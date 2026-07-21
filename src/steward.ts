@@ -5,6 +5,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted } from "./agents.ts";
+import { withFactoryMeta } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 
@@ -88,7 +89,14 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         const lines = body.split("\n");
         const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
         const description = lines.slice(1).join("\n").trim();
-        if (title && description.length > 50) created.push(await linear.createSubIssue(epic, title, description));
+        // Stamp factory-authored follow-ups with a TRUSTED block at offset 0
+        // (and strip any block the model embedded after reading untrusted epic/
+        // child inputs) so an injected repo/type/model can never be honored —
+        // the same defense plan.ts gives decomposer children.
+        if (title && description.length > 50) {
+          const stamped = withFactoryMeta(description, { type: "task", ...(repo ? { repo } : {}) });
+          created.push(await linear.createSubIssue(epic, title, stamped));
+        }
       }
       await linear.postComment(epic, [
         linear.SENTINEL, "", "**Steward closeout**", "", summary.slice(0, 8000),

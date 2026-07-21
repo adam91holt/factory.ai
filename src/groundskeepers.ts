@@ -6,6 +6,7 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, resetWorkspaceToBase } from "./repos.ts";
 import { isEligible } from "./loop.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
+import { withFactoryMeta } from "./meta.ts";
 import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry } from "./db.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
@@ -565,7 +566,13 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
         }
         const title = titleR.clean.slice(0, 250);
         const description = descR.clean.slice(0, 10_000);
-        if (title && description.length > 50) created.push(await linear.createIssue(card.team, title, description));
+        // Stamp with a TRUSTED block at offset 0 (and strip any block the model
+        // embedded from untrusted repo/web content) so an injected repo/type/
+        // model in the drafted body can never be honored downstream.
+        if (title && description.length > 50) {
+          const stamped = withFactoryMeta(description, { type: "task", ...(repo ? { repo } : {}) });
+          created.push(await linear.createIssue(card.team, title, stamped));
+        }
       }
     }
     const reason = config.dryRun
