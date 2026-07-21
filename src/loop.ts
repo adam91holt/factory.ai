@@ -6,6 +6,7 @@ import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPat
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { renderPrompt } from "./catalog.ts";
+import { buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
@@ -128,6 +129,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
   const stages: StageResult[] = [];
   const budget = new Budget(stages, Date.now() + config.caps.wallMinutesPerIssue * 60_000);
   const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
+  // Feed-forward lessons: bounded, newest-first heuristics for this repo,
+  // prepended AROUND renderPrompt (option a — cards untouched, identical with
+  // card fallbacks). Hard caps live in lessons.ts as constants (≤5 lessons /
+  // ≤1000 chars, no env override); zero lessons ⇒ "" ⇒ prompts built exactly
+  // as today, and a closed db degrades the same way (lessonsForRepo → []).
+  const lessonsBlock = buildLessonsBlock(lessonsForRepo(repo));
   const reviewerScratch = join(config.workRoot, ".reviewer-scratch");
   mkdirSync(reviewerScratch, { recursive: true });
 
@@ -147,7 +154,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- implementer
     const implementer = await runStage("implementer",
-      renderPrompt("implementer", { repo, spec },
+      lessonsBlock + renderPrompt("implementer", { repo, spec },
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`),
       { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
@@ -168,14 +175,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const clampedDiff = diff.slice(0, 180_000);
     const repoLens = "blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess";
     const [reviewClaude, reviewCodexTry] = await Promise.all([
-      runStage("reviewer-claude", renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
+      runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
         { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
-      runStage("reviewer-repo", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
+      runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
         { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
-      reviewCodex = await runStage("reviewer-fallback", renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
+      reviewCodex = await runStage("reviewer-fallback", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
         { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
@@ -186,7 +193,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
     const fixer = await runStage("fixer",
-      renderPrompt("fixer", { spec, reviews: untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`) },
+      lessonsBlock + renderPrompt("fixer", { spec, reviews: untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`) },
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`),
       { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);

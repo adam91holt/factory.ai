@@ -60,6 +60,14 @@ export function eventStoreOpen(): boolean {
   return db !== null;
 }
 
+/** Raw handle for sibling stores over the SAME file (lessons.ts). The
+ *  single-connection rule stands: nothing else may open its own handle to
+ *  factory.db — read through this or not at all. Null when the store is
+ *  closed; callers must degrade gracefully (lessons: return none). */
+export function eventDbHandle(): Database | null {
+  return db;
+}
+
 /** Sum of run_stage_finished costUsd for one issueKey (e.g. "GK-kiwi-quest")
  *  since `sinceMs`. Backs a groundskeeper's weekly budget envelope. */
 export function stageSpendForIssueSince(issueKey: string, sinceMs: number): number {
