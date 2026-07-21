@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
+import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta } from "./meta.ts";
@@ -159,7 +159,10 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     stages.push(implementer);
     await postStageComment(issue, implementer);
     if (implementer.error) { await park(issue, stages, `implementer: ${implementer.error}`); return; }
-    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`)) { await park(issue, stages, "implementer produced no committable changes"); return; }
+    // Resume-safe: a prior attempt may have committed the work before failing a
+    // later step (e.g. transient diff). Only park if there is genuinely nothing
+    // — neither a fresh commit this run nor prior commits ahead of base.
+    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`) && !hasCommitsAheadOfBase(ws)) { await park(issue, stages, "implementer produced no committable changes"); return; }
     if (budget.expired) { await park(issue, stages, budget.expiredReason); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "implementation"); return; }
 

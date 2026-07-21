@@ -103,6 +103,15 @@ export function resetWorkspaceToBase(ws: Workspace): void {
   git(ws.dir, ["clean", "-fd"]); // stale untracked files from prior runs; best-effort
 }
 
+/** True if the branch already has commits ahead of its base — e.g. a resumed
+ * run whose prior attempt committed work before failing a later step. Lets the
+ * pipeline proceed to review/PR instead of parking "no committable changes"
+ * when the work exists from before. */
+export function hasCommitsAheadOfBase(ws: Workspace): boolean {
+  const r = gitRetry(ws.dir, ["rev-list", "--count", `${ws.baseRef}..HEAD`]);
+  return r.ok && parseInt(r.stdout.trim() || "0", 10) > 0;
+}
+
 export function commitAll(ws: Workspace, message: string): boolean {
   git(ws.dir, ["add", "-A"]);
   // --no-verify: repo-committed hooks are repo-controlled code execution in the
