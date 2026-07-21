@@ -16,6 +16,9 @@ const OUTCOMES: RunOutcome[] = [
   "needs_human",
   "aborted",
   "stale",
+  "bootstrapped",
+  "authored",
+  "awaiting_answer",
 ];
 
 describe("OutcomeBadge MAP — every RunOutcome is renderable", () => {

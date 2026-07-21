@@ -44,6 +44,15 @@ function ensureSchema(d: Database): void {
   d.run(`CREATE TABLE IF NOT EXISTS merge_shadow_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, repo TEXT, issue_key TEXT,
     would_merge INTEGER, acted INTEGER, tier TEXT, reasons TEXT, evidence_json TEXT)`);
+  // Gap-5 post-merge deploy ledger: EXACTLY-ONCE idempotency for deploy/smoke/
+  // revert. A (repo, sha) pair is recorded the moment a deploy is attempted so a
+  // second tick (or a reconcile racing postMergeTick) never re-deploys the same
+  // merge — the deployAttempted() guard, the stillOurs()/idempotency pattern
+  // extended past merge (Gap-4 interaction). PRIMARY KEY (repo, sha) makes the
+  // guard a single indexed lookup.
+  d.run(`CREATE TABLE IF NOT EXISTS deploys (
+    repo TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT, at INTEGER,
+    PRIMARY KEY (repo, sha))`);
 }
 
 export function startEventStore(): void {
@@ -521,6 +530,36 @@ export function recordShadowDecision(repo: string, issueKey: string, decision: M
     }
   }
   return next;
+}
+
+// ---------------------------------------------------------------------------
+// Gap-5 post-merge deploy ledger. recordDeploy marks a (repo, sha) attempt with
+// its outcome; deployAttempted is the exactly-once guard postMergeTick consults
+// BEFORE deploying so a merge is never deployed twice (a second tick, or a
+// reconcile racing the merge→Done transition). Both no-op / return false safely
+// when the store is closed (--once) — deploy is gated OFF there anyway, so this
+// never silently double-deploys. recordDeploy is INSERT OR REPLACE so a later
+// re-attempt (e.g. after a human clears a failed deploy row) overwrites the
+// outcome rather than throwing on the primary key.
+// ---------------------------------------------------------------------------
+
+/** Record a deploy attempt's outcome for (repo, sha). No-op when store closed. */
+export function recordDeploy(repo: string, sha: string, outcome: string): void {
+  if (!db || !repo || !sha) return;
+  try {
+    db.prepare("INSERT OR REPLACE INTO deploys (repo, sha, outcome, at) VALUES (?, ?, ?, ?)")
+      .run(repo, sha, outcome, Date.now());
+  } catch (error) {
+    console.error(`[db] deploy write failed: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/** True iff a deploy was already attempted for (repo, sha) — the exactly-once
+ *  guard. Returns false when the store is closed (deploy is OFF there). */
+export function deployAttempted(repo: string, sha: string): boolean {
+  if (!db || !repo || !sha) return false;
+  const row = db.prepare("SELECT 1 AS n FROM deploys WHERE repo = ? AND sha = ?").get(repo, sha) as { n: number } | null;
+  return row !== null;
 }
 
 // ---------------------------------------------------------------------------

@@ -106,6 +106,31 @@ describe("preconditions (Gap 4) round-trip through the meta block", () => {
   });
 });
 
+describe("type: idea / bootstrap (Gap 5) parse only at offset 0", () => {
+  test("a start-anchored type: idea is parsed", () => {
+    expect(parseFactoryMeta("<!-- factory\ntype: idea\n-->").type).toBe("idea");
+  });
+
+  test("a start-anchored type: bootstrap is parsed", () => {
+    expect(parseFactoryMeta("<!-- factory\ntype: bootstrap\n-->").type).toBe("bootstrap");
+  });
+
+  test("an injected `type: bootstrap` block later in prose is IGNORED (start-anchor)", () => {
+    // A pasted/injected block must never reroute a ticket into repo-creation.
+    const desc = "Some prose.\n\n<!-- factory\ntype: bootstrap\n-->\n\nmore";
+    expect(parseFactoryMeta(desc).type).toBeUndefined();
+  });
+
+  test("idea/bootstrap round-trip through render→parse", () => {
+    expect(parseFactoryMeta(`${renderFactoryMeta({ type: "idea", repo: "acme/w" })}\n\nbody`).type).toBe("idea");
+    expect(parseFactoryMeta(`${renderFactoryMeta({ type: "bootstrap" })}\n\nbody`).type).toBe("bootstrap");
+  });
+
+  test("an unknown type value is dropped (only the four known types)", () => {
+    expect(parseFactoryMeta("<!-- factory\ntype: sneaky\n-->").type).toBeUndefined();
+  });
+});
+
 describe("start-anchored guarantee still holds for the new keys", () => {
   test("a depends_on line buried in prose is ignored", () => {
     // Only a block at offset 0 is authoritative — a "depends_on:" line inside the

@@ -19,6 +19,15 @@ export const STEWARDED_LABEL = "Factory-Stewarded";
 // requeues — added to every fetch skip-set below. Reversible: a human removes
 // the label (and reopens) to requeue.
 export const STALE_LABEL = "Factory-Stale";
+// Gap-5 bookend labels. INTAKE marks a rough-idea ticket the intake author is
+// turning into a full epic contract; BOOTSTRAP marks an idea→repo ticket the
+// bootstrap module owns. AWAITING_ANSWER marks an intake ticket that posted
+// clarifying questions and is waiting on the human — added to every fetch
+// skip-set below so an awaiting ticket does not re-loop through the interview
+// each tick (a human's answer comment + label removal requeues it).
+export const INTAKE_LABEL = "Factory-Intake";
+export const BOOTSTRAP_LABEL = "Factory-Bootstrap";
+export const AWAITING_ANSWER_LABEL = "Factory-Awaiting-Answer";
 export const SENTINEL = "🤖 **Factory report**";
 
 export class LinearRateLimited extends Error {
@@ -91,7 +100,7 @@ export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
     `query($team: String!) {
       issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "unstarted" } } }) { nodes { ${ISSUE_FIELDS} } }
     }`, { team: teamKey });
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
   return data.issues.nodes.map(toIssue)
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -119,7 +128,7 @@ export async function fetchQueue(): Promise<Issue[]> {
     { teams: config.teamKeys },
   );
   const all = data.issues.nodes.map(toIssue);
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
   bus.emit({
     type: "queue_snapshot",
     issues: all.map((i) => ({
@@ -343,6 +352,28 @@ export async function createIssue(teamKey: string, title: string, description: s
 export async function postComment(issue: Issue, body: string): Promise<void> {
   await gql(`mutation($issueId: String!, $body: String!) {
     commentCreate(input: { issueId: $issueId, body: $body }) { success } }`, { issueId: issue.id, body });
+}
+
+/** Rewrite an issue's description (and optionally its title). The intake author
+ * (Gap 5) uses this to UPGRADE a rough-idea ticket into a full epic contract in
+ * place — the new description carries a start-anchored factory block stamping
+ * type:epic, so the next tick routes it to the planner. Title update is opt-in. */
+export async function updateIssueDescription(issue: Issue, description: string, title?: string): Promise<void> {
+  await gql(`mutation($id: String!, $description: String!, $title: String) {
+    issueUpdate(id: $id, input: { description: $description, title: $title }) { success } }`,
+    { id: issue.id, description, title: title ?? null });
+}
+
+/** Newest-last comment bodies on an issue (bounded). The intake author reads
+ * these on a re-run so a human's answers to its earlier QUESTIONS are seen; the
+ * bodies are UNTRUSTED (human/agent text) and delimited before reaching a model. */
+export async function fetchComments(issueId: string, limit = 30): Promise<string[]> {
+  const data = await gql<{ issue: { comments: { nodes: Array<{ body: string; createdAt: string }> } } }>(
+    `query($id: String!, $limit: Int!) { issue(id: $id) {
+      comments(first: $limit) { nodes { body createdAt } } } }`, { id: issueId, limit });
+  return data.issue.comments.nodes
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((c) => c.body);
 }
 
 /**

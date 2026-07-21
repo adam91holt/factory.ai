@@ -43,7 +43,12 @@ export interface GateMeta {
   outputTail: string;         // last ≤400 chars of failure output, redacted; "" on pass
 }
 
-export type RunOutcome = "pr_open" | "planned" | "parked" | "needs_human" | "aborted" | "stale";
+// Gap-5 bookend outcomes: "authored" = intake turned a rough idea into a full
+// epic contract and requeued it; "awaiting_answer" = intake posted clarifying
+// questions and is waiting on the human; "bootstrapped" = a new project repo was
+// created + green-gate-scaffolded + registered.
+export type RunOutcome = "pr_open" | "planned" | "parked" | "needs_human" | "aborted" | "stale"
+  | "bootstrapped" | "authored" | "awaiting_answer";
 // Gap-2: "strong" = a repo whose real app was driven (a passing e2e gate or
 // external browser evidence on top of unit tests) — the tier auto-merge requires.
 export type GateStrength = "none" | "weak" | "real" | "strong";
@@ -93,7 +98,13 @@ export type FactoryEventBody =
   // ---- Gap-2 evidence-gated merge ladder (shadow → auto-low-risk → auto) ----
   | { type: "merge_decision"; issueKey: string; repo: string; tier: MergeTier;
       wouldMerge: boolean; acted: boolean; strength: string; browser: BrowserEvidence;
-      security: "pass" | "fail" | null; cleanStreak: number; reasons: string[] };
+      security: "pass" | "fail" | null; cleanStreak: number; reasons: string[] }
+  // ---- Gap-5 post-merge deploy/smoke/revert (postmerge.ts) ----
+  | { type: "deploy_started"; repo: string; sha: string; issueKey?: string }
+  | { type: "deploy_finished"; repo: string; sha: string; ok: boolean;
+      stage: "skipped" | "deploy" | "smoke"; reverted: boolean; detail: string }
+  // ---- Gap-5 project bootstrap (bootstrap.ts) ----
+  | { type: "bootstrap_finished"; issueKey: string; repo: string | null; ok: boolean; reason: string };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

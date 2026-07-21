@@ -12,6 +12,9 @@ export const MAP: Record<Status, { label: string; variant: BadgeVariant }> = {
   needs_human: { label: "NEEDS HUMAN", variant: "human" },
   aborted: { label: "ABORTED", variant: "err" },
   stale: { label: "STALE", variant: "parked" },
+  bootstrapped: { label: "BOOTSTRAPPED", variant: "ok" },
+  authored: { label: "AUTHORED", variant: "ok" },
+  awaiting_answer: { label: "AWAITING ANSWER", variant: "human" },
 };
 
 export function OutcomeBadge({ status, className }: { status: Status; className?: string }) {

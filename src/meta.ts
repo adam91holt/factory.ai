@@ -11,7 +11,11 @@ import { parsePrecondition } from "./precondition.ts";
 
 export interface FactoryMeta {
   repo?: string;                       // org/name — machine-exact, no regex
-  type?: "epic" | "task";              // routing: planner vs pipeline
+  // routing. epic → planner; task → pipeline; idea → intake authoring (Gap 5);
+  // bootstrap → project bootstrap (Gap 5). idea/bootstrap parse ONLY at offset 0
+  // like every other key (start-anchor) so injected prose can never reroute a
+  // ticket into repo-creation or the intake interview.
+  type?: "epic" | "task" | "idea" | "bootstrap";
   model?: string;                      // per-ticket implementer/fixer model override
   // per-ticket merge policy. UNREAD today (auto-merge is gated solely on
   // config.autoMergeRepos). If ever wired in, a description-sourced value may
@@ -82,7 +86,7 @@ export function parseFactoryMeta(description: string): FactoryMeta {
     const key = kv[1]!.toLowerCase();
     const value = kv[2]!.replace(/^["'`]|["'`]$/g, "").trim();
     if (key === "repo" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) meta.repo = value;
-    else if (key === "type" && (value === "epic" || value === "task")) meta.type = value;
+    else if (key === "type" && (value === "epic" || value === "task" || value === "idea" || value === "bootstrap")) meta.type = value;
     else if (key === "model" && value && isKnownModel(value)) meta.model = value;
     else if (key === "merge" && (value === "auto" || value === "shadow" || value === "review")) meta.merge = value;
     else if (key === "depends_on") {

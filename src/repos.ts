@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import { parseFactoryMeta } from "./meta.ts";
@@ -147,8 +147,13 @@ export const DIFF_FAILED = "<diff-failed>";
 
 // groundskeepers/ and agents/ are the factory's own spend governors and role
 // definitions — a PR that flips `enabled:` or raises `budget:` must never
-// auto-merge without a human (machine self-arming).
-const GUARDED_PATH_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
+// auto-merge without a human (machine self-arming). projects/ is the same class
+// of self-mod: a project registry card (Gap 5) is factory-controlled routing
+// config that decides which repos the factory may build/deploy into AND carries
+// TRUSTED deploy/smoke shell commands — a PR that adds or edits one must be
+// human-reviewed, so bootstrap REGISTERS via a human-gated PR, never a direct
+// commit.
+const GUARDED_PATH_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /(^|\/)projects\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
 
 /** Pure guarded-path classifier: the subset of `files` that any guard regex
  * matches. Extracted from guardedPathsTouched so the policy is unit-testable
@@ -225,4 +230,96 @@ export function createPr(ws: Workspace, title: string, body: string): string {
   // URL is on stdout; stderr carries progress/notices (C14).
   const url = (r.stdout ?? "").split("\n").map((line) => line.trim()).filter((line) => /^https?:\/\//.test(line)).pop();
   return url ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// Gap-5 bookends: project bootstrap (idea→repo) and post-merge revert.
+// ---------------------------------------------------------------------------
+
+/** Build the `gh repo create` argv. PRIVATE-BY-DEFAULT is enforced HERE, in code
+ * guarded by a type + a test — NOT by prompt discipline: a regression that
+ * leaked source is a categorical safety failure (safety envelope (a)). The type
+ * makes `{ private: false }` unrepresentable at call sites, and this function
+ * throws if it is ever passed at runtime (defence in depth). The argv NEVER
+ * contains "--public" — there is no code path that emits it. */
+export function ghRepoCreateArgs(fullName: string, opts: { private: true }): string[] {
+  if (opts.private !== true) {
+    throw new Error(`ghRepoCreate refuses a non-private repo (${fullName}) — private-by-default is non-negotiable (safety envelope a)`);
+  }
+  // --private explicit; no --source so gh creates an EMPTY remote (bootstrap
+  // seeds and pushes the first commit itself).
+  return ["repo", "create", fullName, "--private"];
+}
+
+/** Create a PRIVATE GitHub repo via `gh repo create`. Throws (never spawns) when
+ * asked for anything but private. Returns the created repo URL on success. */
+export function ghRepoCreate(fullName: string, opts: { private: true }): { ok: boolean; url: string; out: string } {
+  const args = ghRepoCreateArgs(fullName, opts); // throws on non-private before any spawn
+  const r = spawnSync("gh", args, { encoding: "utf8", timeout: 60_000 });
+  const out = ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 400);
+  const url = (r.stdout ?? "").split(/\s+/).map((t) => t.trim()).filter((t) => /^https?:\/\/github\.com\//.test(t)).pop()
+    ?? `https://github.com/${fullName}`;
+  return { ok: r.status === 0, url, out };
+}
+
+/** Clone a freshly-created (empty) repo and prepare a worktree on the default
+ * branch so the scaffolder can seed it. An empty repo has no commits yet, so we
+ * clone into the work root and ensure a `main` branch exists to commit onto. The
+ * returned Workspace pushes with `HEAD:main` like any other. Never touches
+ * ~/RapidoCoding — everything under FACTORY_WORK_ROOT. */
+export function initScaffoldRepo(repo: string): Workspace {
+  const url = `https://github.com/${repo}.git`;
+  const dir = join(config.workRoot, `bootstrap-${repo.replace("/", "__")}`);
+  mkdirSync(config.workRoot, { recursive: true });
+  // Fresh each bootstrap attempt — a stale half-scaffold must not leak in. This
+  // is a factory-owned path under FACTORY_WORK_ROOT (same as the plan/gk scratch
+  // dirs), never a checkout of a live repo.
+  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+  const clone = git(config.workRoot, ["clone", url, dir], SLOW);
+  if (!clone.ok) throw new Error(`clone of empty repo ${repo} failed: ${clone.out.slice(0, 300)}`);
+  // A brand-new gh repo is empty → unborn branch. Ensure we are on `main`.
+  git(dir, ["checkout", "-B", "main"]);
+  return { repo, dir, branch: "main", baseRef: "refs/remotes/origin/main" };
+}
+
+/** Auto-revert a merge commit on an auto-repo: `git revert -m 1 <sha>` (first-
+ * parent, i.e. undo the merged change while keeping main's history) then push.
+ * ok:false on a conflicting revert (a human built on top of the merge) — the
+ * caller escalates to a revert PR + Needs-Human rather than force-reverting
+ * (operational note: an auto-revert that conflicts must not clobber human work). */
+export function revertMerge(repo: string, dir: string, mergeSha: string): { ok: boolean; out: string } {
+  const rev = git(dir, ["revert", "-m", "1", "--no-edit", mergeSha]);
+  if (!rev.ok) {
+    git(dir, ["revert", "--abort"]); // leave the worktree clean for the PR fallback
+    return { ok: false, out: rev.out.slice(0, 400) };
+  }
+  const push = git(dir, ["push", "origin", "HEAD:main"], SLOW);
+  return { ok: push.ok, out: (rev.out + push.out).slice(0, 400) };
+}
+
+/** Open a revert PR for a review-repo (or an auto-repo whose direct revert
+ * conflicted): branch, revert, push, `gh pr create`. Returns the PR URL. The
+ * revert runs on a NEW branch so main is never force-touched. */
+export function createRevertPr(ws: Workspace, mergeSha: string, why: string): string {
+  const branch = `factory/revert-${mergeSha.slice(0, 12)}`;
+  git(ws.dir, ["checkout", "-B", branch]);
+  const rev = git(ws.dir, ["revert", "-m", "1", "--no-edit", mergeSha]);
+  if (!rev.ok) { git(ws.dir, ["revert", "--abort"]); throw new Error(`revert of ${mergeSha} failed on branch ${branch}: ${rev.out.slice(0, 200)}`); }
+  const push = git(ws.dir, ["push", "origin", `HEAD:${branch}`], SLOW);
+  if (!push.ok) throw new Error(`push of revert branch failed: ${push.out.slice(0, 200)}`);
+  const body = redactRevertWhy(why);
+  const r = spawnSync("gh", ["pr", "create", "--repo", ws.repo, "--head", branch, "--title", `Revert ${mergeSha.slice(0, 12)} — smoke failed`, "--body", body],
+    { cwd: ws.dir, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) {
+    const existing = spawnSync("gh", ["pr", "view", branch, "--repo", ws.repo, "--json", "url", "-q", ".url"], { encoding: "utf8", timeout: 30_000 });
+    if (existing.status === 0 && existing.stdout.trim()) return existing.stdout.trim();
+    throw new Error(`gh pr create (revert) failed: ${((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300)}`);
+  }
+  return (r.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => /^https?:\/\//.test(l)).pop() ?? "";
+}
+
+/** why-text for a revert PR body is model/gate output — cap it (secret scrub
+ * lives at every OTHER outbound seam; a revert body carries only smoke output). */
+function redactRevertWhy(why: string): string {
+  return `Automated revert: the post-merge smoke check failed.\n\n${why.slice(0, 1500)}\n\n🤖 Post-merge auto-revert (factory Gap 5). A human reviews before this lands.`;
 }

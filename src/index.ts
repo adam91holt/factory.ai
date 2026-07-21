@@ -8,7 +8,10 @@ import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
 import { reconcileTick } from "./reconcile.ts";
 import { groundskeeperTick } from "./groundskeepers.ts";
-import { EPIC_LABEL } from "./linear.ts";
+import { postMergeTick } from "./postmerge.ts";
+import { runIntake } from "./intake.ts";
+import { bootstrapProject } from "./bootstrap.ts";
+import { EPIC_LABEL, INTAKE_LABEL, BOOTSTRAP_LABEL } from "./linear.ts";
 import { parseFactoryMeta } from "./meta.ts";
 import { selectRunnable, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
@@ -56,6 +59,7 @@ async function tick(): Promise<boolean> {
     await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
     await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
     await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
+    await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
     return false;
   }
 
@@ -64,14 +68,35 @@ async function tick(): Promise<boolean> {
   // Factory-Epic tickets route to the PLAN stage (one per tick bounds spend);
   // their children arrive as ordinary tickets on later ticks (plan v1.1).
   const isEpic = (i: { labels: string[]; description: string }) => i.labels.includes(EPIC_LABEL) || parseFactoryMeta(i.description).type === "epic";
-  const epic = queue.find(isEpic);
+  // Gap-5 bookends: an idea ticket routes to intake authoring (rough idea → full
+  // epic contract, interviewing only on genuine ambiguity); a bootstrap ticket
+  // routes to project bootstrap (idea → private repo → green scaffold). Both run
+  // BEFORE the epic branch and are excluded from the eligible pipeline loop —
+  // they upgrade/scaffold in place rather than flowing through implement→PR.
+  const isIdea = (i: { labels: string[]; description: string }) => i.labels.includes(INTAKE_LABEL) || parseFactoryMeta(i.description).type === "idea";
+  const isBootstrap = (i: { labels: string[]; description: string }) => i.labels.includes(BOOTSTRAP_LABEL) || parseFactoryMeta(i.description).type === "bootstrap";
+  const special = (i: { labels: string[]; description: string }) => isEpic(i) || isIdea(i) || isBootstrap(i);
+
+  // One heavy bookend op of each kind per tick (bounds spend, like the epic).
+  // Bootstrap takes precedence over idea/epic when a ticket is somehow both.
+  const bootstrap = queue.find((i) => isBootstrap(i) && !isEpic(i));
+  if (bootstrap) await bootstrapProject(bootstrap).catch((error) => {
+    console.error(`[${bootstrap.identifier}] bootstrap unhandled: ${error instanceof Error ? error.message : error}`);
+  });
+  const idea = queue.find((i) => isIdea(i) && !isBootstrap(i) && !isEpic(i));
+  if (idea) await runIntake(idea).catch((error) => {
+    console.error(`[${idea.identifier}] intake unhandled: ${error instanceof Error ? error.message : error}`);
+  });
+
+  const isEpicOnly = (i: { labels: string[]; description: string }) => isEpic(i) && !isIdea(i) && !isBootstrap(i);
+  const epic = queue.find(isEpicOnly);
   if (epic) await planIssue(epic).catch((error) => {
     console.error(`[${epic.identifier}] planner unhandled: ${error instanceof Error ? error.message : error}`);
   });
 
   const eligible = [];
   for (const issue of queue) {
-    if (isEpic(issue)) continue;
+    if (special(issue)) continue;
     if (isEligible(issue)) eligible.push(issue);
     // Repo may still be parseable even when the ticket fails other contract
     // checks — thread it through so the distilled lesson stays repo-scoped.
@@ -84,6 +109,7 @@ async function tick(): Promise<boolean> {
     await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
     await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
     await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
+    await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
     return false;
   }
 

@@ -78,6 +78,24 @@ export const config = {
   // the var is unset/empty so a fresh checkout never generates work unattended.
   groundskeepersEnabled: ["1", "true", "yes", "on"].includes((process.env.GROUNDSKEEPERS_ENABLED ?? "").trim().toLowerCase()),
 
+  // Gap-5 post-merge deploy/smoke/revert GLOBAL kill-switch. Deploy is a NEW
+  // spend + blast-radius surface (it runs a project's real deploy command and
+  // can auto-revert main), so it ships OFF exactly like groundskeepersEnabled:
+  // unset/empty/0 = disabled. Both this AND a project card's own
+  // `deployEnabled: true` must hold — the groundskeeper double-gate applied to
+  // deploys. Leave at 0 unless you intend unattended deploys.
+  deployEnabled: ["1", "true", "yes", "on"].includes((process.env.DEPLOY_ENABLED ?? "").trim().toLowerCase()),
+  // Default GitHub org/owner for `gh repo create` during project bootstrap
+  // (Gap 5). A bootstrap ticket may name org/slug explicitly; this is the
+  // fallback owner. Empty means the ticket MUST name a fully-qualified org.
+  bootstrapOrg: (process.env.FACTORY_BOOTSTRAP_ORG ?? "").trim(),
+  // Optional override for where project registry cards (projects/<name>.md)
+  // live — the human-gated routing config that says which repos the factory may
+  // build/deploy into. Empty (the default) → registry.ts uses its module-
+  // relative projects/ dir, exactly like groundskeepers/. Only set to relocate
+  // the cards off the repo tree.
+  projectsDir: (process.env.FACTORY_PROJECTS_DIR ?? "").trim() ? expandHome(process.env.FACTORY_PROJECTS_DIR!) : "",
+
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
   // The factory's OWN repo slug — NEVER auto-merged regardless of enrollment or
   // ceiling (isSelfRepo in merge-ladder.ts also matches any `.../factory`).
