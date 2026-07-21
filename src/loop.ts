@@ -59,11 +59,22 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
 }
 
 /** Terminal "needs human" — labeled so it can never loop or spam (C6).
+ *  The reason comment is best-effort but the LABEL is guaranteed: a Linear
+ *  comment failure must never leave the ticket unlabeled (it would requeue and
+ *  loop), and a labeled ticket without its reason comment is the FAC-14 failure
+ *  mode — so the comment is retried once in minimal form before giving up.
  *  `repo` (when the caller knows it) scopes the distilled lesson; contract
  *  failures before repo parsing pass nothing and the lesson stays repo-less. */
 export async function markNeedsHuman(issue: linear.Issue, reason: string, repo?: string): Promise<void> {
   bus.emit({ type: "issue_needs_human", issueKey: issue.identifier, reason: redactSecrets(reason).clean.slice(0, 500) });
-  await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason}\n\nRemove the \`${linear.NEEDS_HUMAN_LABEL}\` label after fixing to requeue.`);
+  try {
+    await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason}\n\nRemove the \`${linear.NEEDS_HUMAN_LABEL}\` label after fixing to requeue.`);
+  } catch (e) {
+    console.error(`[${issue.identifier}] needs-human comment failed: ${e}`);
+    // Redact the FULL reason before truncating — slicing first can cut a
+    // secret in half so post()'s exact-value scrub no longer matches it.
+    await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
+  }
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch((e) => console.error(`[${issue.identifier}] label failed: ${e}`));
   }
@@ -360,8 +371,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         ...(tasteFindings ? { tasteFindings } : {}) });
     }
 
-    // Comment is best-effort; transition/release are guaranteed (C10).
-    try { await post(issue, report); } catch (e) { console.error(`[${issue.identifier}] report post failed: ${e}`); }
+    // Comment is best-effort; transition/release are guaranteed (C10). On a
+    // needs_human hold, a failed report still gets a minimal reason-only
+    // fallback comment — the label must never appear without its WHY (FAC-14).
+    try { await post(issue, report); } catch (e) {
+      console.error(`[${issue.identifier}] report post failed: ${e}`);
+      // Redact the FULL reason before truncating (see markNeedsHuman above).
+      if (needsHuman) await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${redactSecrets(holdReason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
+    }
     if (!config.dryRun) {
       if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
@@ -401,7 +418,14 @@ async function park(issue: linear.Issue, repo: string, stages: StageResult[], re
     reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,
     costUsd: stages.reduce((s, x) => s + x.costUsd, 0), stages: stages.map(toStageMeta),
     gateStrength: "none", guardedPaths: [], dryRun: config.dryRun });
-  try { await post(issue, buildReport(input)); } catch (e) { console.error(`[${issue.identifier}] park report failed: ${e}`); }
+  // The full report carries the park reason onto the ticket. If it fails to
+  // post, fall back to a minimal reason-only comment — a Factory-Parked label
+  // with no visible WHY is the FAC-14 failure mode (reason stranded in SQLite).
+  try { await post(issue, buildReport(input)); } catch (e) {
+    console.error(`[${issue.identifier}] park report failed: ${e}`);
+    // Redact the FULL reason before truncating (see markNeedsHuman above).
+    await post(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal park comment failed too: ${e2}`));
+  }
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.PARKED_LABEL).catch((e) => console.error(`[${issue.identifier}] park label failed: ${e}`));
     await linear.transition(issue, "queue").catch(() => {});

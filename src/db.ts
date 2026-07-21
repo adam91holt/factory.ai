@@ -10,6 +10,7 @@ import { bus, type FactoryEvent } from "./events.ts";
 let db: Database | null = null;
 
 export function startEventStore(): void {
+  if (db) return; // idempotent — main() and startDashboard() may both call this
   db = new Database(join(config.workRoot, "factory.db"));
   // The daemon and a --server-only dashboard may share this file. Without WAL +
   // busy_timeout a long telemetry read holds the lock, the writer's INSERT
@@ -117,6 +118,28 @@ export function parkedRunsSince(sinceMs: number): number {
     } catch { /* skip one bad row */ }
   }
   return n;
+}
+
+/** Most recent recorded park / needs-human reason for one issue key, or null
+ *  when none was ever recorded (legacy rows, closed store). Reads newest-first
+ *  over the issue's own rows (idx_events_issue): run_finished rows with a
+ *  parked/needs_human outcome and issue_needs_human marks both carry the
+ *  reason. Backs the steward's child-status closeout input — a steward must
+ *  never see "parked" with the WHY stranded in SQLite (FAC-14 lesson). */
+export function lastParkReasonForIssue(issueKey: string): string | null {
+  if (!db) return null;
+  const rows = db.prepare(
+    "SELECT type, json FROM events WHERE issue_key = ? AND type IN ('run_finished', 'issue_needs_human') ORDER BY id DESC LIMIT 50",
+  ).all(issueKey) as Array<{ type: string; json: string }>;
+  for (const r of rows) {
+    try {
+      const e = JSON.parse(r.json) as { outcome?: string; reason?: unknown };
+      const reason = typeof e.reason === "string" && e.reason.trim() ? e.reason.trim() : null;
+      if (r.type === "issue_needs_human" && reason) return reason;
+      if (r.type === "run_finished" && (e.outcome === "parked" || e.outcome === "needs_human") && reason) return reason;
+    } catch { /* skip one bad row */ }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

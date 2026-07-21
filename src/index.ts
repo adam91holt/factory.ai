@@ -13,6 +13,7 @@ import { parseFactoryMeta } from "./meta.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
+import { startEventStore } from "./db.ts";
 
 // Watch loop. Serial ticks, WIP-limited, single-instance host lease. Hardened
 // per code-review verdict 2026-07-20: lease guard handles empty/garbage files
@@ -119,6 +120,11 @@ async function main(): Promise<void> {
   }
 
   acquireLease();
+  // Durable event store must be open regardless of dashboard enablement —
+  // --once/--dry-run/DASHBOARD_PORT=0 all resolve the dashboard port to null,
+  // but steward closeout (childStatusBlock → lastParkReasonForIssue) and
+  // groundskeeper governance both read from this store on every tick.
+  startEventStore();
   // Self-heal orphaned claims from a prior process (restart mid-run) before we
   // start ticking, so in-flight tickets resume instead of stranding In-Progress.
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);
