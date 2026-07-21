@@ -9,7 +9,14 @@ import { bus, type FactoryEvent } from "./events.ts";
 
 let db: Database | null = null;
 
+/** Idempotent: the daemon (index.ts, independent of DASHBOARD_PORT) and a
+ *  --server-only dashboard may both call this — only the first call opens the
+ *  handle and subscribes; later calls are no-ops so events are never
+ *  double-inserted. FAC-16: lessons.ts reads through eventDbHandle(), so the
+ *  store must be open in plain `factory:once`/`factory:dry` runs too, not only
+ *  when a dashboard happens to be enabled. */
 export function startEventStore(): void {
+  if (db) return;
   db = new Database(join(config.workRoot, "factory.db"));
   // The daemon and a --server-only dashboard may share this file. Without WAL +
   // busy_timeout a long telemetry read holds the lock, the writer's INSERT

@@ -11,6 +11,7 @@ import { EPIC_LABEL } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
+import { startEventStore } from "./db.ts";
 
 // Watch loop. Serial ticks, WIP-limited, single-instance host lease. Hardened
 // per code-review verdict 2026-07-20: lease guard handles empty/garbage files
@@ -96,6 +97,14 @@ async function tick(): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
+  // Durable event store must be independent of the dashboard (DASHBOARD_PORT):
+  // lessons.ts (FAC-16) reads through eventDbHandle() to feed-forward past
+  // heuristics into implementer/reviewer/fixer prompts, and groundskeeper
+  // governance gates on eventStoreOpen() — both must work in plain
+  // `factory:once`/`factory:dry`/watch runs, not only when a human happens to
+  // have the mission-control dashboard enabled. Idempotent (db.ts), so
+  // startDashboard()'s own startEventStore() call below is a safe no-op.
+  startEventStore();
   if (config.serverOnly) {
     // Dashboard-only mode: serve mission control, never touch Linear. No
     // daemon_started emit — the pipeline daemon genuinely is not running, and
