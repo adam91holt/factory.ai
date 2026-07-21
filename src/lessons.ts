@@ -79,7 +79,18 @@ function startOfLocalDayMs(now: Date): number {
 function distillerCallsToday(): number {
   const now = new Date();
   const today = localDayKey(now);
-  if (attemptDay !== today) { attemptDay = today; attemptsToday = 0; }
+  if (attemptDay !== today) {
+    // Re-baseline on every process start (attemptDay starts "" so this also
+    // fires on the first call after a restart), not just a real day rollover.
+    // Baselining at 0 would let a restarted daemon re-earn up to
+    // MAX_DISTILLER_CALLS_PER_DAY fresh attempts even after most of today's
+    // budget was already spent — persisted rows only count *successful*
+    // writes, so failed/NO-LESSON attempts before the restart left no trace
+    // for the floor to see. Seeding from the persisted count closes that gap:
+    // the in-memory counter picks up where today's spend actually left off.
+    attemptDay = today;
+    attemptsToday = lessonRowCountSince(startOfLocalDayMs(now));
+  }
   return Math.max(attemptsToday, lessonRowCountSince(startOfLocalDayMs(now)));
 }
 
@@ -139,13 +150,22 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
 
     // The distiller sees ONLY redacted event text, inside an untrusted frame,
     // with no tools — lesson content is data distilled from data.
+    // Redact BEFORE truncating each field: a secret that straddles a slice
+    // boundary would survive as an unrecognizable fragment (too short for the
+    // pattern regexes, not equal to the full exact-match value) if we sliced
+    // first and redacted the already-cut text.
+    const reasonRedacted = redactSecrets(input.reason).clean.slice(0, 800);
+    const stageErrorsRedacted = input.stageErrors?.map((e) => redactSecrets(e).clean.slice(0, 300));
+    const tasteFindingsRedacted = input.tasteFindings ? redactSecrets(input.tasteFindings).clean.slice(0, 1200) : undefined;
+    // Belt-and-suspenders final pass over the assembled record (idempotent on
+    // already-redacted text; catches anything reconstructed across fields).
     const record = redactSecrets([
       `outcome: ${input.outcome}`,
       `repo: ${input.repo || "(unknown)"}`,
       `stage: ${input.stage}`,
-      `reason: ${input.reason.slice(0, 800)}`,
-      ...(input.stageErrors?.length ? [`stage errors:\n${input.stageErrors.map((e) => `- ${e.slice(0, 300)}`).join("\n")}`] : []),
-      ...(input.tasteFindings ? [`design-review findings:\n${input.tasteFindings.slice(0, 1200)}`] : []),
+      `reason: ${reasonRedacted}`,
+      ...(stageErrorsRedacted?.length ? [`stage errors:\n${stageErrorsRedacted.map((e) => `- ${e}`).join("\n")}`] : []),
+      ...(tasteFindingsRedacted ? [`design-review findings:\n${tasteFindingsRedacted}`] : []),
     ].join("\n")).clean;
 
     const distilled = await runStage("lesson-distiller",
@@ -182,8 +202,13 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
  *  Hard-capped by count AND cumulative chars via the in-code constants above;
  *  opts may only narrow the caps, never exceed them. */
 export function lessonsForRepo(repo: string, opts?: { maxLessons?: number; maxChars?: number }): LessonRow[] {
-  const maxLessons = Math.max(0, Math.min(opts?.maxLessons ?? MAX_LESSONS_PER_REPO, MAX_LESSONS_PER_REPO));
-  const maxChars = Math.max(0, Math.min(opts?.maxChars ?? MAX_LESSON_CHARS_PER_REPO, MAX_LESSON_CHARS_PER_REPO));
+  // Non-finite opts (NaN, +/-Infinity from a bad caller) must fall back to the
+  // constant rather than silently disabling the cap: NaN propagates through
+  // Math.min/Math.max and every `> maxChars` comparison is then false.
+  const rawMaxLessons = opts?.maxLessons;
+  const rawMaxChars = opts?.maxChars;
+  const maxLessons = Math.max(0, Math.min(Number.isFinite(rawMaxLessons) ? rawMaxLessons! : MAX_LESSONS_PER_REPO, MAX_LESSONS_PER_REPO));
+  const maxChars = Math.max(0, Math.min(Number.isFinite(rawMaxChars) ? rawMaxChars! : MAX_LESSON_CHARS_PER_REPO, MAX_LESSON_CHARS_PER_REPO));
   const rows = activeLessonRowsForRepo(repo, maxLessons);
   const out: LessonRow[] = [];
   let chars = 0;

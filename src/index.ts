@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import { fetchQueue, LinearRateLimited } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
+import { repoFromTicket } from "./repos.ts";
 import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
 import { reconcileTick } from "./reconcile.ts";
@@ -65,7 +66,9 @@ async function tick(): Promise<boolean> {
   for (const issue of queue) {
     if (issue.labels.includes(EPIC_LABEL)) continue;
     if (isEligible(issue)) eligible.push(issue);
-    else await markNeedsHuman(issue, "ticket does not meet the contract (missing sections or unparseable Repo) — see factory docs/ticket-contract.md");
+    // Repo may still be parseable even when the ticket fails other contract
+    // checks — thread it through so the distilled lesson stays repo-scoped.
+    else await markNeedsHuman(issue, "ticket does not meet the contract (missing sections or unparseable Repo) — see factory docs/ticket-contract.md", repoFromTicket(issue.description) ?? undefined);
   }
   if (eligible.length === 0) {
     bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 });

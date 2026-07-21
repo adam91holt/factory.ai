@@ -108,7 +108,10 @@ class Budget {
 export async function processIssue(issue: linear.Issue): Promise<void> {
   const missing = missingSections(issue);
   if (missing.length > 0) {
-    await markNeedsHuman(issue, `ticket is missing required sections: ${missing.join(", ")} (see factory docs/ticket-contract.md)`);
+    // Repo may still be parseable even though other required sections are
+    // missing (e.g. "## Repo" present, "## Verifications" absent) — thread it
+    // through so the lesson stays repo-scoped instead of falling into "".
+    await markNeedsHuman(issue, `ticket is missing required sections: ${missing.join(", ")} (see factory docs/ticket-contract.md)`, repoFromTicket(issue.description) ?? undefined);
     return;
   }
   const repo = repoFromTicket(issue.description);
