@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import { saveCatalogEntry, type SaveResult } from "../src/catalog-manager.ts";
 
@@ -6,6 +9,26 @@ import { saveCatalogEntry, type SaveResult } from "../src/catalog-manager.ts";
 // touches the working tree, never commits, never needs cleanup.
 
 const err = (r: SaveResult): string => String((r.json as { error?: unknown }).error ?? "");
+
+// The "arm a nonexistent card" test below depends on `zz-gk-nonexistent.md`
+// actually being absent from groundskeepers/. If someone ever adds a real,
+// enabled card by that name (matching the default steward model),
+// saveCatalogEntry's arming check would stop rejecting and the test would
+// fall through into its writeFileSync/git-commit section — silently mutating
+// and committing a real card mid test-run. Fail loudly instead of letting
+// that happen quietly.
+const NONEXISTENT_CARD_PATH = join(
+  fileURLToPath(new URL("..", import.meta.url)),
+  "groundskeepers",
+  "zz-gk-nonexistent.md",
+);
+if (existsSync(NONEXISTENT_CARD_PATH)) {
+  throw new Error(
+    `tests/catalog-manager.test.ts: fixture collision — ${NONEXISTENT_CARD_PATH} now exists on disk. ` +
+      "This test's rejection-only guarantee depends on that file being absent; pick a different " +
+      "guaranteed-absent name (or delete/rename the new card) before running this suite.",
+  );
+}
 
 const agentBody = (content: string, name = "zz-test-agent"): unknown =>
   ({ kind: "agent", name, content });

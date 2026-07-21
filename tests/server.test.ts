@@ -141,13 +141,17 @@ describe("applyEvent", () => {
 describe("pruneFinishedRuns (via the run_finished fold)", () => {
   test("keeps the newest 50 finished runs and every active run", () => {
     let m = initial();
+    // Active run started BEFORE any finished run, so every subsequent
+    // run_finished below (and the pruneFinishedRuns call it triggers) runs
+    // with the active run already present in `runs` — that's what actually
+    // exercises "pruning coexists with an active run" instead of just
+    // asserting on state pruning never touched.
+    m = fold([stageStarted("FAC-ACTIVE", "implementer")], m);
     // 60 finished runs with strictly increasing finishedAt.
     for (let i = 1; i <= 60; i++) {
       const key = `FAC-${100 + i}`;
       m = fold([started(key), finished(key, 10_000 + i)], m);
     }
-    // Plus one active run started BEFORE all of them.
-    m = fold([stageStarted("FAC-ACTIVE", "implementer")], m);
     const runs = Object.values(m.runs);
     const finishedRuns = runs.filter((r) => r.status !== "active");
     expect(finishedRuns).toHaveLength(50);
