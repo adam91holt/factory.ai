@@ -95,3 +95,15 @@ Decompose (foundation-first): (1) extend the card schema + loader for `mcpServer
 - The **pipeline reads the per-ticket override** and applies it to that ticket's stages (implementer/fixer/reviewers), falling back to the global default when absent.
 - Generalizes to per-ticket: any ticket can request a specific model/worker; the override is a ceiling the governance still bounds (budget caps unchanged).
 This is what lets the global default stay cheap (sonnet/opus routing) while high-stakes epics (like FAC-14 self-improvement) opt into Fable end-to-end without a global flip. Until it exists, premium epics require a temporary global change + revert.
+
+## Epic (after worker-pool): Projects — multi-repo registry + new-project bootstrap
+**Adam, 2026-07-21:** how the factory works across many projects and spins up new ones.
+
+**Already works (execution layer):** repo is per-ticket (`## Repo`), so the same daemon builds any repo named in a ticket (proven: kiwi-quest + factory.ai same session). Teams are `FACTORY_TEAM_KEYS` config; merge trust is the per-repo allowlist; groundskeepers already name their repos+team. A "project" is already a bundle of {team, repos, merge tier, groundskeeper, workers} — just scattered.
+
+**Build:**
+1. **Project registry** — `projects/<name>.md` cards (like groundskeeper cards) bundling: Linear team, repo(s), merge policy tier, groundskeeper, which worker specialists + MCP servers + secrets that project's work gets. Onboarding a venture/client = one card. The factory reads the registry to know which teams to watch and how to treat each repo (replaces scattered env: FACTORY_TEAM_KEYS, MERGE_AUTO_REPOS all move into cards). Model on the triage-agent's @rapido/clients pattern.
+2. **New-project bootstrap** — a capability (worker or epic type) that goes idea → running repo: `gh repo create`, scaffold the chosen stack with GREEN gates (typecheck/build/test), seed a CLAUDE.md + ticket-contract, push initial commit, register the project card. Then normal epics build into it. Closes the day-one "idea in → complete system out" loop.
+3. **Existing-complex-project resolution** — for repos that are docs hubs routing to real code (the Rapido hub → fck.mongo/service.* pattern, see rapido-operational-picture): the factory clones the hub, reads its CLAUDE.md router, and worktrees the named sibling code repos. Multi-repo tickets get an ordered PR list (the deferred changeset contract) rather than auto-merge-across-repos.
+
+Anti-goals: bootstrap must not auto-create public repos or push secrets; new repos default to private + human-gated merge until trust is earned per the merge-policy ramp; the registry never grants a project's workers ambient MCP/secrets — allowlisted per card.
