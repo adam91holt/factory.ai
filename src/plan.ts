@@ -4,6 +4,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, type StageResult } from "./agents.ts";
+import { parseFactoryMeta, withFactoryMeta } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { postStageComment } from "./loop.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -100,9 +101,14 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
       finish("planned", `dry-run: planned ${children.length} children`);
       return;
     }
+    // Stamp every child with the atomic factory metadata block: the exact repo,
+    // type:task, and the epic's model (per-epic override propagates to children).
+    // This is why children can never fail repo-parse or the epic-race again.
+    const epicModel = parseFactoryMeta(issue.description).model;
     const created: string[] = [];
     for (const child of children) {
-      created.push(await linear.createSubIssue(issue, child.title, child.description));
+      const stamped = withFactoryMeta(child.description, { repo, type: "task", ...(epicModel ? { model: epicModel } : {}) });
+      created.push(await linear.createSubIssue(issue, child.title, stamped));
     }
 
     await linear.postComment(issue, [

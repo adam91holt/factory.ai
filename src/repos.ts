@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
+import { parseFactoryMeta } from "./meta.ts";
 
 // Worktree manager. Never touches ~/RapidoCoding (Adam's live checkouts) —
 // everything lives under FACTORY_WORK_ROOT. Hardened per code-review verdict
@@ -33,6 +34,10 @@ export function repoFromTicket(description: string): string | null {
   // org/name anywhere in it — tolerant of "## Repo (org/name)", a bare line,
   // backticks, or a link. (Decomposers format this inconsistently: parens on
   // the header line vs the repo on the next line.)
+  // Primary: the atomic, typed factory metadata block. Fallback: the ## Repo
+  // section (hardened, for tickets/humans that don't use the block yet).
+  const metaRepo = parseFactoryMeta(description).repo;
+  if (metaRepo) return metaRepo;
   const section = description.match(/##\s*Repo\b([\s\S]*?)(?:\n##\s|$)/);
   const repo = section?.[1]?.match(/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/)?.[1];
   return repo ?? null;

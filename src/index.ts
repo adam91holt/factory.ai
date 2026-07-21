@@ -8,6 +8,7 @@ import { stewardTick } from "./steward.ts";
 import { reconcileTick } from "./reconcile.ts";
 import { groundskeeperTick } from "./groundskeepers.ts";
 import { EPIC_LABEL } from "./linear.ts";
+import { parseFactoryMeta } from "./meta.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
@@ -56,14 +57,15 @@ async function tick(): Promise<boolean> {
   // slots or starve the FIFO head (C6).
   // Factory-Epic tickets route to the PLAN stage (one per tick bounds spend);
   // their children arrive as ordinary tickets on later ticks (plan v1.1).
-  const epic = queue.find((issue) => issue.labels.includes(EPIC_LABEL));
+  const isEpic = (i: { labels: string[]; description: string }) => i.labels.includes(EPIC_LABEL) || parseFactoryMeta(i.description).type === "epic";
+  const epic = queue.find(isEpic);
   if (epic) await planIssue(epic).catch((error) => {
     console.error(`[${epic.identifier}] planner unhandled: ${error instanceof Error ? error.message : error}`);
   });
 
   const eligible = [];
   for (const issue of queue) {
-    if (issue.labels.includes(EPIC_LABEL)) continue;
+    if (isEpic(issue)) continue;
     if (isEligible(issue)) eligible.push(issue);
     else await markNeedsHuman(issue, "ticket does not meet the contract (missing sections or unparseable Repo) — see factory docs/ticket-contract.md");
   }

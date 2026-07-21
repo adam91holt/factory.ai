@@ -5,6 +5,7 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
+import { parseFactoryMeta } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -104,6 +105,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     await markNeedsHuman(issue, `ticket is missing required sections: ${missing.join(", ")} (see factory docs/ticket-contract.md)`);
     return;
   }
+  // Per-ticket model override from the factory metadata block (e.g. an epic
+  // pins model: claude-fable-5 and the decomposer copies it to each child).
+  const ovr = parseFactoryMeta(issue.description).model;
+  const implModel = ovr || config.models.implementer;
+  const fixModel = ovr || config.models.fixer;
   const repo = repoFromTicket(issue.description);
   if (!repo) {
     await markNeedsHuman(issue, `could not parse a single org/name from the "## Repo" section — never guessing (ROUTE failure contract)`);
@@ -149,7 +155,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const implementer = await runStage("implementer",
       renderPrompt("implementer", { repo, spec },
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`),
-      { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      { model: implModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(implementer);
     await postStageComment(issue, implementer);
     if (implementer.error) { await park(issue, stages, `implementer: ${implementer.error}`); return; }
@@ -188,7 +194,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const fixer = await runStage("fixer",
       renderPrompt("fixer", { spec, reviews: untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`) },
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`),
-      { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     await postStageComment(issue, fixer);
     if (fixer.error) { await park(issue, stages, `fixer: ${fixer.error}`); return; }
@@ -219,7 +225,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       for (let round = 1; round < maxTasteRounds && !tastePasses(design) && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
-          { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
         commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
@@ -244,7 +250,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
-        { model: config.models.fixer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
     await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
