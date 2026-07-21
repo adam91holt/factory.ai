@@ -110,14 +110,26 @@ export function commitAll(ws: Workspace, message: string): boolean {
   return git(ws.dir, ["commit", "--no-verify", "-m", message]).ok;
 }
 
+function gitRetry(cwd: string, args: string[], attempts = 3): GitResult {
+  let last = git(cwd, args);
+  for (let i = 1; i < attempts && !last.ok; i++) {
+    // Busy-wait a beat: concurrent worktrees of one repo share the object store,
+    // so a sibling's fetch/commit can transiently lock refs. Contention clears fast.
+    const until = Date.now() + 400;
+    while (Date.now() < until) { /* spin */ }
+    last = git(cwd, args);
+  }
+  return last;
+}
+
 function mergeBase(ws: Workspace): string {
-  const mb = git(ws.dir, ["merge-base", "HEAD", ws.baseRef]);
+  const mb = gitRetry(ws.dir, ["merge-base", "HEAD", ws.baseRef]);
   if (!mb.ok) throw new Error(`cannot locate base ${ws.baseRef}: ${mb.stderr.slice(0, 200)}`);
   return mb.stdout.trim();
 }
 
 export function diffAgainstBase(ws: Workspace): string {
-  const diff = git(ws.dir, ["diff", mergeBase(ws), "HEAD"]);
+  const diff = gitRetry(ws.dir, ["diff", mergeBase(ws), "HEAD"]);
   if (!diff.ok) throw new Error(`diff failed: ${diff.stderr.slice(0, 200)}`);
   return diff.stdout;
 }
