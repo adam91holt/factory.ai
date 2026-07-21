@@ -130,6 +130,15 @@ export async function fetchQueue(): Promise<Issue[]> {
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // FIFO regardless of server order (C21)
 }
 
+/** All issues of a given state TYPE in a team (e.g. "started" = In Progress + In Review). */
+export async function fetchIssuesByStateType(stateType: string, teamKey: string): Promise<Issue[]> {
+  const data = await gql<{ issues: { nodes: RawIssue[] } }>(
+    `query($team: String!, $st: String!) {
+      issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: $st } } }) {
+        nodes { ${ISSUE_FIELDS} } } }`, { team: teamKey, st: stateType });
+  return data.issues.nodes.map(toIssue);
+}
+
 export async function getIssue(id: string): Promise<Issue> {
   const data = await gql<{ issue: RawIssue }>(
     `query($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`, { id });

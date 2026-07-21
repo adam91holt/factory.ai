@@ -5,6 +5,7 @@ import { fetchQueue, LinearRateLimited } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
 import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
+import { reconcileTick } from "./reconcile.ts";
 import { groundskeeperTick } from "./groundskeepers.ts";
 import { EPIC_LABEL } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
