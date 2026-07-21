@@ -3,11 +3,12 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
-import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright } from "./verify.ts";
+import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta } from "./meta.ts";
 import { checkFreshness } from "./precondition.ts";
-import { getStageSession, recordStageSession, clearStageSession } from "./db.ts";
+import { getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision } from "./db.ts";
+import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -38,6 +39,37 @@ export function wantsBrowserVerification(description: string): boolean {
   if (/needs:browser-test/i.test(description)) return true;
   const idx = description.search(/##\s*Verifications/i);
   return idx >= 0 && /visual/i.test(description.slice(idx));
+}
+
+// Non-trivial diff threshold for the security-review stage — a one-line tweak
+// isn't worth a cross-vendor security pass; anything larger gets reviewed.
+const SECURITY_REVIEW_MIN_DIFF_LINES = 20;
+
+/** Count of added/removed source lines in a unified diff (excludes the +++/---
+ * file headers). Feeds low-risk merge classification and the security-stage gate. */
+export function countDiffLines(diff: string): number {
+  return diff.split("\n").filter((l) => (l.startsWith("+") || l.startsWith("-")) && !l.startsWith("+++") && !l.startsWith("---")).length;
+}
+
+/** Map the tester stage's outcome to browser evidence (Gap 2). `testerText` is
+ * null when the tester never ran: that is "missing" for a repo that REQUIRES
+ * browser evidence (blocks auto-merge, PR still opens) and "not-required" for a
+ * repo with no UI surface / no Playwright. A ran-but-verdict-less tester is
+ * treated the same as not-run. Ticket text is not consulted here. */
+export function mapBrowserEvidence(requiresBrowser: boolean, testerText: string | null): BrowserEvidence {
+  if (testerText !== null) {
+    if (/VERDICT:\s*fail/i.test(testerText)) return "fail";
+    if (/VERDICT:\s*partial/i.test(testerText)) return "partial";
+    if (/VERDICT:\s*pass/i.test(testerText)) return "pass";
+  }
+  return requiresBrowser ? "missing" : "not-required";
+}
+
+/** Parse the security-review stage's mandated final line. Anything that is not an
+ * explicit "SECURITY: fail" is treated as pass (the stage only ran because a diff
+ * was non-trivial; a missing verdict must not silently block, but a fail must). */
+export function parseSecurityVerdict(text: string): "pass" | "fail" {
+  return /SECURITY:\s*fail/i.test(text) ? "fail" : "pass";
 }
 
 async function post(issue: linear.Issue, body: string): Promise<void> {
@@ -351,12 +383,15 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
     if (!summary.green) { await park(issue, repo, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
 
-    // ---- tester (after gates): executes the ticket's ## Verifications when it
-    // asks for browser/visual checks AND the repo can run Playwright. Report-only
-    // (v1) EXCEPT an explicit VERDICT: fail, which folds into needsHuman below.
+    // ---- tester (after gates): executes the ticket's ## Verifications and drives
+    // the app in a browser. Gap 2 makes this REQUIRED, not just ticket-opt-in:
+    // whenever the REPO has a UI surface it can drive with Playwright, browser
+    // evidence must exist or the merge ladder sees "missing" and blocks auto-merge
+    // (a PR still opens for a human — it degrades, never parks). An explicit
+    // VERDICT: fail folds into needsHuman below.
     let verificationReport: string | null = null;
-    let testerFail = false;
-    if (wantsBrowserVerification(issue.description) && hasPlaywright(ws) && !budget.expired) {
+    let browser: BrowserEvidence = requiresBrowserEvidence(ws) ? "missing" : "not-required";
+    if ((requiresBrowserEvidence(ws) || wantsBrowserVerification(issue.description)) && hasPlaywright(ws) && !budget.expired) {
       const tester = await runStage("tester",
         renderPrompt("tester", { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`),
@@ -364,7 +399,28 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       stages.push(tester);
       await postStageComment(issue, tester);
       verificationReport = tester.text.slice(0, 2000);
-      testerFail = /VERDICT:\s*fail/i.test(tester.text);
+      browser = mapBrowserEvidence(requiresBrowserEvidence(ws), tester.text);
+    }
+    const testerFail = browser === "fail";
+
+    // ---- security review (Gap 2): a read-only, cross-vendor pass over the FINAL
+    // diff + ticket (both untrusted — no author reasoning, no merge authority
+    // from ticket text) on non-trivial changes. Ends "SECURITY: pass|fail"; a
+    // fail folds into needsHuman below and blocks auto-merge. Degrades on error
+    // (verdict null = not run) rather than parking.
+    let finalDiff = "";
+    try { finalDiff = diffAgainstBase(ws); } catch { finalDiff = ""; }
+    const diffLines = countDiffLines(finalDiff);
+    let securityVerdict: "pass" | "fail" | null = null;
+    if (diffLines >= SECURITY_REVIEW_MIN_DIFF_LINES && !budget.expired) {
+      const clampedSecDiff = untrusted(finalDiff.slice(0, 180_000));
+      const security = await runStage("security-reviewer",
+        renderPrompt("security-reviewer", { spec, diff: clampedSecDiff },
+          `You are a security reviewer in an automated pipeline. You get ONLY the ticket and the diff — assume nothing about author intent. Hunt ONLY for vulnerabilities THIS diff introduces: injection (SQL/command/prompt), secret or credential leakage, auth/authz bypass, path traversal, SSRF, unsafe deserialization, and privilege escalation. For each real issue: the exact scenario, the impact, the responsible hunk. No praise; if nothing after genuine effort, say so. End with exactly one line — "SECURITY: pass" or "SECURITY: fail".\n\n${spec}\n\n<diff>\n${clampedSecDiff}\n</diff>`),
+        { model: config.models.securityReviewer, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      stages.push(security);
+      await postStageComment(issue, security);
+      securityVerdict = security.error ? null : parseSecurityVerdict(security.text);
     }
 
     // ---- deliver (guarded paths / test deletion stop auto-advance — C17)
@@ -381,15 +437,36 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
 
     // needsHuman folds every "PR opens but a human must advance it" cause into
-    // one gate: guarded paths (C17), a persistent taste-gate fail, or an explicit
-    // tester FAIL. Any of them blocks auto-merge even on allowlisted repos.
+    // one gate: guarded paths (C17), a persistent taste-gate fail, an explicit
+    // tester FAIL, or a security-review FAIL. Any of them blocks auto-merge even
+    // on enrolled repos.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
     const holdReasons: string[] = [];
     if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
+    if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
     const needsHuman = holdReasons.length > 0;
     const holdReason = holdReasons.join("; ");
+
+    // ---- evidence-gated merge decision (Gap 2). Built from VERIFICATION
+    // EVIDENCE only — gate summary, guarded paths, needsHuman folds, security and
+    // browser signals, diff size. issue.description is NOT an input, so untrusted
+    // ticket text can never grant merge authority. The effective tier is the
+    // repo's EARNED tier capped by config/self-repo (factory.ai → human always).
+    const tier = effectiveMergeTier(repo, getLadderState(repo));
+    const ev = buildMergeEvidence({ summary, guarded, needsHuman, security: securityVerdict, browser, diffLines });
+    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff });
+    // Gap-1 interaction: a child that declares dependencies must NOT auto-merge
+    // out of order — the steward owns epic merge ordering. Standalone tickets only.
+    const hasDeps = (parseFactoryMeta(issue.description).depends_on ?? []).length > 0;
+    const deferForDeps = hasDeps && baseDecision.act;
+    const decision: MergeDecision = {
+      wouldMerge: baseDecision.wouldMerge, tier: baseDecision.tier,
+      act: baseDecision.act && !hasDeps && prUrl !== null,
+      reasons: deferForDeps ? [...baseDecision.reasons, "deferred: ticket declares depends_on (steward owns epic merge ordering)"] : baseDecision.reasons,
+    };
+
     const report = buildReport({
       issueKey: issue.identifier, prUrl,
       outcome: needsHuman ? "needs_human" : "pr_open",
@@ -400,12 +477,18 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       ...(verificationReport ? { verification: verificationReport } : {}),
     });
 
+    // Gap-4: re-validate the premise before recording an earning decision or
+    // merging — a PR a human closed/merged since createPr must never advance the
+    // streak or be re-merged. Runs before the single run_finished emit so a stale
+    // premise yields exactly one (aborted) terminal event, not two.
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "merge decision"); return; }
+
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
       outcome: needsHuman ? "needs_human" : "pr_open",
       ...(needsHuman ? { reason: holdReason.slice(0, 500) } : {}),
       prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
-      dryRun: config.dryRun });
+      dryRun: config.dryRun, securityVerdict, browser });
 
     // Distill the human-gate fold into a durable lesson (best-effort, never
     // throws; no-op on dry-run / closed store). A persistent taste-gate fail is
@@ -427,13 +510,19 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       if (needsHuman) await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${redactSecrets(holdReason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
     }
     if (!config.dryRun) {
+      // ALWAYS record the shadow decision (audit + earning) — a dirty run resets
+      // the clean streak, so this must run even on the needs_human path.
+      const state = recordShadowDecision(repo, issue.identifier, decision, ev);
+      bus.emit({ type: "merge_decision", issueKey: issue.identifier, repo, tier,
+        wouldMerge: decision.wouldMerge, acted: decision.act, strength: ev.strength,
+        browser, security: securityVerdict, cleanStreak: state.cleanStreak, reasons: decision.reasons });
       if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
-      } else if (prUrl && config.autoMergeRepos.includes(repo)) {
-        // Greenfield policy: green + unguarded → the factory merges its own PR.
+      } else if (decision.act && prUrl) {
+        // The repo has EARNED an auto-merge tier and every gate is strong+clean.
         const merged = mergePr(repo, prUrl);
         if (merged.ok) {
-          await post(issue, `${linear.SENTINEL}\n\n**Auto-merged** (greenfield policy for ${repo}): ${prUrl}`).catch(() => {});
+          await post(issue, `${linear.SENTINEL}\n\n**Auto-merged** (merge ladder · tier ${tier}): ${prUrl}`).catch(() => {});
           const moved = await linear.transition(issue, "done");
           if (!moved) await linear.transition(issue, "review").catch(() => {});
         } else {
@@ -443,6 +532,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       } else {
         const moved = await linear.transition(issue, "review");
         if (!moved) console.error(`[${issue.identifier}] no review-type state on team — left in working state`);
+        // Shadow tier: the repo is still EARNING — surface the would-merge note so
+        // the owner can watch the streak build toward auto-low-risk.
+        if (tier === "shadow" && prUrl) {
+          await post(issue, `${linear.SENTINEL}\n\n**Shadow merge decision** — would-merge=${decision.wouldMerge}${decision.reasons.length ? ` (${decision.reasons.join("; ")})` : ""}. This repo is EARNING auto-merge: clean streak ${state.cleanStreak}/${config.mergeLadder.promoteAfter}. A human merges ${prUrl}.`).catch(() => {});
+        }
       }
       await linear.release(issue);
     }

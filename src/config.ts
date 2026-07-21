@@ -12,6 +12,19 @@ function num(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+// "repo:tier,repo2:tier" → { repo: tier } — the per-repo merge-ladder ceiling.
+// Only the four known tiers are accepted; an unknown/typo tier is dropped so a
+// malformed env var can never widen merge authority.
+const LADDER_TIERS = new Set(["human", "shadow", "auto-low-risk", "auto"]);
+function parsePairs(raw: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of (raw ?? "").split(",")) {
+    const [repo, tier] = pair.split(":").map((s) => s.trim());
+    if (repo && tier && LADDER_TIERS.has(tier)) out[repo] = tier;
+  }
+  return out;
+}
+
 function expandHome(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
 }
@@ -38,6 +51,9 @@ export const config = {
     steward: process.env.STEWARD_MODEL ?? "claude-fable-5",
     designReviewer: process.env.DESIGN_REVIEWER_MODEL ?? "opus",
     tester: process.env.TESTER_MODEL ?? "sonnet",
+    // Gap-2 security-review stage — cross-vendor by default (Codex) so a Claude
+    // author is not the sole security judge of its own diff.
+    securityReviewer: process.env.SECURITY_REVIEWER_MODEL ?? "gpt-5.6-sol",
     // Lesson distiller: one cheap tool-less call per failure (park / needs-human /
     // taste-fail) that turns the event into a one-line reusable lesson (lessons.ts).
     distiller: process.env.DISTILLER_MODEL ?? "haiku",
@@ -63,8 +79,24 @@ export const config = {
   groundskeepersEnabled: ["1", "true", "yes", "on"].includes((process.env.GROUNDSKEEPERS_ENABLED ?? "").trim().toLowerCase()),
 
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
-  // Repos where the factory may merge its own green, unguarded PRs (greenfield/
-  // fun). DEFAULT for every other repo: human merges — the review gate stands.
+  // The factory's OWN repo slug — NEVER auto-merged regardless of enrollment or
+  // ceiling (isSelfRepo in merge-ladder.ts also matches any `.../factory`).
+  selfRepo: (process.env.FACTORY_SELF_REPO ?? "").trim(),
+  // Gap-2 evidence-gated merge ladder. A repo is ENROLLED (here or via the
+  // retained MERGE_AUTO_REPOS) but STILL starts at "shadow" and must EARN
+  // auto-merge over `promoteAfter` consecutive clean shadow decisions. Ceiling
+  // caps how far a repo can climb; MERGE_AUTO_REPOS repos default to ceiling
+  // "auto", any other enrolled repo to "auto-low-risk". None of this is derivable
+  // from ticket text — the earning is measured from verification evidence only.
+  mergeLadder: {
+    enrolled: (process.env.MERGE_LADDER_REPOS ?? "").split(",").map((t) => t.trim()).filter(Boolean),
+    ceiling: parsePairs(process.env.MERGE_LADDER_CEILING),
+    promoteAfter: num("MERGE_LADDER_PROMOTE_AFTER", 10),
+    lowRiskMaxDiff: num("MERGE_LADDER_LOW_RISK_MAX_DIFF", 40),
+  },
+  // Repos where the factory may merge its own green, unguarded PRs. RETAINED but
+  // re-interpreted (Gap 2): a repo here is enrolled with ceiling "auto" and STILL
+  // starts at shadow — it must earn auto-merge through the ladder, not flip on.
   autoMergeRepos: (process.env.MERGE_AUTO_REPOS ?? "").split(",").map((r) => r.trim()).filter(Boolean), // route ALL stages via CLIProxyAPI (multi-account pooling)
   watchIntervalSeconds: Math.max(30, num("WATCH_INTERVAL_SECONDS", 60)),
   idleIntervalSeconds: Math.max(10, num("WATCH_INTERVAL_IDLE_SECONDS", 15)), // fast poll when nothing is in flight

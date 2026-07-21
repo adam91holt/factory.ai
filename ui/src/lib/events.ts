@@ -38,8 +38,14 @@ export interface GateMeta {
 }
 
 export type RunOutcome = "pr_open" | "planned" | "parked" | "needs_human" | "aborted" | "stale";
-export type GateStrength = "none" | "weak" | "real";
+// Gap-2: "strong" = a repo whose real app was driven (a passing e2e gate or
+// external browser evidence on top of unit tests) — the tier auto-merge requires.
+export type GateStrength = "none" | "weak" | "real" | "strong";
 export type DaemonMode = "watch" | "once" | "dry";
+
+// Gap-2 evidence-gated merge ladder (mirror of src/events.ts).
+export type MergeTier = "human" | "shadow" | "auto-low-risk" | "auto";
+export type BrowserEvidence = "pass" | "partial" | "fail" | "missing" | "not-required";
 
 /** Event bodies as emitted by daemon code (bus stamps seq + at). */
 export type FactoryEventBody =
@@ -72,7 +78,12 @@ export type FactoryEventBody =
       green: boolean; strength: GateStrength; gates: GateMeta[] }
   | { type: "run_finished"; issueKey: string; outcome: RunOutcome; reason?: string;
       prUrl: string | null; costUsd: number; stages: StageMeta[];
-      gateStrength: GateStrength; guardedPaths: string[]; dryRun: boolean };
+      gateStrength: GateStrength; guardedPaths: string[]; dryRun: boolean;
+      securityVerdict?: "pass" | "fail" | null; browser?: BrowserEvidence }
+  // ---- Gap-2 evidence-gated merge ladder (shadow → auto-low-risk → auto) ----
+  | { type: "merge_decision"; issueKey: string; repo: string; tier: MergeTier;
+      wouldMerge: boolean; acted: boolean; strength: string; browser: BrowserEvidence;
+      security: "pass" | "fail" | null; cleanStreak: number; reasons: string[] };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

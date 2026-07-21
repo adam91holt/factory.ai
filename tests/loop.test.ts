@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, countDiffLines } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
+import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
 
 const issue = (description: string): Issue => ({
@@ -102,5 +103,62 @@ describe("freshness gate decision mapping", () => {
 
   test("park: an authored premise can't be confirmed (no moot) → human decides", () => {
     expect(decideFreshness([row("pr-open acme/w#4", "unknown"), row("path-exists src/x.ts", "hold")]).action).toBe("park");
+  });
+});
+
+// Gap 2 browser-evidence mapping — the loop maps the tester's verdict (or its
+// absence) to a BrowserEvidence value the merge ladder consumes. Pure helper,
+// derived from the REPO's requirement and the tester output, never ticket text.
+describe("mapBrowserEvidence", () => {
+  test("a UI repo that REQUIRES browser evidence but ran no tester → missing (blocks auto)", () => {
+    expect(mapBrowserEvidence(true, null)).toBe("missing");
+  });
+
+  test("a non-UI repo with no tester → not-required", () => {
+    expect(mapBrowserEvidence(false, null)).toBe("not-required");
+  });
+
+  test("tester verdicts map pass/partial/fail", () => {
+    expect(mapBrowserEvidence(true, "drove the screen\nVERDICT: pass")).toBe("pass");
+    expect(mapBrowserEvidence(true, "some items manual\nVERDICT: partial")).toBe("partial");
+    expect(mapBrowserEvidence(true, "the button 404s\nVERDICT: fail")).toBe("fail");
+  });
+
+  test("a tester that ran but produced no verdict falls back to missing/not-required", () => {
+    expect(mapBrowserEvidence(true, "I could not determine anything")).toBe("missing");
+    expect(mapBrowserEvidence(false, "I could not determine anything")).toBe("not-required");
+  });
+});
+
+describe("parseSecurityVerdict", () => {
+  test("maps an explicit SECURITY: fail to fail (folds into holdReasons/needsHuman)", () => {
+    expect(parseSecurityVerdict("found an injection\nSECURITY: fail")).toBe("fail");
+  });
+  test("anything else is pass (a missing verdict must not silently block)", () => {
+    expect(parseSecurityVerdict("no issues found\nSECURITY: pass")).toBe("pass");
+    expect(parseSecurityVerdict("no line at all")).toBe("pass");
+  });
+});
+
+describe("countDiffLines", () => {
+  test("counts changed lines, excluding the +++/--- file headers", () => {
+    const diff = ["diff --git a/x b/x", "--- a/x", "+++ b/x", "@@ -1 +1,2 @@", "-old", "+new", "+added", " context"].join("\n");
+    expect(countDiffLines(diff)).toBe(3);
+  });
+});
+
+// The critical construction guarantee of Gap 2: the merge decision the loop makes
+// is derived from VERIFICATION EVIDENCE, not from issue.description. We assert the
+// evidence built for decideMerge carries only gate/security/browser/diff signals,
+// and that decideMerge's arity leaves no room for a ticket argument.
+describe("merge decision is evidence-derived, never ticket-derived", () => {
+  test("buildMergeEvidence consumes gate summary + security/browser/diff — no description", () => {
+    const ev = buildMergeEvidence({
+      summary: { green: true, strength: "strong" }, guarded: [], needsHuman: false,
+      security: "pass", browser: "pass", diffLines: 12,
+    });
+    // A clean strong bundle would-merge at auto; the input had no ticket text.
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(true);
+    expect(decideMerge.length).toBe(3); // (tier, evidence, opts) — no description slot
   });
 });

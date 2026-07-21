@@ -2,12 +2,49 @@ import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import { bus, type FactoryEvent } from "./events.ts";
+import { advanceLadder, seedLadderState, ceilingForRepo, type LadderState, type MergeDecision, type MergeEvidence } from "./merge-ladder.ts";
 
 // Durable event store (owner request 2026-07-20): every FactoryEvent — already
 // redacted at emit — lands in SQLite so agent activity survives restarts.
 // bun:sqlite is built in; no dependencies.
 
 let db: Database | null = null;
+
+/** All DDL for factory.db — extracted so both the daemon store and the in-memory
+ * test seam create an identical schema. `CREATE ... IF NOT EXISTS` throughout, so
+ * calling it on an existing file is a no-op. */
+function ensureSchema(d: Database): void {
+  d.run(`CREATE TABLE IF NOT EXISTS stage_sessions (
+    issue_key TEXT NOT NULL, stage TEXT NOT NULL, session_id TEXT NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (issue_key, stage))`);
+  d.run(`CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq INTEGER, at INTEGER, type TEXT, issue_key TEXT, json TEXT)`);
+  d.run("CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_key, id)");
+  // Telemetry aggregation scans by event type (run_stage_finished / run_finished).
+  d.run("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, id)");
+  // Durable, repo-scoped lessons distilled from failures (park / needs-human /
+  // taste-fail) — the self-improvement flywheel's memory (level-4-roadmap.md,
+  // principle 7). Same shared handle as the event log: never a second writer
+  // against a running daemon (see governance note below). All reads/writes go
+  // through the row helpers here, and ONLY src/lessons.ts calls those — other
+  // modules consume the lessons.ts API, never SQL.
+  d.run(`CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER,
+    repo TEXT, stage TEXT, issue_key TEXT,
+    lesson TEXT, source_reason TEXT,
+    archived INTEGER DEFAULT 0)`);
+  d.run("CREATE INDEX IF NOT EXISTS idx_lessons_repo ON lessons(repo, archived, id)");
+  // Gap-2 merge ladder: the per-repo EARNED tier + clean streak, and an append-
+  // only audit log of every shadow decision. The earning MATH lives in
+  // merge-ladder.ts (pure); these tables only persist its output.
+  d.run(`CREATE TABLE IF NOT EXISTS merge_ladder (
+    repo TEXT PRIMARY KEY, tier TEXT, clean_streak INTEGER, total_shadow INTEGER, updated_at INTEGER)`);
+  d.run(`CREATE TABLE IF NOT EXISTS merge_shadow_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, repo TEXT, issue_key TEXT,
+    would_merge INTEGER, acted INTEGER, tier TEXT, reasons TEXT, evidence_json TEXT)`);
+}
 
 export function startEventStore(): void {
   if (db) return; // idempotent — main() and startDashboard() may both call this
@@ -16,32 +53,11 @@ export function startEventStore(): void {
   // busy_timeout a long telemetry read holds the lock, the writer's INSERT
   // throws SQLITE_BUSY, and the subscriber catch below silently DROPS the event
   // from the durable log.
-  db.run(`CREATE TABLE IF NOT EXISTS stage_sessions (
-    issue_key TEXT NOT NULL, stage TEXT NOT NULL, session_id TEXT NOT NULL, at INTEGER NOT NULL,
-    PRIMARY KEY (issue_key, stage))`);
   db.run("PRAGMA busy_timeout = 2000");
   try { db.run("PRAGMA journal_mode = WAL"); } catch (error) {
     console.error(`[db] WAL switch failed (keeping default journal): ${error instanceof Error ? error.message : error}`);
   }
-  db.run(`CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    seq INTEGER, at INTEGER, type TEXT, issue_key TEXT, json TEXT)`);
-  db.run("CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_key, id)");
-  // Telemetry aggregation scans by event type (run_stage_finished / run_finished).
-  db.run("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, id)");
-  // Durable, repo-scoped lessons distilled from failures (park / needs-human /
-  // taste-fail) — the self-improvement flywheel's memory (level-4-roadmap.md,
-  // principle 7). Same shared handle as the event log: never a second writer
-  // against a running daemon (see governance note below). All reads/writes go
-  // through the row helpers here, and ONLY src/lessons.ts calls those — other
-  // modules consume the lessons.ts API, never SQL.
-  db.run(`CREATE TABLE IF NOT EXISTS lessons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at INTEGER,
-    repo TEXT, stage TEXT, issue_key TEXT,
-    lesson TEXT, source_reason TEXT,
-    archived INTEGER DEFAULT 0)`);
-  db.run("CREATE INDEX IF NOT EXISTS idx_lessons_repo ON lessons(repo, archived, id)");
+  ensureSchema(db);
   const insert = db.prepare("INSERT INTO events (seq, at, type, issue_key, json) VALUES (?, ?, ?, ?, ?)");
   bus.subscribe((e: FactoryEvent) => {
     try {
@@ -464,4 +480,64 @@ export function getStageSession(issueKey: string, stage: string): string | null 
 export function clearStageSession(issueKey: string, stage: string): void {
   if (!db) return;
   try { db.prepare("DELETE FROM stage_sessions WHERE issue_key = ? AND stage = ?").run(issueKey, stage); } catch { /* best-effort */ }
+}
+
+// ---------------------------------------------------------------------------
+// Merge ladder persistence (Gap 2) — persistence ONLY. The earning transition
+// (advanceLadder) and every policy decision (decideMerge / effectiveMergeTier)
+// live in merge-ladder.ts so the loop and the steward share one source of truth.
+// A closed store returns null / a pass-through state, so the pipeline never
+// throws and simply records nothing when telemetry is off (--once).
+// ---------------------------------------------------------------------------
+
+/** The persisted earned tier + streak for a repo, or null when it has no row. */
+export function getLadderState(repo: string): LadderState | null {
+  if (!db) return null;
+  const r = db.prepare("SELECT repo, tier, clean_streak, total_shadow FROM merge_ladder WHERE repo = ?")
+    .get(repo) as { repo: string; tier: string; clean_streak: number; total_shadow: number } | null;
+  if (!r) return null;
+  return { repo: r.repo, tier: r.tier as LadderState["tier"], cleanStreak: r.clean_streak, totalShadow: r.total_shadow };
+}
+
+/** Append a shadow-decision audit row and advance the earned tier. Returns the
+ * new LadderState (also when the store is closed — then it is the pure
+ * transition, unpersisted). This is the ONE writer of the earning streak, gated
+ * by loop.ts behind a stillOurs() re-check so a stale PR never advances it. */
+export function recordShadowDecision(repo: string, issueKey: string, decision: MergeDecision, ev: MergeEvidence): LadderState {
+  const prev = getLadderState(repo) ?? seedLadderState(repo);
+  const next = advanceLadder(prev, decision.wouldMerge, {
+    promoteAfter: config.mergeLadder.promoteAfter,
+    ceiling: ceilingForRepo(repo),
+  });
+  if (db) {
+    try {
+      db.prepare("INSERT INTO merge_shadow_log (at, repo, issue_key, would_merge, acted, tier, reasons, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(Date.now(), repo, issueKey, decision.wouldMerge ? 1 : 0, decision.act ? 1 : 0, decision.tier, decision.reasons.join("; ").slice(0, 1000), JSON.stringify(ev));
+      db.prepare(`INSERT INTO merge_ladder (repo, tier, clean_streak, total_shadow, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET tier = excluded.tier, clean_streak = excluded.clean_streak, total_shadow = excluded.total_shadow, updated_at = excluded.updated_at`)
+        .run(next.repo, next.tier, next.cleanStreak, next.totalShadow, Date.now());
+    } catch (error) {
+      console.error(`[db] merge-ladder write failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Test seam — an in-memory database with the full schema, used only by the unit
+// suite (no bus subscription, no file). Kept here so the module-level `db` handle
+// stays private and the single-writer invariant holds.
+// ---------------------------------------------------------------------------
+
+/** Open an :memory: (or given-path) db with the full schema for tests. */
+export function openTestDatabase(path = ":memory:"): void {
+  db = new Database(path);
+  ensureSchema(db);
+}
+
+/** Close and clear the test database (resets caches too). */
+export function closeTestDatabase(): void {
+  try { db?.close(); } catch { /* already closed */ }
+  db = null;
+  telemetryCache = null;
 }
