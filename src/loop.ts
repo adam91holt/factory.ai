@@ -66,7 +66,9 @@ export async function markNeedsHuman(issue: linear.Issue, reason: string): Promi
     await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason}\n\nRemove the \`${linear.NEEDS_HUMAN_LABEL}\` label after fixing to requeue.`);
   } catch (e) {
     console.error(`[${issue.identifier}] needs-human comment failed: ${e}`);
-    await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${reason.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
+    // Redact the FULL reason before truncating — slicing first can cut a
+    // secret in half so post()'s exact-value scrub no longer matches it.
+    await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
   }
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch((e) => console.error(`[${issue.identifier}] label failed: ${e}`));
@@ -327,7 +329,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // fallback comment — the label must never appear without its WHY (FAC-14).
     try { await post(issue, report); } catch (e) {
       console.error(`[${issue.identifier}] report post failed: ${e}`);
-      if (needsHuman) await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${holdReason.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
+      // Redact the FULL reason before truncating (see markNeedsHuman above).
+      if (needsHuman) await post(issue, `${linear.SENTINEL}\n\n**needs human** — ${redactSecrets(holdReason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal needs-human comment failed too: ${e2}`));
     }
     if (!config.dryRun) {
       if (needsHuman) {
@@ -372,7 +375,8 @@ async function park(issue: linear.Issue, stages: StageResult[], reason: string):
   // with no visible WHY is the FAC-14 failure mode (reason stranded in SQLite).
   try { await post(issue, buildReport(input)); } catch (e) {
     console.error(`[${issue.identifier}] park report failed: ${e}`);
-    await post(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — ${reason.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal park comment failed too: ${e2}`));
+    // Redact the FULL reason before truncating (see markNeedsHuman above).
+    await post(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal park comment failed too: ${e2}`));
   }
   if (!config.dryRun) {
     await linear.addLabel(issue, linear.PARKED_LABEL).catch((e) => console.error(`[${issue.identifier}] park label failed: ${e}`));

@@ -10,6 +10,7 @@ import { bus, type FactoryEvent } from "./events.ts";
 let db: Database | null = null;
 
 export function startEventStore(): void {
+  if (db) return; // idempotent — main() and startDashboard() may both call this
   db = new Database(join(config.workRoot, "factory.db"));
   // The daemon and a --server-only dashboard may share this file. Without WAL +
   // busy_timeout a long telemetry read holds the lock, the writer's INSERT

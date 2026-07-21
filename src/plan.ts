@@ -5,7 +5,7 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { renderPrompt } from "./catalog.ts";
-import { postStageComment } from "./loop.ts";
+import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
@@ -47,8 +47,11 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
 export async function planIssue(issue: linear.Issue): Promise<void> {
   const repo = repoFromTicket(issue.description);
   if (!repo) {
-    await linear.postComment(issue, `${linear.SENTINEL}\n\n**needs human** — epic has no parseable "## Repo" section; the planner needs a repo to research.`).catch(() => {});
-    if (!config.dryRun) await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
+    // Route through markNeedsHuman() rather than duplicating its comment/label
+    // logic — it also emits the durable issue_needs_human event that
+    // lastParkReasonForIssue reads, so this reason reaches steward closeout
+    // (FAC-14 lesson) instead of surfacing as "(no reason recorded)".
+    await markNeedsHuman(issue, `epic has no parseable "## Repo" section; the planner needs a repo to research.`);
     return;
   }
   bus.emit({ type: "run_started", issueKey: issue.identifier, title: `[plan] ${issue.title}`, repo, dryRun: config.dryRun });
@@ -124,7 +127,10 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // (§2.2) so the ticket comment carries the WHY without carrying a secret.
     await linear.postComment(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — planner failed: ${redactSecrets(reason).clean.slice(0, 300)}`).catch(() => {});
     if (!config.dryRun) await linear.addLabel(issue, linear.PARKED_LABEL).catch(() => {});
-    finish("parked", reason.slice(0, 200));
+    // Pass the FULL reason — finish() redacts before its own truncation, and
+    // pre-slicing here would cut a secret in half, defeating the exact-value
+    // scrub (redactSecrets matches whole values only).
+    finish("parked", reason);
     console.error(`[${issue.identifier}] planner parked: ${reason}`);
   }
 }

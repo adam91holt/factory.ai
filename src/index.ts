@@ -11,6 +11,7 @@ import { EPIC_LABEL } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
+import { startEventStore } from "./db.ts";
 
 // Watch loop. Serial ticks, WIP-limited, single-instance host lease. Hardened
 // per code-review verdict 2026-07-20: lease guard handles empty/garbage files
@@ -114,6 +115,11 @@ async function main(): Promise<void> {
   }
 
   acquireLease();
+  // Durable event store must be open regardless of dashboard enablement —
+  // --once/--dry-run/DASHBOARD_PORT=0 all resolve the dashboard port to null,
+  // but steward closeout (childStatusBlock → lastParkReasonForIssue) and
+  // groundskeeper governance both read from this store on every tick.
+  startEventStore();
   const dashboard = startDashboard();
 
   console.log(`factory watching teams [${config.teamKeys.join(", ")}] · workRoot ${config.workRoot} · ${config.dryRun ? "DRY-RUN" : "live"}`);

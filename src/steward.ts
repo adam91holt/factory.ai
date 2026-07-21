@@ -134,7 +134,10 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
     // Error strings can interpolate HTTP bodies — redact at the outbound seam
     // (§2.2) so the Needs-Human label always ships with a safe, visible WHY.
     await linear.postComment(epic, `${linear.SENTINEL}\n\n**Steward failed:** ${redactSecrets(reason).clean.slice(0, 300)} — human review needed.`).catch(() => {});
-    finish("parked", reason.slice(0, 200));
+    // Pass the FULL reason — finish() redacts before its own truncation, and
+    // pre-slicing here would cut a secret in half, defeating the exact-value
+    // scrub (redactSecrets matches whole values only).
+    finish("parked", reason);
     console.error(`[${epic.identifier}] steward failed: ${reason}`);
   }
 }
