@@ -554,7 +554,10 @@ export function startDashboard(): {
       // empty list, not an error.
       if (wantsHtml && serveIndex(res)) return;
       try {
-        const body = JSON.stringify({ lessons: listLessons() });
+        const body = JSON.stringify({ lessons: listLessons()
+          .filter((l) => !l.archived)                                   // archive actually hides (F1)
+          .map((l) => ({ id: l.id, repo: l.repo, stage: l.stage, lesson: l.lesson,
+            createdAt: l.createdAt, sourceIssue: l.issueKey || null, sourceUrl: null })) }); // UI shape (F2)
         res.writeHead(200, { "content-type": "application/json" });
         res.end(body);
       } catch (error) {
