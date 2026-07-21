@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
-import { fetchQueue, LinearRateLimited } from "./linear.ts";
+import { fetchQueue, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
 import { repoFromTicket } from "./repos.ts";
 import { planIssue } from "./plan.ts";
@@ -119,6 +119,10 @@ async function main(): Promise<void> {
   }
 
   acquireLease();
+  // Self-heal orphaned claims from a prior process (restart mid-run) before we
+  // start ticking, so in-flight tickets resume instead of stranding In-Progress.
+  const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);
+  if (recovered.length > 0) console.log(`[recover] reset ${recovered.length} orphaned claim(s) from a prior run: ${recovered.join(", ")}`);
   const dashboard = startDashboard();
 
   console.log(`factory watching teams [${config.teamKeys.join(", ")}] · workRoot ${config.workRoot} · ${config.dryRun ? "DRY-RUN" : "live"}`);

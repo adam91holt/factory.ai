@@ -329,6 +329,27 @@ export async function claim(issue: Issue): Promise<boolean> {
   }
 }
 
+/** Startup recovery: a fresh daemon owns no in-flight work, and the
+ * single-instance lease guarantees no live sibling holds a claim — so ANY
+ * Executing-labeled issue at startup is an orphan from a process that died
+ * (e.g. a restart mid-run). Reset each to the queue so it re-claims and
+ * resumes (resume-safe commit gate + git-retry handle committed-but-unpushed
+ * work). Without this, a restart strands in-flight tickets In-Progress forever. */
+export async function recoverOrphanedClaims(): Promise<string[]> {
+  const orphans = await fetchByLabel(EXECUTING_LABEL).catch(() => [] as Issue[]);
+  const recovered: string[] = [];
+  for (const issue of orphans) {
+    try {
+      await removeLabel(issue, EXECUTING_LABEL);
+      await transition(issue, "queue");
+      recovered.push(issue.identifier);
+    } catch (error) {
+      console.error(`[recover] ${issue.identifier} reset failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+  return recovered;
+}
+
 export async function release(issue: Issue): Promise<void> {
   await removeLabel(issue, EXECUTING_LABEL).catch(() => {});
 }
