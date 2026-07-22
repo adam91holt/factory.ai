@@ -5,6 +5,7 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
+import { isDraining } from "./control.ts";
 import { parseFactoryMeta } from "./meta.ts";
 import { checkFreshness } from "./precondition.ts";
 import { getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision } from "./db.ts";
@@ -182,13 +183,28 @@ async function resolveStale(issue: linear.Issue, repo: string, stages: StageResu
   }
 }
 
+// G2-prereq0: pure decision logic factored out of Budget so it's unit-testable
+// without touching control.ts's module-level drain flag. `draining` folds into
+// both so every "if (budget.expired) park+return" guard and every
+// "!budget.expired" loop/gate condition ALREADY sprinkled through processIssue
+// also halts on drain — a human's ONE button must stop spend on an
+// already-claimed issue at the next stage boundary, not just stop index.ts
+// from claiming new work. Draining is checked first: it always wins over budget.
+export function budgetExpired(now: number, deadlineMs: number, remainingUsd: number, draining: boolean): boolean {
+  return draining || now > deadlineMs || remainingUsd <= 0;
+}
+export function budgetExpiredReason(now: number, deadlineMs: number, draining: boolean): string {
+  return draining ? "factory is draining (kill switch or spend cap) — halting before the next stage"
+    : now > deadlineMs ? "wall-clock cap reached" : "issue budget exhausted";
+}
+
 class Budget {
   constructor(private stages: StageResult[], private deadline: number) {}
   get spent(): number { return this.stages.reduce((s, x) => s + x.costUsd, 0); }
   get remainingUsd(): number { return config.caps.budgetUsdPerIssue - this.spent; }
   get deadlineMs(): number { return this.deadline; }
-  get expired(): boolean { return Date.now() > this.deadline || this.remainingUsd <= 0; }
-  get expiredReason(): string { return Date.now() > this.deadline ? "wall-clock cap reached" : "issue budget exhausted"; }
+  get expired(): boolean { return budgetExpired(Date.now(), this.deadline, this.remainingUsd, isDraining()); }
+  get expiredReason(): string { return budgetExpiredReason(Date.now(), this.deadline, isDraining()); }
 }
 
 export async function processIssue(issue: linear.Issue): Promise<void> {
@@ -262,6 +278,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       if (decision.action === "cancel") { await resolveStale(issue, repo, stages, decision.reason); return; }
       if (decision.action === "park") { await park(issue, repo, stages, `freshness: ${decision.reason}`); return; }
     }
+
+    // G2-prereq0: a drain entered while claim/workspace-setup/freshness ran
+    // above must stop BEFORE the first (most expensive) stage spends anything —
+    // mirrors every other "if (budget.expired) park+return" boundary below.
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
 
     // ---- implementer
     // Feed-forward lessons: bounded, newest-first heuristics for this repo,

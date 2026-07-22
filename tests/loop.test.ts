@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines, budgetExpired, budgetExpiredReason } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -178,6 +178,50 @@ describe("countDiffLines", () => {
   test("counts changed lines, excluding the +++/--- file headers", () => {
     const diff = ["diff --git a/x b/x", "--- a/x", "+++ b/x", "@@ -1 +1,2 @@", "-old", "+new", "+added", " context"].join("\n");
     expect(countDiffLines(diff)).toBe(3);
+  });
+});
+
+// G2-prereq0 (kill switch drain awareness): processIssue's Budget class folds
+// isDraining() into `expired` so every existing "if (budget.expired) park" guard
+// and "!budget.expired" loop/gate ALREADY sprinkled through the pipeline also
+// halts once a human hits /stop — a drained issue must not spend on the NEXT
+// stage. budgetExpired/budgetExpiredReason are the pure decision Budget
+// delegates to; asserted directly here since Budget itself isn't exported and
+// isDraining() reads control.ts's module-level flag (out of scope for a pure
+// unit test — control.test.ts covers that flag's own transitions).
+describe("budgetExpired (G2-prereq0: kill switch must halt an in-flight issue)", () => {
+  const future = Date.now() + 60_000;
+  const past = Date.now() - 1;
+
+  test("draining forces expired even with time and budget both remaining", () => {
+    expect(budgetExpired(Date.now(), future, 5, true)).toBe(true);
+  });
+
+  test("not draining, deadline and budget both fine → not expired", () => {
+    expect(budgetExpired(Date.now(), future, 5, false)).toBe(false);
+  });
+
+  test("not draining but past the deadline → expired", () => {
+    expect(budgetExpired(Date.now(), past, 5, false)).toBe(true);
+  });
+
+  test("not draining but budget exhausted → expired", () => {
+    expect(budgetExpired(Date.now(), future, 0, false)).toBe(true);
+    expect(budgetExpired(Date.now(), future, -0.01, false)).toBe(true);
+  });
+});
+
+describe("budgetExpiredReason", () => {
+  const future = Date.now() + 60_000;
+  const past = Date.now() - 1;
+
+  test("draining wins over an also-expired deadline — a human reading the park reason sees WHY", () => {
+    expect(budgetExpiredReason(Date.now(), past, true)).toBe("factory is draining (kill switch or spend cap) — halting before the next stage");
+  });
+
+  test("not draining: distinguishes wall-clock cap from budget exhaustion by deadline alone", () => {
+    expect(budgetExpiredReason(Date.now(), past, false)).toBe("wall-clock cap reached");
+    expect(budgetExpiredReason(Date.now(), future, false)).toBe("issue budget exhausted");
   });
 });
 
