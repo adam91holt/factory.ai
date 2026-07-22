@@ -50,6 +50,32 @@ const DENY_ORCHESTRATION = [
   "Workflow", "ReportFindings", "PushNotification", "ScheduleWakeup",
 ];
 
+// ---------------------------------------------------------------------------
+// Kill switch (B6, prerequisite-0 in docs/planning/autonomy.md "Build order"
+// item 0). Every in-flight stage registers its AbortController here for the
+// duration of the SDK call; POST /stop (server.ts, via control.ts) walks this
+// registry and aborts everything in one shot. Keyed by a per-call id, not
+// `label` — multiple concurrent issues can run the same stage label at once.
+// ---------------------------------------------------------------------------
+const activeStages = new Map<string, { label: string; controller: AbortController }>();
+
+/** Abort every in-flight stage's AbortController right now. Returns the stage
+ *  labels that were aborted (server.ts's /stop response). Safe with zero
+ *  active stages (returns []) — a human hitting /stop with nothing running is
+ *  not an error. */
+export function abortAllStages(): string[] {
+  const labels = [...activeStages.values()].map((s) => s.label);
+  for (const { controller } of activeStages.values()) {
+    controller.abort(new Error("kill switch: /stop invoked"));
+  }
+  return labels;
+}
+
+/** Count of stages currently in flight — used by tests and /stop's response. */
+export function activeStageCount(): number {
+  return activeStages.size;
+}
+
 export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
   const t0 = Date.now();
   // Non-claude models route via the proxy automatically (any role can be either
@@ -77,6 +103,8 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   const remainingMs = Math.max(5_000, opts.deadlineMs - Date.now());
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(new Error("stage deadline reached")), remainingMs);
+  const stageId = randomUUID();
+  activeStages.set(stageId, { label, controller: abort });
   try {
     let result: Record<string, unknown> | null = null;
     const q = query({
@@ -167,6 +195,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     return out;
   } finally {
     clearTimeout(timer);
+    activeStages.delete(stageId);
   }
 }
 

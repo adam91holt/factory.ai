@@ -8,17 +8,20 @@ import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView, type StageView } from "./events.ts";
+import { killSwitch } from "./control.ts";
 
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
 // Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
 // file reads outside ui/dist and factory-history.jsonl. The exceptions are the
-// two guarded POSTs: /catalog/save (the catalog manager), which reads a bounded
-// JSON body and writes ONE validated card/skill file under
-// agents|skills|groundskeepers, then commits it — and /lessons/archive, which
-// flips archived=1 on ONE lesson row (never a delete) — both a human editing
-// the org through the loopback UI, both behind the same guardedJsonBody()
-// CSRF/DNS-rebinding gate. All emitted payload strings were redacted at emit
-// time. node:http only (Bun implements it) — no new dependencies.
+// three guarded POSTs: /catalog/save (the catalog manager), which reads a
+// bounded JSON body and writes ONE validated card/skill file under
+// agents|skills|groundskeepers, then commits it; /lessons/archive, which flips
+// archived=1 on ONE lesson row (never a delete); and /stop (B6 kill switch,
+// prerequisite-0), which aborts every in-flight stage and enters drain mode —
+// all three are a human acting through the loopback UI, all three behind the
+// same guardedJsonBody() CSRF/DNS-rebinding gate. All emitted payload strings
+// were redacted at emit time. node:http only (Bun implements it) — no new
+// dependencies.
 
 const UI_DIST = fileURLToPath(new URL("../ui/dist", import.meta.url));
 
@@ -431,6 +434,25 @@ export function startDashboard(): {
           res.writeHead(500, { "content-type": "application/json" });
           res.end('{"error":"archive failed"}');
         }
+      });
+      return;
+    }
+
+    // Write route: kill switch (B6, prerequisite-0). Same guard as /catalog/save
+    // and /lessons/archive. Aborts every in-flight stage's AbortController
+    // (agents.ts) AND enters drain mode (control.ts) so index.ts stops claiming
+    // new work starting next tick — a human acting on a runaway factory needs
+    // ONE button, not a `pkill` (docs/planning/autonomy.md "Prerequisite 0").
+    if (url.pathname === "/stop") {
+      void guardedJsonBody(req, res).then((guarded) => {
+        if (guarded === null) return; // refusal already written
+        const reasonRaw = (guarded.body as { reason?: unknown } | null)?.reason;
+        const reason = typeof reasonRaw === "string" && reasonRaw.trim() !== ""
+          ? reasonRaw.trim().slice(0, 200)
+          : "manual /stop";
+        const { abortedStages } = killSwitch(reason);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, draining: true, abortedCount: abortedStages.length, abortedStages }));
       });
       return;
     }

@@ -18,6 +18,9 @@ import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
 import { startEventStore } from "./db.ts";
+import { isDraining } from "./control.ts";
+import { startAlerts } from "./alerts.ts";
+import { startSpendCap } from "./spend-cap.ts";
 
 // Watch loop. Serial ticks, WIP-limited, single-instance host lease. Hardened
 // per code-review verdict 2026-07-20: lease guard handles empty/garbage files
@@ -79,17 +82,21 @@ async function tick(): Promise<boolean> {
 
   // One heavy bookend op of each kind per tick (bounds spend, like the epic).
   // Bootstrap takes precedence over idea/epic when a ticket is somehow both.
-  const bootstrap = queue.find((i) => isBootstrap(i) && !isEpic(i));
+  // Prerequisite-0 kill switch/spend cap (B6/T5): drain mode means "claim
+  // nothing new" — these three ARE new-work claims (each spends real budget on
+  // a ticket that wasn't already in flight), so they're gated exactly like the
+  // batch claim below. In-flight work from before drain started is untouched.
+  const bootstrap = isDraining() ? undefined : queue.find((i) => isBootstrap(i) && !isEpic(i));
   if (bootstrap) await bootstrapProject(bootstrap).catch((error) => {
     console.error(`[${bootstrap.identifier}] bootstrap unhandled: ${error instanceof Error ? error.message : error}`);
   });
-  const idea = queue.find((i) => isIdea(i) && !isBootstrap(i) && !isEpic(i));
+  const idea = isDraining() ? undefined : queue.find((i) => isIdea(i) && !isBootstrap(i) && !isEpic(i));
   if (idea) await runIntake(idea).catch((error) => {
     console.error(`[${idea.identifier}] intake unhandled: ${error instanceof Error ? error.message : error}`);
   });
 
   const isEpicOnly = (i: { labels: string[]; description: string }) => isEpic(i) && !isIdea(i) && !isBootstrap(i);
-  const epic = queue.find(isEpicOnly);
+  const epic = isDraining() ? undefined : queue.find(isEpicOnly);
   if (epic) await planIssue(epic).catch((error) => {
     console.error(`[${epic.identifier}] planner unhandled: ${error instanceof Error ? error.message : error}`);
   });
@@ -119,7 +126,9 @@ async function tick(): Promise<boolean> {
   // dependencies are all completed (topological frontier) and its `touches`
   // globs don't collide with an in-flight or already-admitted sibling (file
   // mutex). A child that declares neither behaves exactly as before.
-  const capacity = config.caps.wipLimit - inFlight.size;
+  // Draining → zero capacity: selectRunnable defers every candidate, so the
+  // batch below is empty and nothing new gets claimed (B6/T5, control.ts).
+  const capacity = isDraining() ? 0 : config.caps.wipLimit - inFlight.size;
   const candidates = eligible
     .filter((i) => !inFlight.has(i.identifier))
     .map((issue) => {
@@ -149,6 +158,10 @@ async function tick(): Promise<boolean> {
   await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
   await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
   await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
+  // B7: this busy path omitted postMergeTick while both the empty-queue and
+  // eligible-empty return paths above ran it — deploy verification would starve
+  // whenever merges kept the board busy (masked today by DEPLOY_ENABLED=off).
+  await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
   return batch.length > 0 || inFlight.size > 0;
 }
 
@@ -181,6 +194,12 @@ async function main(): Promise<void> {
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);
   if (recovered.length > 0) console.log(`[recover] reset ${recovered.length} orphaned claim(s) from a prior run: ${recovered.join(", ")}`);
   const dashboard = startDashboard();
+  // Prerequisite-0 (B6 kill switch / T5 spend cap + alerting, docs/planning/
+  // autonomy.md "Build order" item 0): wire both bus subscribers before the
+  // tick loop starts so the very first stage's spend and the very first
+  // needs-human/park/deploy-revert are covered, not just ones after warm-up.
+  startAlerts();
+  startSpendCap();
 
   console.log(`factory watching teams [${config.teamKeys.join(", ")}] · workRoot ${config.workRoot} · ${config.dryRun ? "DRY-RUN" : "live"}`);
   bus.emit({ type: "daemon_started", mode: config.dryRun ? "dry" : config.oneShot ? "once" : "watch",

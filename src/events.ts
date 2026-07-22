@@ -104,7 +104,13 @@ export type FactoryEventBody =
   | { type: "deploy_finished"; repo: string; sha: string; ok: boolean;
       stage: "skipped" | "deploy" | "smoke"; reverted: boolean; detail: string }
   // ---- Gap-5 project bootstrap (bootstrap.ts) ----
-  | { type: "bootstrap_finished"; issueKey: string; repo: string | null; ok: boolean; reason: string };
+  | { type: "bootstrap_finished"; issueKey: string; repo: string | null; ok: boolean; reason: string }
+  // ---- Prerequisite-0 (docs/planning/autonomy.md "Build order" item 0): kill
+  // switch (B6, control.ts) + rolling daily spend cap (T5, spend-cap.ts). Both
+  // funnel through control.ts's enterDrain — this is the ONE event a human (or
+  // the spend cap) entering drain mode ever emits, so alerts.ts has a single
+  // trigger to watch. `reason` is already bounded/plain text (never raw input).
+  | { type: "drain_entered"; trigger: "kill_switch" | "budget_cap"; reason: string };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };
