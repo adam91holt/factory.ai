@@ -3,6 +3,11 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readChildren, createChildren, type ChildSpec } from "../src/plan.ts";
+import { config } from "../src/config.ts";
+
+// A model in the configured roster (parseFactoryMeta drops unlisted models — a
+// security allowlist), so this test survives any roster (e.g. all-gpt-5.6-sol).
+const ROSTER_MODEL = Object.values(config.models)[0]!;
 import { parseFactoryMeta } from "../src/meta.ts";
 
 // Minimal body that clears readChildren's `description.length > 50` filter.
@@ -101,12 +106,12 @@ describe("createChildren — ordinal→identifier resolution", () => {
       { title: "Only", description: "just a body", ordinal: 1, dependsOn: [], touches: [] },
     ];
     let body = "";
-    await createChildren(children, { repo: "acme/w", model: "sonnet" }, async (_c, stampedBody) => { body = stampedBody; return "FAC-7"; });
+    await createChildren(children, { repo: "acme/w", model: ROSTER_MODEL }, async (_c, stampedBody) => { body = stampedBody; return "FAC-7"; });
     const meta = parseFactoryMeta(body);
     expect(meta.depends_on).toBeUndefined();
     expect(meta.touches).toBeUndefined();
     expect(meta.repo).toBe("acme/w");
-    expect(meta.model).toBe("sonnet");
+    expect(meta.model).toBe(ROSTER_MODEL);
   });
 });
 

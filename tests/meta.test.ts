@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, type FactoryMeta } from "../src/meta.ts";
+import { config } from "../src/config.ts";
+
+// A model guaranteed to be in the configured roster — parseFactoryMeta's allowlist
+// (a security feature) drops any model not in config.models, so tests must not
+// hardcode a specific id that a roster change (e.g. all-gpt-5.6-sol) would unlist.
+const ROSTER_MODEL = Object.values(config.models)[0]!;
 
 describe("depends_on / touches round-trip", () => {
   test("render→parse preserves both array keys", () => {
@@ -91,9 +97,9 @@ describe("preconditions (Gap 4) round-trip through the meta block", () => {
   });
 
   test("preconditions round-trip alongside repo/type/model/merge/depends_on/touches", () => {
-    const meta: FactoryMeta = { repo: "acme/w", type: "task", model: "sonnet", merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] };
+    const meta: FactoryMeta = { repo: "acme/w", type: "task", model: ROSTER_MODEL, merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] };
     const parsed = parseFactoryMeta(`${renderFactoryMeta(meta)}\n\nbody`);
-    expect(parsed).toMatchObject({ repo: "acme/w", type: "task", model: "sonnet", merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] });
+    expect(parsed).toMatchObject({ repo: "acme/w", type: "task", model: ROSTER_MODEL, merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"] });
   });
 
   test("withFactoryMeta strips an embedded block that tried to inject a precondition (injection-safety)", () => {
