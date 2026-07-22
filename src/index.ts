@@ -12,7 +12,7 @@ import { postMergeTick } from "./postmerge.ts";
 import { runIntake } from "./intake.ts";
 import { bootstrapProject } from "./bootstrap.ts";
 import { EPIC_LABEL, INTAKE_LABEL, BOOTSTRAP_LABEL } from "./linear.ts";
-import { parseFactoryMeta } from "./meta.ts";
+import { parseFactoryMeta, resolveTicketRoute } from "./meta.ts";
 import { selectRunnable, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
@@ -54,8 +54,29 @@ let draining = false;
 // any candidate whose globs would overlap. .size/.has/.delete are unchanged.
 const inFlight = new Map<string, string[]>();
 
+// Runtime orphan sweep (B3/B5 audit improvement #5): recoverOrphanedClaims was
+// startup-only, so an issue that went invisibly-in-flight mid-run (e.g. a
+// mutation failure that left the Executing label attached with nothing
+// tracking it in-process) stayed stuck until the daemon happened to restart.
+// Re-running the same recovery periodically — excluding THIS process's own
+// live inFlight claims — converts that into self-healing without risking a
+// genuinely-running claim being reset out from under itself. Cadence is ticks,
+// not wall-clock, so it scales with however often tick() actually runs (fast
+// idle polling vs. slower busy polling both eventually hit the sweep).
+const ORPHAN_SWEEP_EVERY_N_TICKS = 20;
+let tickCount = 0;
+
+async function sweepOrphanedClaims(): Promise<void> {
+  const recovered = await recoverOrphanedClaims(new Set(inFlight.keys())).catch(() => [] as string[]);
+  if (recovered.length > 0) console.log(`[recover] runtime sweep reset ${recovered.length} orphaned claim(s) not tracked by this process: ${recovered.join(", ")}`);
+}
+
 async function tick(): Promise<boolean> {
   bus.emit({ type: "tick_started" });
+  tickCount += 1;
+  if (tickCount % ORPHAN_SWEEP_EVERY_N_TICKS === 0) {
+    await sweepOrphanedClaims().catch((error) => console.error(`[recover] runtime sweep failed: ${error instanceof Error ? error.message : error}`));
+  }
   const queue = await fetchQueue();
   if (queue.length === 0) {
     bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 });
@@ -70,15 +91,23 @@ async function tick(): Promise<boolean> {
   // slots or starve the FIFO head (C6).
   // Factory-Epic tickets route to the PLAN stage (one per tick bounds spend);
   // their children arrive as ordinary tickets on later ticks (plan v1.1).
-  const isEpic = (i: { labels: string[]; description: string }) => i.labels.includes(EPIC_LABEL) || parseFactoryMeta(i.description).type === "epic";
   // Gap-5 bookends: an idea ticket routes to intake authoring (rough idea → full
   // epic contract, interviewing only on genuine ambiguity); a bootstrap ticket
   // routes to project bootstrap (idea → private repo → green scaffold). Both run
   // BEFORE the epic branch and are excluded from the eligible pipeline loop —
   // they upgrade/scaffold in place rather than flowing through implement→PR.
-  const isIdea = (i: { labels: string[]; description: string }) => i.labels.includes(INTAKE_LABEL) || parseFactoryMeta(i.description).type === "idea";
-  const isBootstrap = (i: { labels: string[]; description: string }) => i.labels.includes(BOOTSTRAP_LABEL) || parseFactoryMeta(i.description).type === "bootstrap";
-  const special = (i: { labels: string[]; description: string }) => isEpic(i) || isIdea(i) || isBootstrap(i);
+  // B5: routing is resolved through resolveTicketRoute (meta.ts), which treats
+  // the factory META block as AUTHORITATIVE over labels when it declares
+  // epic/idea/bootstrap — so a ticket whose meta was rewritten to type:epic but
+  // whose Factory-Intake label lingered (a swallowed removeLabel failure, e.g.
+  // intake.ts ~193) still routes to exactly one bookend instead of being
+  // excluded from every one of them and silently skipped forever.
+  const routeOf = (i: { labels: string[]; description: string }) => resolveTicketRoute(i.description,
+    { epic: i.labels.includes(EPIC_LABEL), idea: i.labels.includes(INTAKE_LABEL), bootstrap: i.labels.includes(BOOTSTRAP_LABEL) });
+  const isEpic = (i: { labels: string[]; description: string }) => routeOf(i) === "epic";
+  const isIdea = (i: { labels: string[]; description: string }) => routeOf(i) === "idea";
+  const isBootstrap = (i: { labels: string[]; description: string }) => routeOf(i) === "bootstrap";
+  const special = (i: { labels: string[]; description: string }) => routeOf(i) !== null;
 
   // One heavy bookend op of each kind per tick (bounds spend, like the epic).
   // Bootstrap takes precedence over idea/epic when a ticket is somehow both.

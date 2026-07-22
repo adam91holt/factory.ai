@@ -9,7 +9,9 @@ import { bus, type FactoryEvent } from "./events.ts";
 // endpoint that accepts a JSON POST body works) on the handful of events that
 // mean "a human should look at this now": issue_needs_human, run_finished
 // {outcome: parked}, deploy_finished{reverted: true}, tick_finished{error},
-// and drain_entered (kill switch or spend cap).
+// drain_entered (kill switch or spend cap), and park_mutation_failed (B3 —
+// park's own retried Linear mutations still failed; the ticket may be
+// stranded).
 //
 // Every field this module sends is either a fixed label or an event field that
 // was ALREADY redacted at emit time (loop.ts / postmerge.ts / index.ts /
@@ -43,6 +45,12 @@ export function toAlertPayload(e: FactoryEvent): AlertPayload | null {
       return { event: e.type, message: `tick error: ${e.error}`, at: e.at };
     case "drain_entered":
       return { event: e.type, message: `drain mode entered (${e.trigger}): ${e.reason}`, at: e.at };
+    case "park_mutation_failed":
+      // B3: park()'s own retried mutations still failed — the ticket may be
+      // stranded (Executing label / missing Parked label). Always alerts; this
+      // is exactly the "invisible in-flight forever" failure mode T5 exists to
+      // surface.
+      return { event: e.type, message: `${e.issueKey} STRANDED after park: ${e.failures.join("; ")}`, at: e.at };
     default:
       return null;
   }

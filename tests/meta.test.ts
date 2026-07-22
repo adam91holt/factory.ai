@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, type FactoryMeta } from "../src/meta.ts";
+import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, type FactoryMeta } from "../src/meta.ts";
 import { config } from "../src/config.ts";
 
 // A model guaranteed to be in the configured roster — parseFactoryMeta's allowlist
@@ -134,6 +134,51 @@ describe("type: idea / bootstrap (Gap 5) parse only at offset 0", () => {
 
   test("an unknown type value is dropped (only the four known types)", () => {
     expect(parseFactoryMeta("<!-- factory\ntype: sneaky\n-->").type).toBeUndefined();
+  });
+});
+
+// B5: the router (index.ts) must treat the META block as AUTHORITATIVE over
+// stale labels — the exact fix for a ticket that is BOTH isIdea (label) and
+// isEpic (meta) because intake.ts's removeLabel(INTAKE_LABEL) failed silently
+// after the description rewrite. Before this fix, index.ts's isEpic/isIdea
+// were independent `label OR meta` checks, so such a ticket satisfied both and
+// was excluded from every routing find() — skipped forever.
+describe("resolveTicketRoute (B5: meta authoritative over stale labels)", () => {
+  const noLabels = { epic: false, idea: false, bootstrap: false };
+
+  test("meta type:epic wins even when the stale Factory-Intake label lingers", () => {
+    const desc = "<!-- factory\ntype: epic\n-->\n\nbody";
+    expect(resolveTicketRoute(desc, { ...noLabels, idea: true })).toBe("epic");
+  });
+
+  test("meta type:idea wins even when a stale Factory-Epic label lingers", () => {
+    const desc = "<!-- factory\ntype: idea\n-->\n\nbody";
+    expect(resolveTicketRoute(desc, { ...noLabels, epic: true })).toBe("idea");
+  });
+
+  test("meta type:bootstrap wins over a stale Factory-Epic label", () => {
+    const desc = "<!-- factory\ntype: bootstrap\n-->\n\nbody";
+    expect(resolveTicketRoute(desc, { ...noLabels, epic: true })).toBe("bootstrap");
+  });
+
+  test("no meta block at all → labels alone decide (unchanged pre-fix behavior)", () => {
+    expect(resolveTicketRoute("plain ticket, no meta block", { ...noLabels, epic: true })).toBe("epic");
+    expect(resolveTicketRoute("plain ticket, no meta block", { ...noLabels, idea: true })).toBe("idea");
+    expect(resolveTicketRoute("plain ticket, no meta block", { ...noLabels, bootstrap: true })).toBe("bootstrap");
+  });
+
+  test("meta type:task (an ordinary ticket) with no special labels → null (not special)", () => {
+    const desc = "<!-- factory\ntype: task\nrepo: acme/w\n-->\n\nbody";
+    expect(resolveTicketRoute(desc, noLabels)).toBeNull();
+  });
+
+  test("neither meta nor labels declare a type → null", () => {
+    expect(resolveTicketRoute("plain ticket", noLabels)).toBeNull();
+  });
+
+  test("a start-anchor violation (meta buried in prose) is ignored by parseFactoryMeta, so labels decide", () => {
+    const desc = "Some prose.\n\n<!-- factory\ntype: epic\n-->\n\nmore";
+    expect(resolveTicketRoute(desc, { ...noLabels, idea: true })).toBe("idea");
   });
 });
 

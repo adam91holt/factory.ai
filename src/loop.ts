@@ -591,6 +591,37 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
   }
 }
 
+/** Bounded retry with exponential backoff for a single side-effecting mutation.
+ *  B3: a Linear outage mid-run must not strand a ticket — park()'s own
+ *  mutations (label / transition / release) used to be one-shot `.catch(() =>
+ *  {})`, so an outage that lines up with the SAME park() call that reports it
+ *  also swallows every attempt to record the park, leaving the ticket
+ *  Executing-labeled and invisible until a human notices or the daemon
+ *  restarts. `sleep` is injectable so tests never wait on a real timer; the
+ *  default schedule (3 attempts, 1s/2s backoff) absorbs a transient blip
+ *  without holding up the pipeline for long. Never throws — total exhaustion
+ *  is reported via the returned `ok:false`, not an exception, so callers
+ *  decide how loudly to surface it. */
+export async function retryMutation(
+  fn: () => Promise<unknown>,
+  opts: { attempts?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const attempts = opts.attempts ?? 3;
+  const baseDelayMs = opts.baseDelayMs ?? 1000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let lastError = "unknown error";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await fn();
+      return { ok: true };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (attempt < attempts - 1) await sleep(baseDelayMs * 2 ** attempt);
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
 async function park(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
   // Caps and failures PARK, never destroy: worktree kept, Factory-Parked label
   // keeps it out of the queue until a human clears it (C6); comment best-effort,
@@ -613,9 +644,28 @@ async function park(issue: linear.Issue, repo: string, stages: StageResult[], re
     await post(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal park comment failed too: ${e2}`));
   }
   if (!config.dryRun) {
-    await linear.addLabel(issue, linear.PARKED_LABEL).catch((e) => console.error(`[${issue.identifier}] park label failed: ${e}`));
-    await linear.transition(issue, "queue").catch(() => {});
-    await linear.release(issue);
+    // B3: retry each mutation with bounded backoff before giving up — an outage
+    // that swallows all three .catch(()=>{})s used to strand the ticket
+    // Executing-labeled with no Parked label, invisible until a restart.
+    const labelResult = await retryMutation(() => linear.addLabel(issue, linear.PARKED_LABEL));
+    const transitionResult = await retryMutation(() => linear.transition(issue, "queue"));
+    const releaseResult = await retryMutation(() => linear.removeLabel(issue, linear.EXECUTING_LABEL));
+    const failures = [
+      ...(labelResult.ok ? [] : [`Parked label: ${labelResult.error}`]),
+      ...(transitionResult.ok ? [] : [`queue transition: ${transitionResult.error}`]),
+      ...(releaseResult.ok ? [] : [`Executing-label release: ${releaseResult.error}`]),
+    ];
+    if (failures.length > 0) {
+      // Every retry was exhausted — the ticket may be STRANDED (still
+      // Executing-labeled and/or not visibly Parked). Log loudly with a
+      // greppable prefix AND put it on the bus (alerts.ts always alerts on
+      // this) so it is observable instead of silently lost — the runtime
+      // orphan sweep (index.ts) and startup recoverOrphanedClaims are the
+      // eventual self-heal for the Executing-label half of this.
+      const redactedFailures = failures.map((f) => redactSecrets(f).clean.slice(0, 300));
+      console.error(`[${issue.identifier}] STRANDED: park mutations failed after retries — ${redactedFailures.join("; ")}`);
+      bus.emit({ type: "park_mutation_failed", issueKey: issue.identifier, failures: redactedFailures });
+    }
   }
   console.error(`[${issue.identifier}] parked: ${reason}`);
   // Distill the park into a durable, repo-scoped lesson (best-effort, never

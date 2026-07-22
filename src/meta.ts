@@ -112,6 +112,34 @@ export function parseFactoryMeta(description: string): FactoryMeta {
   return meta;
 }
 
+/** B5: which bookend (if any) a ticket routes to — epic → planner, idea →
+ *  intake authoring, bootstrap → project bootstrap, or null for an ordinary
+ *  ticket. The factory META block is AUTHORITATIVE over labels when it
+ *  declares one of these three types: before this fix, index.ts computed
+ *  isEpic/isIdea/isBootstrap as independent `label OR meta` checks, so a
+ *  ticket whose meta was rewritten to type:epic but whose stale
+ *  Factory-Intake label lingered (e.g. intake.ts's removeLabel(INTAKE_LABEL)
+ *  failing after the description rewrite, swallowed at intake.ts ~193)
+ *  satisfied BOTH isEpic and isIdea — and was excluded from every routing
+ *  `find()` (each requires the others false), silently skipped forever. Here,
+ *  a meta type of epic/idea/bootstrap always wins outright; only when the
+ *  block is absent or names the ordinary "task" type do labels decide (the
+ *  unchanged pre-fix behavior for tickets with no meta block at all, e.g. a
+ *  human manually applying Factory-Epic). */
+export type TicketRoute = "epic" | "idea" | "bootstrap" | null;
+
+export function resolveTicketRoute(
+  description: string,
+  labels: { epic: boolean; idea: boolean; bootstrap: boolean },
+): TicketRoute {
+  const metaType = parseFactoryMeta(description).type;
+  if (metaType === "epic" || metaType === "idea" || metaType === "bootstrap") return metaType;
+  if (labels.epic) return "epic";
+  if (labels.idea) return "idea";
+  if (labels.bootstrap) return "bootstrap";
+  return null;
+}
+
 /** Render a metadata block to prepend to a ticket description. Omits empty keys
  * (scalar undefined/"" AND empty arrays) so a child with no DAG data renders a
  * block byte-identical to today's — the backward-compat guarantee. Array values

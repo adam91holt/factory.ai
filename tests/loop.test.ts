@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines, budgetExpired, budgetExpiredReason } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -222,6 +222,62 @@ describe("budgetExpiredReason", () => {
   test("not draining: distinguishes wall-clock cap from budget exhaustion by deadline alone", () => {
     expect(budgetExpiredReason(Date.now(), past, false)).toBe("wall-clock cap reached");
     expect(budgetExpiredReason(Date.now(), future, false)).toBe("issue budget exhausted");
+  });
+});
+
+// B3: park's own Linear mutations (label / transition / release) used to be
+// one-shot `.catch(() => {})`, so a transient Linear outage during THAT SAME
+// park() call silently stranded the ticket (Executing label attached, no
+// Parked label). retryMutation is the bounded-backoff wrapper closing that
+// gap; `sleep` is injected so these tests never wait on a real timer.
+describe("retryMutation (B3: bounded retry for park's own mutations)", () => {
+  test("succeeds on the first try — never sleeps, never retries", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(async () => { calls += 1; }, { sleep: async (ms) => { sleeps.push(ms); } });
+    expect(result).toEqual({ ok: true });
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("recovers on a later attempt after transient failures, with exponential backoff between tries", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(
+      async () => { calls += 1; if (calls < 3) throw new Error(`transient ${calls}`); },
+      { attempts: 5, baseDelayMs: 100, sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    expect(result).toEqual({ ok: true });
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([100, 200]); // doubles each attempt: 100 * 2^0, 100 * 2^1
+  });
+
+  test("exhausting every attempt reports ok:false with the LAST error — never throws", async () => {
+    let calls = 0;
+    const result = await retryMutation(
+      async () => { calls += 1; throw new Error(`fail ${calls}`); },
+      { attempts: 3, baseDelayMs: 1, sleep: async () => {} },
+    );
+    expect(result).toEqual({ ok: false, error: "fail 3" });
+    expect(calls).toBe(3);
+  });
+
+  test("attempts:1 tries exactly once and never sleeps, even on failure", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(
+      async () => { calls += 1; throw new Error("nope"); },
+      { attempts: 1, sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    expect(result).toEqual({ ok: false, error: "nope" });
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("a non-Error throw is stringified rather than crashing", async () => {
+    const result = await retryMutation(async () => { throw "plain string failure"; },
+      { attempts: 1, sleep: async () => {} });
+    expect(result).toEqual({ ok: false, error: "plain string failure" });
   });
 });
 

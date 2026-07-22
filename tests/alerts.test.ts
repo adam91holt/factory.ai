@@ -58,6 +58,11 @@ describe("toAlertPayload — which events alert", () => {
     expect(toAlertPayload(budgetCap)?.message).toBe("drain mode entered (budget_cap): over cap");
   });
 
+  test("park_mutation_failed always alerts (B3: park's retried mutations still failed)", () => {
+    const e = stamp({ type: "park_mutation_failed", issueKey: "FAC-7", failures: ["Parked label: HTTP 503", "queue transition: HTTP 503"] });
+    expect(toAlertPayload(e)?.message).toBe("FAC-7 STRANDED after park: Parked label: HTTP 503; queue transition: HTTP 503");
+  });
+
   test("events with no alert mapping return null", () => {
     expect(toAlertPayload(stamp({ type: "tick_started" }))).toBeNull();
     expect(toAlertPayload(stamp({ type: "run_stage_finished", issueKey: "FAC-1", stage: "implementer",

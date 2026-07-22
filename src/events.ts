@@ -110,7 +110,15 @@ export type FactoryEventBody =
   // funnel through control.ts's enterDrain — this is the ONE event a human (or
   // the spend cap) entering drain mode ever emits, so alerts.ts has a single
   // trigger to watch. `reason` is already bounded/plain text (never raw input).
-  | { type: "drain_entered"; trigger: "kill_switch" | "budget_cap"; reason: string };
+  | { type: "drain_entered"; trigger: "kill_switch" | "budget_cap"; reason: string }
+  // B3: park's own Linear mutations (Parked label / queue transition / Executing-
+  // label release) exhausted their bounded retries during processIssue's park()
+  // — the ticket may now be STRANDED (still Executing-labeled and/or missing its
+  // Parked label) until a human notices or a later orphan sweep recovers it
+  // (recoverOrphanedClaims). Daemon-only addition, like drain_entered before it —
+  // not mirrored to the UI's copy of this union; it's an operability signal for
+  // logs/alerts, not something the dashboard renders today.
+  | { type: "park_mutation_failed"; issueKey: string; failures: string[] };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };
