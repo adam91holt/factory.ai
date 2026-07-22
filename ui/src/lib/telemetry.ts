@@ -13,6 +13,7 @@ export interface Telemetry {
     cacheRead: number;
     cacheWrite: number;
     prOpen: number;
+    merged: number;
     parked: number;
     needsHuman: number;
     aborted: number;
@@ -45,7 +46,7 @@ export interface Telemetry {
     cacheRead: number;
     runs: number;
   }>;
-  outcomes: { pr_open: number; planned: number; parked: number; needs_human: number; aborted: number };
+  outcomes: { pr_open: number; merged: number; planned: number; parked: number; needs_human: number; aborted: number };
   parkReasons: Array<{ reason: string; count: number }>;
   costPerIssue: Array<{ issueKey: string; costUsd: number; runs: number }>;
 }

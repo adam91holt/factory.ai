@@ -94,8 +94,11 @@ export function BoardPage() {
   const executing = runs
     .filter((r) => r.status === "active")
     .sort((a, b) => a.startedAt - b.startedAt);
+  // B16: "merged" is delivered too — it's a PR that the ladder both opened AND
+  // merged with zero human intervention, so it belongs in the same lane as an
+  // open-awaiting-human-merge PR, not off in Board limbo.
   const delivered = runs
-    .filter((r) => r.status === "pr_open")
+    .filter((r) => r.status === "pr_open" || r.status === "merged")
     .sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0));
   const stale = boardAt !== null && now - boardAt > 2 * watchInterval * 1000;
 

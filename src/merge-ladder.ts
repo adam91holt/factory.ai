@@ -121,8 +121,11 @@ export function isSelfRepo(repo: string): boolean {
 }
 
 /** Is a repo enrolled in the ladder at all? MERGE_LADDER_REPOS ∪ the retained
- * MERGE_AUTO_REPOS (which now enroll at ceiling "auto" but still start shadow). */
-function isEnrolled(repo: string): boolean {
+ * MERGE_AUTO_REPOS (which now enroll at ceiling "auto" but still start shadow).
+ * Exported (B9) so db.ts can gate the earning WRITE path on it too — not just
+ * effectiveMergeTier's READ path — so a repo cannot accrue a clean streak
+ * before a human opts it in. */
+export function isEnrolled(repo: string): boolean {
   return config.mergeLadder.enrolled.includes(repo) || config.autoMergeRepos.includes(repo);
 }
 

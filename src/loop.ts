@@ -12,7 +12,7 @@ import { getStageSession, recordStageSession, clearStageSession, getLadderState,
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
-import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
+import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./events.ts";
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
@@ -542,9 +542,30 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       reasons: deferForDeps ? [...baseDecision.reasons, "deferred: ticket declares depends_on (steward owns epic merge ordering)"] : baseDecision.reasons,
     };
 
+    // Gap-4: re-validate the premise before recording an earning decision or
+    // merging — a PR a human closed/merged since createPr must never advance the
+    // streak or be re-merged. Runs before the single run_finished emit so a stale
+    // premise yields exactly one (aborted) terminal event, not two.
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "merge decision"); return; }
+
+    // B16: attempt the merge HERE — before building/emitting the run's
+    // terminal report/event — instead of after. mergePr is a synchronous
+    // spawnSync call (repos.ts), so moving it a few statements earlier costs
+    // nothing, but it means run_finished/telemetry records what ACTUALLY
+    // happened (an evidence-gated, zero-human-touch merge) instead of a
+    // "pr_open" stamped before the merge was even attempted — the gap that
+    // made the "≤1 human intervention" milestone unmeasurable. The
+    // Linear-visible comment sequence further down is unchanged: the merge
+    // result is only ANNOUNCED to the ticket later, in its usual place.
+    let merged: { ok: boolean; out: string } | null = null;
+    if (!config.dryRun && decision.act && prUrl) {
+      merged = mergePr(repo, prUrl);
+    }
+    const outcome: RunOutcome = merged?.ok ? "merged" : needsHuman ? "needs_human" : "pr_open";
+
     const report = buildReport({
       issueKey: issue.identifier, prUrl,
-      outcome: needsHuman ? "needs_human" : "pr_open",
+      outcome,
       reason: needsHuman ? holdReason : undefined,
       stages, gates: results, gateStrength: summary.strength, guardedPaths: guarded,
       reviewFindingsSummary: fixer.text.slice(0, 1500),
@@ -552,14 +573,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       ...(verificationReport ? { verification: verificationReport } : {}),
     });
 
-    // Gap-4: re-validate the premise before recording an earning decision or
-    // merging — a PR a human closed/merged since createPr must never advance the
-    // streak or be re-merged. Runs before the single run_finished emit so a stale
-    // premise yields exactly one (aborted) terminal event, not two.
-    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "merge decision"); return; }
-
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
-      outcome: needsHuman ? "needs_human" : "pr_open",
+      outcome,
       ...(needsHuman ? { reason: holdReason.slice(0, 500) } : {}),
       prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
@@ -593,9 +608,10 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         browser, security: securityVerdict, cleanStreak: state.cleanStreak, reasons: decision.reasons });
       if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
-      } else if (decision.act && prUrl) {
-        // The repo has EARNED an auto-merge tier and every gate is strong+clean.
-        const merged = mergePr(repo, prUrl);
+      } else if (decision.act && prUrl && merged) {
+        // The repo EARNED an auto-merge tier and every gate was strong+clean —
+        // the merge itself already ran (above, before run_finished); this just
+        // announces the already-known outcome to the ticket.
         if (merged.ok) {
           await post(issue, `${linear.SENTINEL}\n\n**Auto-merged** (merge ladder · tier ${tier}): ${prUrl}`).catch(() => {});
           const moved = await linear.transition(issue, "done");
@@ -615,7 +631,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       }
       await linear.release(issue);
     }
-    console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : "pr_open"} ${prUrl ?? "(dry-run)"}`);
+    console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : outcome} ${prUrl ?? "(dry-run)"}`);
   } catch (error) {
     await park(issue, repo, stages, error instanceof Error ? error.message : String(error));
   }

@@ -9,7 +9,9 @@ import type { GateResult } from "./verify.ts";
 export interface ReportInput {
   issueKey: string;
   prUrl: string | null;
-  outcome: "pr_open" | "parked" | "needs_human" | "blocked" | "aborted";
+  // B16: "merged" = mergePr actually succeeded (zero human intervention),
+  // distinct from "pr_open" (a human still has to merge it) — see events.ts.
+  outcome: "pr_open" | "merged" | "parked" | "needs_human" | "blocked" | "aborted";
   reason?: string;
   stages: StageResult[];
   gates: GateResult[];
@@ -27,6 +29,11 @@ export function buildReport(input: ReportInput): string {
 
   if (input.outcome === "pr_open" && input.prUrl) {
     lines.push(`PR ready for review: ${input.prUrl}`, "");
+  } else if (input.outcome === "merged" && input.prUrl) {
+    // The tier-specific "**Auto-merged** (merge ladder · tier X)" comment
+    // (loop.ts, posted right after this report) carries the full detail —
+    // keep this line short so the two comments don't read as duplicates.
+    lines.push(`PR merged: ${input.prUrl}`, "");
   } else {
     lines.push(`**Outcome:** ${input.outcome}${input.reason ? ` — ${input.reason}` : ""}`, "");
   }
