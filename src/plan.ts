@@ -7,6 +7,7 @@ import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.t
 import { parseFactoryMeta, withFactoryMeta } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
+import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
@@ -17,23 +18,120 @@ import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 //     → sub-issues created under the parent; parent labeled Factory-Planned
 //       (tracking-only, filtered from the queue forever).
 
-interface ChildSpec {
+export interface ChildSpec {
   title: string;
   description: string;
+  ordinal: number;        // NN from the filename — dependency edges are by ordinal
+  dependsOn: number[];    // ordinals of siblings this child must follow (## Depends-on)
+  touches: string[];      // path globs this child will modify (## Touches) — the mutex key
+}
+
+/** Extract the body of a "## <heading>" section (case-insensitive) up to the
+ * next "## " heading. Returns "" when the section is absent — the DAG sections
+ * are optional, so old decomposer output (no ## Depends-on / ## Touches) parses
+ * to empty, keeping the change backward-compatible. */
+function extractSection(body: string, heading: string): string {
+  const lines = body.split("\n");
+  const start = lines.findIndex((l) => l.trim().toLowerCase() === `## ${heading}`.toLowerCase());
+  if (start === -1) return "";
+  const out: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i]!)) break;
+    out.push(lines[i]!);
+  }
+  return out.join("\n").trim();
 }
 
 /** Children are read from files the decomposer WROTE (one .md per child,
- * first line "# Title") — no giant-JSON-in-result-text to truncate. */
-function readChildren(dir: string): ChildSpec[] {
+ * first line "# Title") — no giant-JSON-in-result-text to truncate. Each file
+ * is named <NN>-<slug>.md; NN is the build-order ordinal that ## Depends-on
+ * edges reference. */
+export function readChildren(dir: string): ChildSpec[] {
   const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
-  const children = files.map((f) => {
+  const children = files.map((f, i) => {
     const body = readFileSync(join(dir, f), "utf8").trim();
     const lines = body.split("\n");
     const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
-    return { title, description: lines.slice(1).join("\n").trim() };
+    const description = lines.slice(1).join("\n").trim();
+    // Ordinal from the NN filename prefix (build order); fall back to sorted
+    // position when a file lacks a numeric prefix so ordinals stay unique.
+    const prefix = f.match(/^0*(\d+)/);
+    const ordinal = prefix ? Number(prefix[1]) : i + 1;
+    // ## Depends-on: any digit runs are ordinals (tolerant of "01, 02", bullets,
+    // spaces). ## Touches: comma/newline/bullet-separated globs.
+    const dependsOn = (extractSection(description, "Depends-on").match(/\d+/g) ?? []).map(Number);
+    const touches = extractSection(description, "Touches")
+      .split(/[\n,]/).map((s) => s.replace(/^[-*]\s*/, "").replace(/^`|`$/g, "").trim()).filter((s) => s.length > 0);
+    return { title, description, ordinal, dependsOn, touches };
   }).filter((c) => c.title.length > 0 && c.description.length > 50);
   if (children.length < 2 || children.length > 6) throw new Error(`decomposer produced ${children.length} valid child files (expected 2-6)`);
+  // Validate the DAG fail-closed: every edge must point to an EXISTING,
+  // STRICTLY-LOWER ordinal (no self-ref, no forward-ref, no missing ref).
+  // Backward-only edges are acyclic by construction. A violation throws → the
+  // planner's catch parks the epic rather than creating a broken dependency web.
+  const ordinals = new Set(children.map((c) => c.ordinal));
+  for (const c of children) {
+    for (const dep of c.dependsOn) {
+      if (dep === c.ordinal) throw new Error(`child ${c.ordinal} depends on itself`);
+      if (dep >= c.ordinal) throw new Error(`child ${c.ordinal} has a forward/equal dependency on ${dep} (edges must reference lower-numbered files)`);
+      if (!ordinals.has(dep)) throw new Error(`child ${c.ordinal} depends on missing ordinal ${dep}`);
+    }
+  }
   return children;
+}
+
+/** Create the children in ascending ordinal order, resolving each child's
+ * ordinal dependencies to the Linear identifiers of the already-created lower
+ * ordinals, and stamping the factory meta block (repo, type:task, optional
+ * model/depends_on/touches). Pure over the `create` callback so the
+ * ordinal→identifier resolution and DAG-aware stamping are unit-testable
+ * without Linear. Because edges only ever point to strictly-lower ordinals,
+ * every dependency is already in byOrdinal when its dependent is stamped —
+ * single-pass, no create-then-update window. Returns the created identifiers in
+ * creation (ascending-ordinal) order.
+ *
+ * Gap 1 merge-race fix: the scheduler's file-mutex (busyTouches/globsOverlap)
+ * only defers overlapping siblings while they are concurrently in `inFlight`. A
+ * child leaves inFlight the moment it opens a PR, but on a human-merge repo
+ * (autoMergeRepos is empty by default, incl. factory.ai) that PR sits UNMERGED
+ * in review — so an overlapping sibling admitted on a later tick would branch
+ * from an origin/main that lacks its work, re-opening the very duplicate-file
+ * race (FAC-15/16/18) the mutex exists to kill, merely deferred from session-
+ * time to merge-time. So we serialize overlap at the DAG layer too: any child
+ * whose ## Touches overlap an EARLIER-ordinal sibling's gains an implicit
+ * depends_on edge to it. The completion-gated frontier then holds the later
+ * child until the earlier one reaches a terminal state (merged=completed, or
+ * canceled), not merely until it leaves inFlight. Edges still point only to
+ * strictly-lower ordinals, so acyclicity is preserved. */
+export async function createChildren(
+  children: ChildSpec[],
+  base: { repo: string; model?: string },
+  create: (child: ChildSpec, stampedDescription: string) => Promise<string>,
+): Promise<string[]> {
+  const created: string[] = [];
+  const byOrdinal = new Map<number, string>();
+  const sorted = [...children].sort((a, b) => a.ordinal - b.ordinal);
+  for (const child of sorted) {
+    // Union the declared edges with implicit overlap edges to lower-ordinal
+    // siblings (globsOverlap is empty-list-safe, so a child with no ## Touches
+    // adds none and attracts none — unchanged behavior). De-dup and sort so a
+    // sibling that is BOTH an explicit dep and an overlap dep is listed once.
+    const overlapOrdinals = sorted
+      .filter((s) => s.ordinal < child.ordinal && globsOverlap(child.touches, s.touches))
+      .map((s) => s.ordinal);
+    const depOrdinals = [...new Set([...child.dependsOn, ...overlapOrdinals])].sort((a, b) => a - b);
+    const dependsIds = depOrdinals.map((o) => byOrdinal.get(o)!); // all lower ordinals already created
+    const stamped = withFactoryMeta(child.description, {
+      repo: base.repo, type: "task",
+      ...(base.model ? { model: base.model } : {}),
+      ...(dependsIds.length ? { depends_on: dependsIds } : {}),
+      ...(child.touches.length ? { touches: child.touches } : {}),
+    });
+    const id = await create(child, stamped);
+    byOrdinal.set(child.ordinal, id);
+    created.push(id);
+  }
+  return created;
 }
 
 function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
@@ -89,10 +187,11 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
       renderPrompt("decomposer", { repo, spec, brief: untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`) },
         [
           "You are the decomposer in a software factory's planning stage. Using the epic and the scout's research brief, produce 2-6 child tickets that TOGETHER deliver the epic. HARD RULES:",
-          '- Every child MUST be independently implementable and ALL children may run IN PARALLEL — declare a "## Area" section listing the file paths/directories that child owns, and areas MUST NOT overlap. Anything inherently sequential belongs merged into one child.',
-          `- Every child description MUST contain exactly these sections: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo}), ## Verifications (Automated/Manual/Visual), ## Area, and optionally ## Implementation approach.`,
+          '- The children form a DAG, not a flat parallel list. For any child that MUST follow another, declare a "## Depends-on" section listing the ordinals of the files it depends on (reference LOWER-NUMBERED files only, e.g. "01, 02"). A child with no ## Depends-on runs as soon as capacity allows.',
+          '- Declare a "## Touches" section listing EVERY path glob the child will modify (e.g. "src/foo/**, src/bar.ts"). Any child whose ## Touches overlap an EARLIER-numbered sibling\'s is given an implicit build-order dependency on it: the later child does not start until the earlier one has MERGED, so overlap costs parallelism (not correctness) — number overlapping children in the order they should build. You MUST declare touches honestly and completely: an omitted path reintroduces the sibling file-race. Prefer honest overlap (safe, serialized) over false independence.',
+          `- Every child description MUST contain exactly these sections: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo}), ## Verifications (Automated/Manual/Visual), ## Touches, optionally ## Depends-on, and optionally ## Implementation approach.`,
           "- Size each child to fit one implementer session (~40 turns / 45 min).",
-          'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
+          'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
           "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
         ].join("\n")),
       { model: config.models.planner, cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
@@ -110,11 +209,8 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // type:task, and the epic's model (per-epic override propagates to children).
     // This is why children can never fail repo-parse or the epic-race again.
     const epicModel = parseFactoryMeta(issue.description).model;
-    const created: string[] = [];
-    for (const child of children) {
-      const stamped = withFactoryMeta(child.description, { repo, type: "task", ...(epicModel ? { model: epicModel } : {}) });
-      created.push(await linear.createSubIssue(issue, child.title, stamped));
-    }
+    const created = await createChildren(children, { repo, model: epicModel },
+      (child, stamped) => linear.createSubIssue(issue, child.title, stamped));
 
     await linear.postComment(issue, [
       linear.SENTINEL, "",

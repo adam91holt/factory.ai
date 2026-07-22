@@ -13,7 +13,7 @@ export interface ReportInput {
   reason?: string;
   stages: StageResult[];
   gates: GateResult[];
-  gateStrength: "none" | "weak" | "real";
+  gateStrength: "none" | "weak" | "real" | "strong";
   guardedPaths: string[];
   reviewFindingsSummary?: string;
   designReview?: string;   // taste-gate findings when TASTE: fail persisted

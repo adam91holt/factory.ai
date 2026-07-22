@@ -14,6 +14,20 @@ export const NEEDS_HUMAN_LABEL = "Factory-Needs-Human";
 export const EPIC_LABEL = "Factory-Epic";
 export const PLANNED_LABEL = "Factory-Planned";
 export const STEWARDED_LABEL = "Factory-Stewarded";
+// Gap-4: a ticket the freshness gate auto-resolved as stale (its goal already
+// exists in the world) is moved to Done AND labeled Factory-Stale so it never
+// requeues — added to every fetch skip-set below. Reversible: a human removes
+// the label (and reopens) to requeue.
+export const STALE_LABEL = "Factory-Stale";
+// Gap-5 bookend labels. INTAKE marks a rough-idea ticket the intake author is
+// turning into a full epic contract; BOOTSTRAP marks an idea→repo ticket the
+// bootstrap module owns. AWAITING_ANSWER marks an intake ticket that posted
+// clarifying questions and is waiting on the human — added to every fetch
+// skip-set below so an awaiting ticket does not re-loop through the interview
+// each tick (a human's answer comment + label removal requeues it).
+export const INTAKE_LABEL = "Factory-Intake";
+export const BOOTSTRAP_LABEL = "Factory-Bootstrap";
+export const AWAITING_ANSWER_LABEL = "Factory-Awaiting-Answer";
 export const SENTINEL = "🤖 **Factory report**";
 
 export class LinearRateLimited extends Error {
@@ -86,7 +100,7 @@ export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
     `query($team: String!) {
       issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "unstarted" } } }) { nodes { ${ISSUE_FIELDS} } }
     }`, { team: teamKey });
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
   return data.issues.nodes.map(toIssue)
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -114,7 +128,7 @@ export async function fetchQueue(): Promise<Issue[]> {
     { teams: config.teamKeys },
   );
   const all = data.issues.nodes.map(toIssue);
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL]);
+  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
   bus.emit({
     type: "queue_snapshot",
     issues: all.map((i) => ({
@@ -137,6 +151,39 @@ export async function fetchIssuesByStateType(stateType: string, teamKey: string)
       issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: $st } } }) {
         nodes { ${ISSUE_FIELDS} } } }`, { team: teamKey, st: stateType });
   return data.issues.nodes.map(toIssue);
+}
+
+/** Resolve a set of sibling identifiers (e.g. ["FAC-123","FAC-124"]) to their
+ * current state TYPE (identifier → "completed" | "started" | …). One GraphQL
+ * query filtering by team key + issue number; the returned identifier is
+ * authoritative so cross-team number collisions can't mismap. The scheduler
+ * calls this each tick to test the DAG frontier against LIVE Linear state (the
+ * stillOurs() freshness pattern generalized to dependencies — Gap 4). An
+ * identifier that resolves to nothing is simply absent from the map, which the
+ * scheduler treats as "not completed" (fail-closed). Tolerates the
+ * LinearRateLimited path like every other query — it throws up to tick()'s
+ * existing backoff. */
+export async function fetchStatesByIdentifiers(ids: string[]): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  // Parse TEAM-123 → { key, number }; drop anything malformed so a junk id
+  // never reaches the query. Collect the distinct team keys and numbers.
+  const numbers: number[] = [];
+  const teamKeys = new Set<string>();
+  for (const id of ids) {
+    const m = id.match(/^([A-Z][A-Z0-9]*)-(\d+)$/);
+    if (!m) continue;
+    teamKeys.add(m[1]!);
+    numbers.push(Number(m[2]!));
+  }
+  if (numbers.length === 0) return result;
+  const data = await gql<{ issues: { nodes: Array<{ identifier: string; state: { type: string } }> } }>(
+    `query($teams: [String!]!, $numbers: [Float!]!) {
+      issues(first: 100, filter: { team: { key: { in: $teams } }, number: { in: $numbers } }) {
+        nodes { identifier state { type } } } }`,
+    { teams: [...teamKeys], numbers },
+  );
+  for (const node of data.issues.nodes) result.set(node.identifier, node.state.type);
+  return result;
 }
 
 export async function getIssue(id: string): Promise<Issue> {
@@ -305,6 +352,28 @@ export async function createIssue(teamKey: string, title: string, description: s
 export async function postComment(issue: Issue, body: string): Promise<void> {
   await gql(`mutation($issueId: String!, $body: String!) {
     commentCreate(input: { issueId: $issueId, body: $body }) { success } }`, { issueId: issue.id, body });
+}
+
+/** Rewrite an issue's description (and optionally its title). The intake author
+ * (Gap 5) uses this to UPGRADE a rough-idea ticket into a full epic contract in
+ * place — the new description carries a start-anchored factory block stamping
+ * type:epic, so the next tick routes it to the planner. Title update is opt-in. */
+export async function updateIssueDescription(issue: Issue, description: string, title?: string): Promise<void> {
+  await gql(`mutation($id: String!, $description: String!, $title: String) {
+    issueUpdate(id: $id, input: { description: $description, title: $title }) { success } }`,
+    { id: issue.id, description, title: title ?? null });
+}
+
+/** Newest-last comment bodies on an issue (bounded). The intake author reads
+ * these on a re-run so a human's answers to its earlier QUESTIONS are seen; the
+ * bodies are UNTRUSTED (human/agent text) and delimited before reaching a model. */
+export async function fetchComments(issueId: string, limit = 30): Promise<string[]> {
+  const data = await gql<{ issue: { comments: { nodes: Array<{ body: string; createdAt: string }> } } }>(
+    `query($id: String!, $limit: Int!) { issue(id: $id) {
+      comments(first: $limit) { nodes { body createdAt } } } }`, { id: issueId, limit });
+  return data.issue.comments.nodes
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((c) => c.body);
 }
 
 /**

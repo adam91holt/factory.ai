@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { detectGates, gateSummary, type GateResult } from "../src/verify.ts";
+import { detectGates, gateSummary, isE2eGate, hasUiSurface, requiresBrowserEvidence, type GateResult } from "../src/verify.ts";
 import type { Workspace } from "../src/repos.ts";
 
 const gate = (name: string, passed: boolean | null, baselinePassed = passed !== null): GateResult =>
@@ -10,7 +10,7 @@ const gate = (name: string, passed: boolean | null, baselinePassed = passed !== 
 
 describe("gateSummary", () => {
   test("no gates at all → green with strength none", () => {
-    expect(gateSummary([])).toEqual({ green: true, strength: "none", failures: [] });
+    expect(gateSummary([])).toEqual({ green: true, strength: "none", failures: [], hasE2eGate: false });
   });
 
   test("all gates skipped (failed baseline) → strength none, still green", () => {
@@ -21,7 +21,7 @@ describe("gateSummary", () => {
 
   test("typecheck-only is a weak gate", () => {
     const s = gateSummary([gate("typecheck", true)]);
-    expect(s).toEqual({ green: true, strength: "weak", failures: [] });
+    expect(s).toEqual({ green: true, strength: "weak", failures: [], hasE2eGate: false });
   });
 
   test("a usable test gate upgrades strength to real", () => {
@@ -105,5 +105,121 @@ describe("detectGates", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("browser/e2e scripts are detected as gates (Gap 2)", () => {
+    const ws = withPackageJson({ "test:e2e": "playwright test", e2e: "playwright test", "test:browser": "playwright test", playwright: "playwright test" });
+    try {
+      const gates = detectGates(ws);
+      for (const g of ["test:e2e", "e2e", "test:browser", "playwright"]) expect(gates).toContain(g);
+    } finally {
+      rmSync(ws.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("isE2eGate", () => {
+  test("classifies the browser/e2e script names, exactly", () => {
+    for (const n of ["e2e", "test:e2e", "test:browser", "playwright"]) expect(isE2eGate(n)).toBe(true);
+  });
+  test("unit-test and unrelated gates are NOT e2e", () => {
+    for (const n of ["test", "test:ci", "test:unit", "typecheck", "build", "lint", "pretest:e2e", "test:e2e-utils"]) expect(isE2eGate(n)).toBe(false);
+  });
+});
+
+describe("gateSummary strength ladder (Gap 2)", () => {
+  test("a unit test gate alone is real, not strong", () => {
+    const s = gateSummary([gate("test", true)]);
+    expect(s.strength).toBe("real");
+    expect(s.hasE2eGate).toBe(false);
+  });
+
+  test("unit test + a passing e2e gate is strong", () => {
+    const s = gateSummary([gate("test", true), gate("test:e2e", true)]);
+    expect(s.strength).toBe("strong");
+    expect(s.hasE2eGate).toBe(true);
+    expect(s.green).toBe(true);
+  });
+
+  test("an e2e gate alone (no unit test) is real — a real test that drove the app", () => {
+    // Chosen rule: a passing/usable e2e gate is at least as strong as unit tests,
+    // so it lifts strength to "real"; "strong" additionally requires unit tests.
+    const s = gateSummary([gate("playwright", true)]);
+    expect(s.strength).toBe("real");
+    expect(s.hasE2eGate).toBe(true);
+  });
+
+  test("a FAILING e2e flips green but strength still reflects capability (strong)", () => {
+    const s = gateSummary([gate("test", true), gate("e2e", false)]);
+    expect(s.green).toBe(false);
+    expect(s.strength).toBe("strong");
+    expect(s.failures.map((f) => f.name)).toEqual(["e2e"]);
+  });
+
+  test("e2e gate + only weak gates (no unit) stays real, never strong", () => {
+    const s = gateSummary([gate("typecheck", true), gate("test:browser", true)]);
+    expect(s.strength).toBe("real");
+  });
+});
+
+const withDir = (build: (dir: string) => void): Workspace => {
+  const dir = mkdtempSync(join(tmpdir(), "factory-uisurface-"));
+  build(dir);
+  return { repo: "acme/x", dir, branch: "factory/x", baseRef: "refs/remotes/origin/main" };
+};
+
+describe("hasUiSurface", () => {
+  test("index.html → UI surface", () => {
+    const ws = withDir((d) => writeFileSync(join(d, "index.html"), "<!doctype html>"));
+    try { expect(hasUiSurface(ws)).toBe(true); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+
+  test("a react dependency → UI surface", () => {
+    const ws = withDir((d) => writeFileSync(join(d, "package.json"), JSON.stringify({ dependencies: { react: "^18" } })));
+    try { expect(hasUiSurface(ws)).toBe(true); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+
+  test("a src/*.tsx file → UI surface", () => {
+    const ws = withDir((d) => { mkdirSync(join(d, "src")); writeFileSync(join(d, "src", "App.tsx"), "export const App = () => null;"); });
+    try { expect(hasUiSurface(ws)).toBe(true); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+
+  test("a public/ dir → UI surface", () => {
+    const ws = withDir((d) => mkdirSync(join(d, "public")));
+    try { expect(hasUiSurface(ws)).toBe(true); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+
+  test("a pure library package.json (no UI dep, no tsx) → NOT a UI surface", () => {
+    const ws = withDir((d) => {
+      writeFileSync(join(d, "package.json"), JSON.stringify({ dependencies: { lodash: "^4" } }));
+      mkdirSync(join(d, "src")); writeFileSync(join(d, "src", "index.ts"), "export const x = 1;");
+    });
+    try { expect(hasUiSurface(ws)).toBe(false); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("requiresBrowserEvidence = hasUiSurface && hasPlaywright (truth table)", () => {
+  const make = (opts: { ui: boolean; playwright: boolean }): Workspace => withDir((d) => {
+    const deps: Record<string, string> = {};
+    if (opts.ui) deps.react = "^18";
+    if (opts.playwright) deps["@playwright/test"] = "^1";
+    writeFileSync(join(d, "package.json"), JSON.stringify({ devDependencies: deps }));
+  });
+
+  test("UI + Playwright → required", () => {
+    const ws = make({ ui: true, playwright: true });
+    try { expect(requiresBrowserEvidence(ws)).toBe(true); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+  test("UI, no Playwright → not required", () => {
+    const ws = make({ ui: true, playwright: false });
+    try { expect(requiresBrowserEvidence(ws)).toBe(false); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+  test("Playwright, no UI → not required", () => {
+    const ws = make({ ui: false, playwright: true });
+    try { expect(requiresBrowserEvidence(ws)).toBe(false); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+  test("neither → not required", () => {
+    const ws = make({ ui: false, playwright: false });
+    try { expect(requiresBrowserEvidence(ws)).toBe(false); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
   });
 });
