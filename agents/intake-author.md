@@ -15,4 +15,4 @@ OUTPUT PROTOCOL — exactly one of:
 
 {{spec}}
 
-{{brief}}
+{{brief}}{{answers}}

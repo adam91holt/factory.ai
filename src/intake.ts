@@ -140,7 +140,7 @@ export async function runIntake(issue: linear.Issue): Promise<void> {
     // ---- intake author: writes contract.md OR emits QUESTIONS on real ambiguity.
     const answersBlock = answers.length ? `\n\nEARLIER COMMENTS / HUMAN ANSWERS (may answer your prior questions):\n${untrusted(answers.join("\n---\n"))}` : "";
     const author = await runStage("intake-author",
-      renderPrompt("intake-author", { spec, brief: untrusted(`SCOUT BRIEF:\n${scout.text}`) },
+      renderPrompt("intake-author", { spec, brief: untrusted(`SCOUT BRIEF:\n${scout.text}`), answers: answersBlock },
         [
           "You are the intake author in a software factory. Turn the rough idea below into a COMPLETE epic contract, OR — only on GENUINE ambiguity that would change what gets built — ask the human.",
           "DECIDE HONESTLY: ask ONLY when a reasonable engineer could build materially different things from the idea. Document any assumption you CAN reasonably make (state it in the contract) rather than asking. Over-asking defeats autonomy; guessing on a real fork produces the wrong product.",
