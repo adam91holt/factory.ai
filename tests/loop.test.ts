@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -167,6 +167,47 @@ describe("securityReviewOutstanding", () => {
     const ev = buildMergeEvidence({
       summary: { green: true, strength: "strong" }, guarded: [], needsHuman: true,
       security: null, browser: "not-required", diffLines: 500,
+    });
+    const d = decideMerge("auto", ev, { lowRiskMaxDiff: 40 });
+    expect(d.wouldMerge).toBe(false);
+    expect(d.act).toBe(false);
+  });
+});
+
+// B22: the taste gate must fail CLOSED on an errored design reviewer (no
+// verdict produced — deadline/budget-killed mid-run, or any other stage
+// error), matching securityReviewOutstanding's fail-closed fold. The old
+// `r.error !== undefined || !/TASTE:\s*fail/.test(r.text)` treated an errored
+// reviewer as an implicit PASS — this held the PR open with zero taste
+// coverage instead of forcing needs_human.
+describe("parseTasteVerdict (B22)", () => {
+  test("an errored stage (no verdict produced) is its own outcome, not a pass", () => {
+    expect(parseTasteVerdict({ error: "stage deadline reached", text: "" })).toBe("error");
+  });
+
+  test("an errored stage with leftover partial text is still 'error', never inferred from text", () => {
+    expect(parseTasteVerdict({ error: "stage deadline reached", text: "TASTE: pass" })).toBe("error");
+  });
+
+  test("an explicit TASTE: fail (no error) is 'fail'", () => {
+    expect(parseTasteVerdict({ text: "found template-default soup\nTASTE: fail" })).toBe("fail");
+  });
+
+  test("an explicit TASTE: pass (no error) is 'pass'", () => {
+    expect(parseTasteVerdict({ text: "looks distinctive\nTASTE: pass" })).toBe("pass");
+  });
+
+  test("no error and no explicit fail line defaults to 'pass' (mirrors parseSecurityVerdict)", () => {
+    expect(parseTasteVerdict({ text: "no verdict line at all" })).toBe("pass");
+  });
+
+  test("'error' folds into needsHuman just like a genuine 'fail' would", () => {
+    // The loop sets designReviewOutstanding=true on "error" and pushes a holdReason
+    // exactly as it does for tasteFindings on "fail" — either alone forces needsHuman,
+    // which forces wouldMerge=false even at the most permissive tier.
+    const ev = buildMergeEvidence({
+      summary: { green: true, strength: "strong" }, guarded: [], needsHuman: true,
+      security: "pass", browser: "not-required", diffLines: 10,
     });
     const d = decideMerge("auto", ev, { lowRiskMaxDiff: 40 });
     expect(d.wouldMerge).toBe(false);

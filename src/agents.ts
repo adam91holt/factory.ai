@@ -40,6 +40,22 @@ interface StageOptions {
   onSessionId?: (id: string) => void;            // fired on session init — persist for resume
 }
 
+// B8: the SDK needs a strictly positive maxBudgetUsd to attempt real work, so a
+// caller passing <= 0 (issue budget already fully spent — defensive; loop.ts's
+// `budget.expired` guards should already have parked before this) gets bumped
+// up to MIN_STAGE_BUDGET_USD. A caller with a small but POSITIVE remainder —
+// e.g. two parallel reviewers each getting half of what's left (loop.ts) —
+// must NOT be floored back up past what it actually asked for: that was the
+// bug (Math.max(0.5, opts.budgetUsd)) that let a near-exhausted issue budget
+// be doubled by the floor itself, on top of the parallel-legs doubling.
+const MIN_STAGE_BUDGET_USD = 0.5;
+
+/** Clamp a requested per-stage budget cap to something the SDK can act on,
+ * without ever inflating a small-but-positive remainder above what was asked. */
+export function stageBudgetUsd(requestedUsd: number): number {
+  return requestedUsd > 0 ? requestedUsd : MIN_STAGE_BUDGET_USD;
+}
+
 // Orchestration/team tools the ambient harness injects into SDK workers and that
 // allowedTools does NOT confine (friction audit 2026-07-21: a read-only reviewer
 // spawned 13-subagent swarms = 42% of spend). Hard-denied on every worker — no
@@ -116,7 +132,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
         disallowedTools: DENY_ORCHESTRATION,
         permissionMode: "dontAsk", // enforces the allowlist (triage-agent lesson)
         maxTurns: opts.maxTurns,
-        maxBudgetUsd: Math.max(0.5, opts.budgetUsd),
+        maxBudgetUsd: stageBudgetUsd(opts.budgetUsd),
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads

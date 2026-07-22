@@ -2,7 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
-import { getIssueDetail } from "./linear.ts";
+import { getIssueDetail, type IssueDetail } from "./linear.ts";
+import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,22 @@ import { killSwitch } from "./control.ts";
 // dependencies.
 
 const UI_DIST = fileURLToPath(new URL("../ui/dist", import.meta.url));
+
+/** B10: getIssueDetail() forwards Linear ticket content verbatim — the only
+ * browser-bound path that isn't already redacted at emit time (unlike bus
+ * events, which run through redactSecrets() before publish). Scrub every
+ * free-text field Linear supplies before this ever reaches the response. */
+export function redactIssueDetail(detail: IssueDetail): IssueDetail {
+  const cleanNode = <T extends { title: string }>(n: T): T => ({ ...n, title: redactSecrets(n.title).clean });
+  return {
+    ...detail,
+    title: redactSecrets(detail.title).clean,
+    description: redactSecrets(detail.description).clean,
+    parent: detail.parent ? cleanNode(detail.parent) : null,
+    children: detail.children.map(cleanNode),
+    siblings: detail.siblings.map(cleanNode),
+  };
+}
 
 function initialMission(): MissionState {
   return { seq: 0, daemon: null, board: [], boardAt: null, runs: {}, needsHuman: [] };
@@ -511,7 +528,7 @@ export function startDashboard(): {
       const key = url.searchParams.get("key") ?? "";
       if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
       getIssueDetail(key)
-        .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(detail)); })
+        .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(redactIssueDetail(detail))); })
         .catch((error: unknown) => {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: String(error instanceof Error ? error.message : error).slice(0, 200) }));

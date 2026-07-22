@@ -84,6 +84,19 @@ export function securityReviewOutstanding(diffLines: number, securityVerdict: "p
   return diffLines >= SECURITY_REVIEW_MIN_DIFF_LINES && securityVerdict === null;
 }
 
+/** Parse a design-review (taste gate) stage's outcome. Unlike parseSecurityVerdict
+ * (text-only), this also distinguishes an ERRORED stage — no verdict produced,
+ * e.g. deadline/budget-killed mid-run — from a genuine "TASTE: fail" (B22): the
+ * old `r.error !== undefined || !/TASTE:\s*fail/.test(r.text)` treated an errored
+ * reviewer as an implicit PASS, fail-OPEN and inconsistent with the security
+ * stage's fail-closed fold (securityReviewOutstanding above). An "error" verdict
+ * must fold into needsHuman too, and is not worth a design-fixer retry round —
+ * there is nothing in an empty/errored review to fix. */
+export function parseTasteVerdict(stage: { error?: string; text: string }): "pass" | "fail" | "error" {
+  if (stage.error !== undefined) return "error";
+  return /TASTE:\s*fail/i.test(stage.text) ? "fail" : "pass";
+}
+
 async function post(issue: linear.Issue, body: string): Promise<void> {
   const { clean, found } = redactSecrets(body);
   if (found > 0) console.error(`[${issue.identifier}] redacted ${found} secret-like strings from outbound comment`);
@@ -325,11 +338,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     const clampedDiff = diff.slice(0, 180_000);
     const repoLens = "blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess";
+    // B8: two reviewers run in Promise.all — each PREVIOUSLY got budget.remainingUsd
+    // in full, so together they could spend up to 2x what was actually left on the
+    // issue. Split the remaining budget across the parallel pair so their combined
+    // cap respects it; the sequential fallback below (only reached after the pair
+    // has settled) can safely reuse the full remainingUsd.
+    const parallelReviewBudget = budget.remainingUsd / 2;
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
@@ -359,22 +378,29 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // juice rubric; a persistent TASTE: fail forces human review and is NEVER
     // auto-merged, even on allowlisted repos (tasteFindings folds into needsHuman).
     let tasteFindings: string | null = null;
+    // B22: a design review that never produced a verdict (deadline/budget-killed
+    // mid-run, or any other stage error) must fold to needs_human — fail CLOSED,
+    // matching securityReviewOutstanding below — rather than being waved through
+    // as an implicit pass.
+    let designReviewOutstanding = false;
     if (uiFilesTouched(ws).length > 0 && !budget.expired) {
       let designDiff = "";
       try { designDiff = diffAgainstBase(ws); } catch { designDiff = ""; }
       const designReviewPrompt = () => renderPrompt("design-reviewer", { spec, diff: designDiff.slice(0, 180_000) },
         `You are the design reviewer — the taste gate — with READ-ONLY worktree access (Read/Glob/Grep). Judge this UI change against docs/design-language.md and (for interactive/game-like work) skills/game-feel/SKILL.md. Reject template-default soup and any interactive screen that could be a plain form or list with no loss. For each problem: a numbered finding with the exact file and a concrete fix. End with exactly one line — "TASTE: pass" or "TASTE: fail" — followed by a one-sentence reason.\n\n${spec}\n\n<diff>\n${designDiff.slice(0, 180_000)}\n</diff>`);
-      const tastePasses = (r: StageResult): boolean => r.error !== undefined || !/TASTE:\s*fail/i.test(r.text);
       // Up to caps.tasteRounds review passes (labels design-reviewer, design-reviewer-2, …);
       // a design-fixer round runs between failing passes (design-fixer, design-fixer-2, …).
       // Budget/deadline is checked before each stage and each iteration; when the rounds
       // are exhausted still failing, tasteFindings folds into the needsHuman path below.
+      // Only a genuine "fail" verdict is worth a design-fixer retry — an "error"
+      // (parseTasteVerdict) means no verdict was produced, so there is nothing in
+      // the empty review to act on; it falls straight through to designReviewOutstanding.
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       let design = await runStage("design-reviewer", designReviewPrompt(),
         { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
-      for (let round = 1; round < maxTasteRounds && !tastePasses(design) && !budget.expired; round++) {
+      for (let round = 1; round < maxTasteRounds && parseTasteVerdict(design) === "fail" && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
           { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
@@ -388,7 +414,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         stages.push(design);
         await postStageComment(issue, design);
       }
-      if (!tastePasses(design)) tasteFindings = design.text.slice(0, 1500);
+      const finalVerdict = parseTasteVerdict(design);
+      if (finalVerdict === "fail") tasteFindings = design.text.slice(0, 1500);
+      else if (finalVerdict === "error") designReviewOutstanding = true;
       if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "design review"); return; }
     }
 
@@ -475,19 +503,21 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
 
     // needsHuman folds every "PR opens but a human must advance it" cause into
-    // one gate: guarded paths (C17), a persistent taste-gate fail, an explicit
-    // tester FAIL, a security-review FAIL, or a WARRANTED-but-absent security pass
-    // (a non-trivial diff whose security review never completed — budget expiry or
+    // one gate: guarded paths (C17), a persistent taste-gate fail, a design
+    // review that never produced a verdict (B22), an explicit tester FAIL, a
+    // security-review FAIL, or a WARRANTED-but-absent security pass (a
+    // non-trivial diff whose security review never completed — budget expiry or
     // stage error left securityVerdict null). Any of them blocks auto-merge even
-    // on enrolled repos. The security-absent fold is fail-closed for the merge
-    // action: without it, a null verdict slips past decideMerge (which blocks only
-    // on "fail"), letting an earned auto tier merge a large diff with the security
-    // gate silently skipped — the exact gate Gap 2 introduced.
+    // on enrolled repos. The security-absent and design-outstanding folds are
+    // fail-closed for the merge action: without them, a null verdict slips past
+    // decideMerge (which blocks only on "fail"), letting an earned auto tier
+    // merge a large diff with the gate silently skipped.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
     const securityWarrantedButAbsent = securityReviewOutstanding(diffLines, securityVerdict);
     const holdReasons: string[] = [];
     if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
+    if (designReviewOutstanding) holdReasons.push("design review did not complete on a UI-touching diff — cannot auto-merge unreviewed");
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
     if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
     if (securityWarrantedButAbsent) holdReasons.push(`security review did not complete on a ${diffLines}-line diff (${budget.expired ? budget.expiredReason : "stage error"}) — cannot auto-merge unreviewed`);
