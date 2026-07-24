@@ -5,13 +5,14 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
+import { isDraining } from "./control.ts";
 import { parseFactoryMeta } from "./meta.ts";
 import { checkFreshness } from "./precondition.ts";
 import { getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision } from "./db.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
-import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
+import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./events.ts";
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
@@ -81,6 +82,19 @@ export function parseSecurityVerdict(text: string): "pass" | "fail" {
  * parks the pipeline on this alone. */
 export function securityReviewOutstanding(diffLines: number, securityVerdict: "pass" | "fail" | null): boolean {
   return diffLines >= SECURITY_REVIEW_MIN_DIFF_LINES && securityVerdict === null;
+}
+
+/** Parse a design-review (taste gate) stage's outcome. Unlike parseSecurityVerdict
+ * (text-only), this also distinguishes an ERRORED stage — no verdict produced,
+ * e.g. deadline/budget-killed mid-run — from a genuine "TASTE: fail" (B22): the
+ * old `r.error !== undefined || !/TASTE:\s*fail/.test(r.text)` treated an errored
+ * reviewer as an implicit PASS, fail-OPEN and inconsistent with the security
+ * stage's fail-closed fold (securityReviewOutstanding above). An "error" verdict
+ * must fold into needsHuman too, and is not worth a design-fixer retry round —
+ * there is nothing in an empty/errored review to fix. */
+export function parseTasteVerdict(stage: { error?: string; text: string }): "pass" | "fail" | "error" {
+  if (stage.error !== undefined) return "error";
+  return /TASTE:\s*fail/i.test(stage.text) ? "fail" : "pass";
 }
 
 async function post(issue: linear.Issue, body: string): Promise<void> {
@@ -182,13 +196,28 @@ async function resolveStale(issue: linear.Issue, repo: string, stages: StageResu
   }
 }
 
+// G2-prereq0: pure decision logic factored out of Budget so it's unit-testable
+// without touching control.ts's module-level drain flag. `draining` folds into
+// both so every "if (budget.expired) park+return" guard and every
+// "!budget.expired" loop/gate condition ALREADY sprinkled through processIssue
+// also halts on drain — a human's ONE button must stop spend on an
+// already-claimed issue at the next stage boundary, not just stop index.ts
+// from claiming new work. Draining is checked first: it always wins over budget.
+export function budgetExpired(now: number, deadlineMs: number, remainingUsd: number, draining: boolean): boolean {
+  return draining || now > deadlineMs || remainingUsd <= 0;
+}
+export function budgetExpiredReason(now: number, deadlineMs: number, draining: boolean): string {
+  return draining ? "factory is draining (kill switch or spend cap) — halting before the next stage"
+    : now > deadlineMs ? "wall-clock cap reached" : "issue budget exhausted";
+}
+
 class Budget {
   constructor(private stages: StageResult[], private deadline: number) {}
   get spent(): number { return this.stages.reduce((s, x) => s + x.costUsd, 0); }
   get remainingUsd(): number { return config.caps.budgetUsdPerIssue - this.spent; }
   get deadlineMs(): number { return this.deadline; }
-  get expired(): boolean { return Date.now() > this.deadline || this.remainingUsd <= 0; }
-  get expiredReason(): string { return Date.now() > this.deadline ? "wall-clock cap reached" : "issue budget exhausted"; }
+  get expired(): boolean { return budgetExpired(Date.now(), this.deadline, this.remainingUsd, isDraining()); }
+  get expiredReason(): string { return budgetExpiredReason(Date.now(), this.deadline, isDraining()); }
 }
 
 export async function processIssue(issue: linear.Issue): Promise<void> {
@@ -263,6 +292,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       if (decision.action === "park") { await park(issue, repo, stages, `freshness: ${decision.reason}`); return; }
     }
 
+    // G2-prereq0: a drain entered while claim/workspace-setup/freshness ran
+    // above must stop BEFORE the first (most expensive) stage spends anything —
+    // mirrors every other "if (budget.expired) park+return" boundary below.
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
+
     // ---- implementer
     // Feed-forward lessons: bounded, newest-first heuristics for this repo,
     // prepended to stage prompts as non-authoritative DATA (caps in lessons.ts:
@@ -304,11 +338,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     const clampedDiff = diff.slice(0, 180_000);
     const repoLens = "blast radius and integration — you have READ-ONLY access to the full repo worktree (Read/Glob/Grep): hunt for callers this diff breaks, dependencies and imports it misses, existing utilities it needlessly duplicates, repo conventions it violates, and tests that should exist for it. Verify suspicions against the actual code, never guess";
+    // B8: two reviewers run in Promise.all — each PREVIOUSLY got budget.remainingUsd
+    // in full, so together they could spend up to 2x what was actually left on the
+    // issue. Split the remaining budget across the parallel pair so their combined
+    // cap respects it; the sequential fallback below (only reached after the pair
+    // has settled) can safely reuse the full remainingUsd.
+    const parallelReviewBudget = budget.remainingUsd / 2;
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
@@ -338,22 +378,29 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // juice rubric; a persistent TASTE: fail forces human review and is NEVER
     // auto-merged, even on allowlisted repos (tasteFindings folds into needsHuman).
     let tasteFindings: string | null = null;
+    // B22: a design review that never produced a verdict (deadline/budget-killed
+    // mid-run, or any other stage error) must fold to needs_human — fail CLOSED,
+    // matching securityReviewOutstanding below — rather than being waved through
+    // as an implicit pass.
+    let designReviewOutstanding = false;
     if (uiFilesTouched(ws).length > 0 && !budget.expired) {
       let designDiff = "";
       try { designDiff = diffAgainstBase(ws); } catch { designDiff = ""; }
       const designReviewPrompt = () => renderPrompt("design-reviewer", { spec, diff: designDiff.slice(0, 180_000) },
         `You are the design reviewer — the taste gate — with READ-ONLY worktree access (Read/Glob/Grep). Judge this UI change against docs/design-language.md and (for interactive/game-like work) skills/game-feel/SKILL.md. Reject template-default soup and any interactive screen that could be a plain form or list with no loss. For each problem: a numbered finding with the exact file and a concrete fix. End with exactly one line — "TASTE: pass" or "TASTE: fail" — followed by a one-sentence reason.\n\n${spec}\n\n<diff>\n${designDiff.slice(0, 180_000)}\n</diff>`);
-      const tastePasses = (r: StageResult): boolean => r.error !== undefined || !/TASTE:\s*fail/i.test(r.text);
       // Up to caps.tasteRounds review passes (labels design-reviewer, design-reviewer-2, …);
       // a design-fixer round runs between failing passes (design-fixer, design-fixer-2, …).
       // Budget/deadline is checked before each stage and each iteration; when the rounds
       // are exhausted still failing, tasteFindings folds into the needsHuman path below.
+      // Only a genuine "fail" verdict is worth a design-fixer retry — an "error"
+      // (parseTasteVerdict) means no verdict was produced, so there is nothing in
+      // the empty review to act on; it falls straight through to designReviewOutstanding.
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       let design = await runStage("design-reviewer", designReviewPrompt(),
         { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
-      for (let round = 1; round < maxTasteRounds && !tastePasses(design) && !budget.expired; round++) {
+      for (let round = 1; round < maxTasteRounds && parseTasteVerdict(design) === "fail" && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
           { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
@@ -367,7 +414,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         stages.push(design);
         await postStageComment(issue, design);
       }
-      if (!tastePasses(design)) tasteFindings = design.text.slice(0, 1500);
+      const finalVerdict = parseTasteVerdict(design);
+      if (finalVerdict === "fail") tasteFindings = design.text.slice(0, 1500);
+      else if (finalVerdict === "error") designReviewOutstanding = true;
       if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "design review"); return; }
     }
 
@@ -454,19 +503,21 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
 
     // needsHuman folds every "PR opens but a human must advance it" cause into
-    // one gate: guarded paths (C17), a persistent taste-gate fail, an explicit
-    // tester FAIL, a security-review FAIL, or a WARRANTED-but-absent security pass
-    // (a non-trivial diff whose security review never completed — budget expiry or
+    // one gate: guarded paths (C17), a persistent taste-gate fail, a design
+    // review that never produced a verdict (B22), an explicit tester FAIL, a
+    // security-review FAIL, or a WARRANTED-but-absent security pass (a
+    // non-trivial diff whose security review never completed — budget expiry or
     // stage error left securityVerdict null). Any of them blocks auto-merge even
-    // on enrolled repos. The security-absent fold is fail-closed for the merge
-    // action: without it, a null verdict slips past decideMerge (which blocks only
-    // on "fail"), letting an earned auto tier merge a large diff with the security
-    // gate silently skipped — the exact gate Gap 2 introduced.
+    // on enrolled repos. The security-absent and design-outstanding folds are
+    // fail-closed for the merge action: without them, a null verdict slips past
+    // decideMerge (which blocks only on "fail"), letting an earned auto tier
+    // merge a large diff with the gate silently skipped.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
     const securityWarrantedButAbsent = securityReviewOutstanding(diffLines, securityVerdict);
     const holdReasons: string[] = [];
     if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
+    if (designReviewOutstanding) holdReasons.push("design review did not complete on a UI-touching diff — cannot auto-merge unreviewed");
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
     if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
     if (securityWarrantedButAbsent) holdReasons.push(`security review did not complete on a ${diffLines}-line diff (${budget.expired ? budget.expiredReason : "stage error"}) — cannot auto-merge unreviewed`);
@@ -491,9 +542,30 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       reasons: deferForDeps ? [...baseDecision.reasons, "deferred: ticket declares depends_on (steward owns epic merge ordering)"] : baseDecision.reasons,
     };
 
+    // Gap-4: re-validate the premise before recording an earning decision or
+    // merging — a PR a human closed/merged since createPr must never advance the
+    // streak or be re-merged. Runs before the single run_finished emit so a stale
+    // premise yields exactly one (aborted) terminal event, not two.
+    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "merge decision"); return; }
+
+    // B16: attempt the merge HERE — before building/emitting the run's
+    // terminal report/event — instead of after. mergePr is a synchronous
+    // spawnSync call (repos.ts), so moving it a few statements earlier costs
+    // nothing, but it means run_finished/telemetry records what ACTUALLY
+    // happened (an evidence-gated, zero-human-touch merge) instead of a
+    // "pr_open" stamped before the merge was even attempted — the gap that
+    // made the "≤1 human intervention" milestone unmeasurable. The
+    // Linear-visible comment sequence further down is unchanged: the merge
+    // result is only ANNOUNCED to the ticket later, in its usual place.
+    let merged: { ok: boolean; out: string } | null = null;
+    if (!config.dryRun && decision.act && prUrl) {
+      merged = mergePr(repo, prUrl);
+    }
+    const outcome: RunOutcome = merged?.ok ? "merged" : needsHuman ? "needs_human" : "pr_open";
+
     const report = buildReport({
       issueKey: issue.identifier, prUrl,
-      outcome: needsHuman ? "needs_human" : "pr_open",
+      outcome,
       reason: needsHuman ? holdReason : undefined,
       stages, gates: results, gateStrength: summary.strength, guardedPaths: guarded,
       reviewFindingsSummary: fixer.text.slice(0, 1500),
@@ -501,14 +573,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       ...(verificationReport ? { verification: verificationReport } : {}),
     });
 
-    // Gap-4: re-validate the premise before recording an earning decision or
-    // merging — a PR a human closed/merged since createPr must never advance the
-    // streak or be re-merged. Runs before the single run_finished emit so a stale
-    // premise yields exactly one (aborted) terminal event, not two.
-    if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "merge decision"); return; }
-
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
-      outcome: needsHuman ? "needs_human" : "pr_open",
+      outcome,
       ...(needsHuman ? { reason: holdReason.slice(0, 500) } : {}),
       prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
@@ -542,9 +608,10 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         browser, security: securityVerdict, cleanStreak: state.cleanStreak, reasons: decision.reasons });
       if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
-      } else if (decision.act && prUrl) {
-        // The repo has EARNED an auto-merge tier and every gate is strong+clean.
-        const merged = mergePr(repo, prUrl);
+      } else if (decision.act && prUrl && merged) {
+        // The repo EARNED an auto-merge tier and every gate was strong+clean —
+        // the merge itself already ran (above, before run_finished); this just
+        // announces the already-known outcome to the ticket.
         if (merged.ok) {
           await post(issue, `${linear.SENTINEL}\n\n**Auto-merged** (merge ladder · tier ${tier}): ${prUrl}`).catch(() => {});
           const moved = await linear.transition(issue, "done");
@@ -564,10 +631,41 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       }
       await linear.release(issue);
     }
-    console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : "pr_open"} ${prUrl ?? "(dry-run)"}`);
+    console.log(`[${issue.identifier}] ${needsHuman ? `needs_human (${holdReason})` : outcome} ${prUrl ?? "(dry-run)"}`);
   } catch (error) {
     await park(issue, repo, stages, error instanceof Error ? error.message : String(error));
   }
+}
+
+/** Bounded retry with exponential backoff for a single side-effecting mutation.
+ *  B3: a Linear outage mid-run must not strand a ticket — park()'s own
+ *  mutations (label / transition / release) used to be one-shot `.catch(() =>
+ *  {})`, so an outage that lines up with the SAME park() call that reports it
+ *  also swallows every attempt to record the park, leaving the ticket
+ *  Executing-labeled and invisible until a human notices or the daemon
+ *  restarts. `sleep` is injectable so tests never wait on a real timer; the
+ *  default schedule (3 attempts, 1s/2s backoff) absorbs a transient blip
+ *  without holding up the pipeline for long. Never throws — total exhaustion
+ *  is reported via the returned `ok:false`, not an exception, so callers
+ *  decide how loudly to surface it. */
+export async function retryMutation(
+  fn: () => Promise<unknown>,
+  opts: { attempts?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const attempts = opts.attempts ?? 3;
+  const baseDelayMs = opts.baseDelayMs ?? 1000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let lastError = "unknown error";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await fn();
+      return { ok: true };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (attempt < attempts - 1) await sleep(baseDelayMs * 2 ** attempt);
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 async function park(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
@@ -592,9 +690,28 @@ async function park(issue: linear.Issue, repo: string, stages: StageResult[], re
     await post(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — ${redactSecrets(reason).clean.slice(0, 500)}`).catch((e2) => console.error(`[${issue.identifier}] minimal park comment failed too: ${e2}`));
   }
   if (!config.dryRun) {
-    await linear.addLabel(issue, linear.PARKED_LABEL).catch((e) => console.error(`[${issue.identifier}] park label failed: ${e}`));
-    await linear.transition(issue, "queue").catch(() => {});
-    await linear.release(issue);
+    // B3: retry each mutation with bounded backoff before giving up — an outage
+    // that swallows all three .catch(()=>{})s used to strand the ticket
+    // Executing-labeled with no Parked label, invisible until a restart.
+    const labelResult = await retryMutation(() => linear.addLabel(issue, linear.PARKED_LABEL));
+    const transitionResult = await retryMutation(() => linear.transition(issue, "queue"));
+    const releaseResult = await retryMutation(() => linear.removeLabel(issue, linear.EXECUTING_LABEL));
+    const failures = [
+      ...(labelResult.ok ? [] : [`Parked label: ${labelResult.error}`]),
+      ...(transitionResult.ok ? [] : [`queue transition: ${transitionResult.error}`]),
+      ...(releaseResult.ok ? [] : [`Executing-label release: ${releaseResult.error}`]),
+    ];
+    if (failures.length > 0) {
+      // Every retry was exhausted — the ticket may be STRANDED (still
+      // Executing-labeled and/or not visibly Parked). Log loudly with a
+      // greppable prefix AND put it on the bus (alerts.ts always alerts on
+      // this) so it is observable instead of silently lost — the runtime
+      // orphan sweep (index.ts) and startup recoverOrphanedClaims are the
+      // eventual self-heal for the Executing-label half of this.
+      const redactedFailures = failures.map((f) => redactSecrets(f).clean.slice(0, 300));
+      console.error(`[${issue.identifier}] STRANDED: park mutations failed after retries — ${redactedFailures.join("; ")}`);
+      bus.emit({ type: "park_mutation_failed", issueKey: issue.identifier, failures: redactedFailures });
+    }
   }
   console.error(`[${issue.identifier}] parked: ${reason}`);
   // Distill the park into a durable, repo-scoped lesson (best-effort, never

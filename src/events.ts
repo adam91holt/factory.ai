@@ -47,7 +47,12 @@ export interface GateMeta {
 // epic contract and requeued it; "awaiting_answer" = intake posted clarifying
 // questions and is waiting on the human; "bootstrapped" = a new project repo was
 // created + green-gate-scaffolded + registered.
-export type RunOutcome = "pr_open" | "planned" | "parked" | "needs_human" | "aborted" | "stale"
+// B16: "merged" = the merge ladder didn't just open the PR — mergePr actually
+// succeeded and the change landed with ZERO human intervention. Distinct from
+// "pr_open" (which now means "a human still has to merge it") so the "≤1 human
+// intervention" milestone is measurable straight from run_finished/telemetry
+// instead of only being visible as a follow-up Linear comment.
+export type RunOutcome = "pr_open" | "merged" | "planned" | "parked" | "needs_human" | "aborted" | "stale"
   | "bootstrapped" | "authored" | "awaiting_answer";
 // Gap-2: "strong" = a repo whose real app was driven (a passing e2e gate or
 // external browser evidence on top of unit tests) — the tier auto-merge requires.
@@ -104,7 +109,21 @@ export type FactoryEventBody =
   | { type: "deploy_finished"; repo: string; sha: string; ok: boolean;
       stage: "skipped" | "deploy" | "smoke"; reverted: boolean; detail: string }
   // ---- Gap-5 project bootstrap (bootstrap.ts) ----
-  | { type: "bootstrap_finished"; issueKey: string; repo: string | null; ok: boolean; reason: string };
+  | { type: "bootstrap_finished"; issueKey: string; repo: string | null; ok: boolean; reason: string }
+  // ---- Prerequisite-0 (docs/planning/autonomy.md "Build order" item 0): kill
+  // switch (B6, control.ts) + rolling daily spend cap (T5, spend-cap.ts). Both
+  // funnel through control.ts's enterDrain — this is the ONE event a human (or
+  // the spend cap) entering drain mode ever emits, so alerts.ts has a single
+  // trigger to watch. `reason` is already bounded/plain text (never raw input).
+  | { type: "drain_entered"; trigger: "kill_switch" | "budget_cap"; reason: string }
+  // B3: park's own Linear mutations (Parked label / queue transition / Executing-
+  // label release) exhausted their bounded retries during processIssue's park()
+  // — the ticket may now be STRANDED (still Executing-labeled and/or missing its
+  // Parked label) until a human notices or a later orphan sweep recovers it
+  // (recoverOrphanedClaims). Daemon-only addition, like drain_entered before it —
+  // not mirrored to the UI's copy of this union; it's an operability signal for
+  // logs/alerts, not something the dashboard renders today.
+  | { type: "park_mutation_failed"; issueKey: string; failures: string[] };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

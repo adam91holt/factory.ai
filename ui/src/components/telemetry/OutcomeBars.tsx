@@ -4,7 +4,8 @@ import { cn } from "../../lib/utils";
 type Outcomes = Telemetry["outcomes"];
 
 const ROWS: Array<{ key: keyof Outcomes; label: string; bar: string; text: string }> = [
-  { key: "pr_open", label: "PR open", bar: "bg-ok", text: "text-ok" },
+  { key: "merged", label: "Merged", bar: "bg-ok", text: "text-ok" },
+  { key: "pr_open", label: "PR open", bar: "bg-ok/60", text: "text-ok" },
   { key: "planned", label: "Planned", bar: "bg-ok/60", text: "text-ok" },
   { key: "parked", label: "Parked", bar: "bg-parked", text: "text-parked" },
   { key: "needs_human", label: "Needs human", bar: "bg-human", text: "text-human" },

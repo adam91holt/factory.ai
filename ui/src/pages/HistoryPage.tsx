@@ -12,6 +12,7 @@ type Filter = "all" | RunOutcome;
 const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: "all", label: "all" },
   { key: "pr_open", label: "pr open" },
+  { key: "merged", label: "merged" },
   { key: "parked", label: "parked" },
   { key: "needs_human", label: "needs human" },
   { key: "aborted", label: "aborted" },

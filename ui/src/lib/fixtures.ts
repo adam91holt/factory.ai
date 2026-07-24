@@ -430,7 +430,7 @@ export function mockTelemetry(): Telemetry {
     totals: {
       costUsd: 62.4128, turns: 512, stageRuns: 63, runs: 11,
       tokensIn: 4_182_400, tokensOut: 486_900, cacheRead: 31_920_000, cacheWrite: 2_140_000,
-      prOpen: 6, parked: 3, needsHuman: 1, aborted: 1, planned: 0, degradedRuns: 1,
+      prOpen: 4, merged: 2, parked: 3, needsHuman: 1, aborted: 1, planned: 0, degradedRuns: 1,
     },
     perModel: [
       { model: "sonnet", calls: 34, tokensIn: 2_910_000, tokensOut: 331_000, cacheRead: 24_600_000, cacheWrite: 1_560_000, costUsd: 38.221 },
@@ -448,7 +448,7 @@ export function mockTelemetry(): Telemetry {
       { stage: "reviewer-fallback", calls: 1, turns: 1, costUsd: 0.208, tokensIn: 5_200, tokensOut: 2_100 },
     ],
     daily,
-    outcomes: { pr_open: 6, planned: 0, parked: 3, needs_human: 1, aborted: 1 },
+    outcomes: { pr_open: 4, merged: 2, planned: 0, parked: 3, needs_human: 1, aborted: 1 },
     parkReasons: [
       { reason: "gates still failing after 3 repair rounds", count: 2 },
       { reason: "wall-clock cap reached", count: 1 },

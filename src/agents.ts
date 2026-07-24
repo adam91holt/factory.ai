@@ -40,6 +40,22 @@ interface StageOptions {
   onSessionId?: (id: string) => void;            // fired on session init — persist for resume
 }
 
+// B8: the SDK needs a strictly positive maxBudgetUsd to attempt real work, so a
+// caller passing <= 0 (issue budget already fully spent — defensive; loop.ts's
+// `budget.expired` guards should already have parked before this) gets bumped
+// up to MIN_STAGE_BUDGET_USD. A caller with a small but POSITIVE remainder —
+// e.g. two parallel reviewers each getting half of what's left (loop.ts) —
+// must NOT be floored back up past what it actually asked for: that was the
+// bug (Math.max(0.5, opts.budgetUsd)) that let a near-exhausted issue budget
+// be doubled by the floor itself, on top of the parallel-legs doubling.
+const MIN_STAGE_BUDGET_USD = 0.5;
+
+/** Clamp a requested per-stage budget cap to something the SDK can act on,
+ * without ever inflating a small-but-positive remainder above what was asked. */
+export function stageBudgetUsd(requestedUsd: number): number {
+  return requestedUsd > 0 ? requestedUsd : MIN_STAGE_BUDGET_USD;
+}
+
 // Orchestration/team tools the ambient harness injects into SDK workers and that
 // allowedTools does NOT confine (friction audit 2026-07-21: a read-only reviewer
 // spawned 13-subagent swarms = 42% of spend). Hard-denied on every worker — no
@@ -49,6 +65,32 @@ const DENY_ORCHESTRATION = [
   "TaskStop", "SendMessage", "CronCreate", "CronList", "CronDelete", "Skill",
   "Workflow", "ReportFindings", "PushNotification", "ScheduleWakeup",
 ];
+
+// ---------------------------------------------------------------------------
+// Kill switch (B6, prerequisite-0 in docs/planning/autonomy.md "Build order"
+// item 0). Every in-flight stage registers its AbortController here for the
+// duration of the SDK call; POST /stop (server.ts, via control.ts) walks this
+// registry and aborts everything in one shot. Keyed by a per-call id, not
+// `label` — multiple concurrent issues can run the same stage label at once.
+// ---------------------------------------------------------------------------
+const activeStages = new Map<string, { label: string; controller: AbortController }>();
+
+/** Abort every in-flight stage's AbortController right now. Returns the stage
+ *  labels that were aborted (server.ts's /stop response). Safe with zero
+ *  active stages (returns []) — a human hitting /stop with nothing running is
+ *  not an error. */
+export function abortAllStages(): string[] {
+  const labels = [...activeStages.values()].map((s) => s.label);
+  for (const { controller } of activeStages.values()) {
+    controller.abort(new Error("kill switch: /stop invoked"));
+  }
+  return labels;
+}
+
+/** Count of stages currently in flight — used by tests and /stop's response. */
+export function activeStageCount(): number {
+  return activeStages.size;
+}
 
 export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
   const t0 = Date.now();
@@ -77,6 +119,8 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   const remainingMs = Math.max(5_000, opts.deadlineMs - Date.now());
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(new Error("stage deadline reached")), remainingMs);
+  const stageId = randomUUID();
+  activeStages.set(stageId, { label, controller: abort });
   try {
     let result: Record<string, unknown> | null = null;
     const q = query({
@@ -88,7 +132,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
         disallowedTools: DENY_ORCHESTRATION,
         permissionMode: "dontAsk", // enforces the allowlist (triage-agent lesson)
         maxTurns: opts.maxTurns,
-        maxBudgetUsd: Math.max(0.5, opts.budgetUsd),
+        maxBudgetUsd: stageBudgetUsd(opts.budgetUsd),
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads
@@ -167,6 +211,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     return out;
   } finally {
     clearTimeout(timer);
+    activeStages.delete(stageId);
   }
 }
 

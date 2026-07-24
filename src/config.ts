@@ -41,6 +41,13 @@ export const config = {
   proxyBaseUrl: (process.env.PROXY_BASE_URL ?? "http://127.0.0.1:8317").replace(/\/+$/, ""),
   proxyAuthToken: process.env.PROXY_AUTH_TOKEN ?? "",
 
+  // Prerequisite-0 alerting (T5, the #1 leverage item — no notification channel
+  // existed before this). Optional ntfy/Slack-style webhook URL: alerts.ts POSTs
+  // a small redacted JSON payload here on issue_needs_human, run_finished{parked},
+  // deploy reverted, tick error, and drain-mode entered. Empty (default) = no-op
+  // cleanly, no dependency on any notification provider.
+  alertWebhookUrl: (process.env.ALERT_WEBHOOK_URL ?? "").trim(),
+
   models: {
     implementer: process.env.IMPLEMENTER_MODEL ?? "sonnet",
     reviewerClaude: process.env.REVIEWER_CLAUDE_MODEL ?? "opus",
@@ -67,6 +74,14 @@ export const config = {
     turnsFixer: num("MAX_TURNS_FIXER", 30),
     wallMinutesPerIssue: num("MAX_WALL_MINUTES_PER_ISSUE", 45),
     budgetUsdPerIssue: num("MAX_BUDGET_USD_PER_ISSUE", 25),
+    // Prerequisite-0 rolling spend cap (T5, docs/planning/autonomy.md "Build
+    // order" item 0): budgetUsdPerIssue above bounds ONE issue; this bounds the
+    // whole factory's trailing-24h spend across every issue/stage. spend-cap.ts
+    // sums run_stage_finished costUsd off the bus and enters drain mode (no new
+    // work claimed; in-flight finishes) once the rolling total exceeds this.
+    // Default is 8x the per-issue cap — the WIP_LIMIT=4 default concurrency
+    // ceiling with headroom for turnover across a day, not a hard science.
+    budgetUsdPerDay: num("MAX_BUDGET_USD_PER_DAY", 200),
     verifierIterations: num("MAX_VERIFIER_ITERATIONS", 3),
     tasteRounds: num("TASTE_MAX_ROUNDS", 2),   // max design-review passes (≥1); fix runs between passes
     wipLimit: num("WIP_LIMIT", 4),

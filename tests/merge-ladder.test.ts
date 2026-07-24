@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
-  decideMerge, advanceLadder, isSelfRepo, effectiveMergeTier, buildMergeEvidence,
+  decideMerge, advanceLadder, isSelfRepo, effectiveMergeTier, buildMergeEvidence, isEnrolled,
   type LadderState, type MergeEvidence,
 } from "../src/merge-ladder.ts";
 import { getLadderState, recordShadowDecision, openTestDatabase, closeTestDatabase } from "../src/db.ts";
@@ -155,6 +155,16 @@ describe("recordShadowDecision — persistence + earning (in-memory sqlite)", ()
   const cleanDecision = decideMerge("shadow", CLEAN, OPTS);
   const dirtyDecision = decideMerge("shadow", { ...CLEAN, green: false }, OPTS);
 
+  // These tests exercise the pure earning-transition WIRING (advanceLadder +
+  // persistence), not the B9 enrollment gate below — so the repos they use are
+  // enrolled up front, exactly as a human would opt a repo in before any of
+  // this could run for real.
+  const ENROLLED_TEST_REPOS = ["acme/ladder-a", "acme/ladder-b", "acme/closed"];
+  beforeAll(() => { config.mergeLadder.enrolled.push(...ENROLLED_TEST_REPOS); });
+  afterAll(() => {
+    config.mergeLadder.enrolled = config.mergeLadder.enrolled.filter((r) => !ENROLLED_TEST_REPOS.includes(r));
+  });
+
   test("N clean decisions promote the persisted tier shadow → auto-low-risk", () => {
     openTestDatabase();
     const repo = "acme/ladder-a";
@@ -191,5 +201,57 @@ describe("recordShadowDecision — persistence + earning (in-memory sqlite)", ()
     const s = recordShadowDecision("acme/closed", "FAC-1", cleanDecision, CLEAN);
     expect(s.cleanStreak).toBe(1);
     expect(getLadderState("acme/closed")).toBeNull();
+  });
+});
+
+describe("recordShadowDecision — B9: earning is gated on isEnrolled (earn only after opt-in)", () => {
+  afterEach(() => closeTestDatabase());
+
+  const cleanDecision = decideMerge("shadow", CLEAN, OPTS);
+
+  test("isEnrolled is false for a repo in neither MERGE_LADDER_REPOS nor MERGE_AUTO_REPOS", () => {
+    expect(isEnrolled("acme/never-enrolled")).toBe(false);
+  });
+
+  test("decisions on an UN-enrolled repo never advance (or even seed) the persisted ladder", () => {
+    openTestDatabase();
+    const repo = "acme/not-enrolled";
+    expect(config.mergeLadder.enrolled.includes(repo)).toBe(false);
+    expect(config.autoMergeRepos.includes(repo)).toBe(false);
+    const N = config.mergeLadder.promoteAfter;
+    // Many clean decisions in a row — before this fix these would silently
+    // build a streak (and even promote to auto-low-risk) underneath an
+    // un-enrolled repo, only surfacing the moment a human later enrolled it.
+    let last: LadderState | null = null;
+    for (let i = 0; i < N + 2; i++) last = recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
+    expect(getLadderState(repo)).toBeNull();          // nothing was ever persisted
+    expect(last?.tier).toBe("shadow");                // and the returned state never advanced either
+    expect(last?.cleanStreak).toBe(0);
+    expect(effectiveMergeTier(repo, getLadderState(repo))).toBe("human");
+  });
+
+  test("enrolling AFTER accruing pre-enrollment decisions does not retroactively grant a streak", () => {
+    openTestDatabase();
+    const repo = "acme/late-enroll";
+    const N = config.mergeLadder.promoteAfter;
+    // Pre-enrollment: N-1 clean decisions — a no-op on the persisted ladder.
+    for (let i = 0; i < N - 1; i++) recordShadowDecision(repo, `FAC-pre-${i}`, cleanDecision, CLEAN);
+    expect(getLadderState(repo)).toBeNull();
+
+    // A human now opts the repo in.
+    config.mergeLadder.enrolled.push(repo);
+    try {
+      // If the pre-enrollment decisions HAD counted, this single post-
+      // enrollment clean decision would already hit promoteAfter and promote.
+      // It must not — earning starts counting from enrollment, at streak 0.
+      const first = recordShadowDecision(repo, "FAC-post-0", cleanDecision, CLEAN);
+      expect(first.cleanStreak).toBe(1);
+      expect(first.tier).toBe("shadow");
+      let state: LadderState | null = null;
+      for (let i = 1; i < N; i++) state = recordShadowDecision(repo, `FAC-post-${i}`, cleanDecision, CLEAN);
+      expect(state?.tier).toBe("auto-low-risk");
+    } finally {
+      config.mergeLadder.enrolled = config.mergeLadder.enrolled.filter((r) => r !== repo);
+    }
   });
 });

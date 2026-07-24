@@ -7,6 +7,7 @@ type Status = "active" | RunOutcome;
 export const MAP: Record<Status, { label: string; variant: BadgeVariant }> = {
   active: { label: "RUNNING", variant: "live" },
   pr_open: { label: "PR OPEN", variant: "ok" },
+  merged: { label: "MERGED", variant: "ok" },
   planned: { label: "PLANNED", variant: "ok" },
   parked: { label: "PARKED", variant: "parked" },
   needs_human: { label: "NEEDS HUMAN", variant: "human" },

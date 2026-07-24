@@ -398,14 +398,29 @@ export async function claim(issue: Issue): Promise<boolean> {
   }
 }
 
-/** Startup recovery: a fresh daemon owns no in-flight work, and the
- * single-instance lease guarantees no live sibling holds a claim — so ANY
- * Executing-labeled issue at startup is an orphan from a process that died
- * (e.g. a restart mid-run). Reset each to the queue so it re-claims and
- * resumes (resume-safe commit gate + git-retry handle committed-but-unpushed
- * work). Without this, a restart strands in-flight tickets In-Progress forever. */
-export async function recoverOrphanedClaims(): Promise<string[]> {
-  const orphans = await fetchByLabel(EXECUTING_LABEL).catch(() => [] as Issue[]);
+/** Pure exclusion filter, extracted so the "which Executing-labeled issues are
+ * ACTUALLY orphaned" decision is unit-testable without a network mock — the
+ * surrounding fetchByLabel/removeLabel/transition calls are integration-only. */
+export function filterOrphanedIssues(issues: Issue[], excludeIdentifiers: ReadonlySet<string>): Issue[] {
+  return issues.filter((issue) => !excludeIdentifiers.has(issue.identifier));
+}
+
+/** Startup recovery (and the runtime orphan sweep, index.ts): a fresh daemon
+ * owns no in-flight work, and the single-instance lease guarantees no live
+ * sibling holds a claim — so any Executing-labeled issue that is NOT one of
+ * THIS process's own in-flight claims is an orphan from a process that died
+ * (e.g. a restart mid-run) or a mutation that failed silently mid-pipeline.
+ * Reset each to the queue so it re-claims and resumes (resume-safe commit
+ * gate + git-retry handle committed-but-unpushed work). Without this, a
+ * restart — or an invisible in-flight ticket the daemon never restarts for —
+ * strands In-Progress tickets forever.
+ *
+ * `excludeIdentifiers` is empty at startup (nothing is in flight yet, so
+ * every Executing-labeled issue found IS an orphan); index.ts's periodic
+ * runtime sweep passes its live `inFlight` keys so genuinely-running claims
+ * are never reset out from under themselves. */
+export async function recoverOrphanedClaims(excludeIdentifiers: ReadonlySet<string> = new Set()): Promise<string[]> {
+  const orphans = filterOrphanedIssues(await fetchByLabel(EXECUTING_LABEL).catch(() => [] as Issue[]), excludeIdentifiers);
   const recovered: string[] = [];
   for (const issue of orphans) {
     try {

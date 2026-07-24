@@ -2,3 +2,9 @@ node_modules/
 .env
 *.log
 .DS_Store
+
+# Runtime SQLite DB (must never be committed)
+factory.db
+factory.db-*
+*.db-wal
+*.db-shm

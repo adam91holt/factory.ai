@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { applyEvent } from "../src/server.ts";
+import { applyEvent, redactIssueDetail } from "../src/server.ts";
 import type { FactoryEvent, FactoryEventBody, MissionState } from "../src/events.ts";
+import type { IssueDetail } from "../src/linear.ts";
 
 // applyEvent is a PURE fold — we drive it with hand-stamped events (explicit
 // seq/at, never Date.now()) and assert on the resulting MissionState. The UI
@@ -170,5 +171,61 @@ describe("pruneFinishedRuns (via the run_finished fold)", () => {
       m = fold([started(key), finished(key, 20_000 + i)], m);
     }
     expect(Object.keys(m.runs)).toHaveLength(50);
+  });
+});
+
+// B10: GET /issue forwards Linear ticket content to the browser — the only
+// browser-bound path that was NOT already redacted at emit time (unlike bus
+// events). redactIssueDetail must scrub every free-text field before the
+// route hands it back, matching the everything-redacted invariant.
+describe("redactIssueDetail (B10)", () => {
+  const SECRET = "lin_api_TESTDUMMY0000000000"; // setup.ts's dummy LINEAR_API_KEY — exact-value redaction leg
+  const MASK = "[REDACTED-SECRET]";
+
+  const detail = (overrides: Partial<IssueDetail> = {}): IssueDetail => ({
+    identifier: "FAC-1", title: "clean title", description: "clean description", url: "https://linear.app/x/issue/FAC-1",
+    stateName: "In Progress", labels: ["bug"], parent: null, children: [], siblings: [],
+    ...overrides,
+  });
+
+  test("redacts a secret embedded in the description", () => {
+    const out = redactIssueDetail(detail({ description: `before ${SECRET} after` }));
+    expect(out.description).not.toContain(SECRET);
+    expect(out.description).toContain(MASK);
+  });
+
+  test("redacts a secret embedded in the title", () => {
+    const out = redactIssueDetail(detail({ title: `oops ${SECRET}` }));
+    expect(out.title).not.toContain(SECRET);
+    expect(out.title).toContain(MASK);
+  });
+
+  test("redacts secrets in parent/children/siblings titles too", () => {
+    const node = (title: string) => ({ identifier: "FAC-2", title, stateName: "Todo" });
+    const out = redactIssueDetail(detail({
+      parent: node(`parent ${SECRET}`),
+      children: [{ ...node(`child ${SECRET}`), stateType: "started", labels: [] }],
+      siblings: [{ ...node(`sibling ${SECRET}`), stateType: "started", labels: [] }],
+    }));
+    expect(out.parent?.title).not.toContain(SECRET);
+    expect(out.children[0]?.title).not.toContain(SECRET);
+    expect(out.siblings[0]?.title).not.toContain(SECRET);
+  });
+
+  test("clean text passes through unchanged", () => {
+    const input = detail();
+    expect(redactIssueDetail(input)).toEqual(input);
+  });
+
+  test("preserves non-text fields (identifier, url, stateName, labels) verbatim", () => {
+    const out = redactIssueDetail(detail({ description: `x ${SECRET} y` }));
+    expect(out.identifier).toBe("FAC-1");
+    expect(out.url).toBe("https://linear.app/x/issue/FAC-1");
+    expect(out.stateName).toBe("In Progress");
+    expect(out.labels).toEqual(["bug"]);
+  });
+
+  test("a null parent stays null", () => {
+    expect(redactIssueDetail(detail()).parent).toBeNull();
   });
 });

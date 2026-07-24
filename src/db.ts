@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import { bus, type FactoryEvent } from "./events.ts";
-import { advanceLadder, seedLadderState, ceilingForRepo, type LadderState, type MergeDecision, type MergeEvidence } from "./merge-ladder.ts";
+import { advanceLadder, seedLadderState, ceilingForRepo, isEnrolled, type LadderState, type MergeDecision, type MergeEvidence } from "./merge-ladder.ts";
 
 // Durable event store (owner request 2026-07-20): every FactoryEvent — already
 // redacted at emit — lands in SQLite so agent activity survives restarts.
@@ -222,7 +222,10 @@ export interface Telemetry {
   totals: {
     costUsd: number; turns: number; stageRuns: number; runs: number;
     tokensIn: number; tokensOut: number; cacheRead: number; cacheWrite: number;
-    prOpen: number; parked: number; needsHuman: number; aborted: number; planned: number;
+    // B16: "merged" is counted separately from "prOpen" — prOpen now means "a
+    // human still has to merge it", merged means the ladder closed the loop
+    // with zero human intervention. Both are still summed in `runs`.
+    prOpen: number; merged: number; parked: number; needsHuman: number; aborted: number; planned: number;
     degradedRuns: number;
   };
   /** per model, sorted by costUsd desc — the star chart ("tokens through which model"). */
@@ -234,7 +237,7 @@ export interface Telemetry {
   /** last 7 calendar days (local), oldest → newest, zero-filled. */
   daily: Array<{ date: string; costUsd: number; turns: number; tokensIn: number;
     tokensOut: number; cacheRead: number; runs: number }>;
-  outcomes: { pr_open: number; planned: number; parked: number; needs_human: number; aborted: number };
+  outcomes: { pr_open: number; merged: number; planned: number; parked: number; needs_human: number; aborted: number };
   /** top-5 park reasons by frequency. */
   parkReasons: Array<{ reason: string; count: number }>;
   /** top-10 issues by total spend (stage-row spend; runs = non-dry deliveries). */
@@ -265,9 +268,9 @@ function emptyTelemetry(): Telemetry {
   return {
     generatedAt: Date.now(),
     totals: { costUsd: 0, turns: 0, stageRuns: 0, runs: 0, tokensIn: 0, tokensOut: 0,
-      cacheRead: 0, cacheWrite: 0, prOpen: 0, parked: 0, needsHuman: 0, aborted: 0, planned: 0, degradedRuns: 0 },
+      cacheRead: 0, cacheWrite: 0, prOpen: 0, merged: 0, parked: 0, needsHuman: 0, aborted: 0, planned: 0, degradedRuns: 0 },
     perModel: [], perStage: [], daily,
-    outcomes: { pr_open: 0, planned: 0, parked: 0, needs_human: 0, aborted: 0 },
+    outcomes: { pr_open: 0, merged: 0, planned: 0, parked: 0, needs_human: 0, aborted: 0 },
     parkReasons: [], costPerIssue: [],
   };
 }
@@ -361,6 +364,7 @@ export function getTelemetry(): Telemetry {
     t.totals.runs += 1;
     const outcome = e.outcome;
     if (outcome === "pr_open") { t.outcomes.pr_open += 1; t.totals.prOpen += 1; }
+    else if (outcome === "merged") { t.outcomes.merged += 1; t.totals.merged += 1; }
     else if (outcome === "planned") { t.outcomes.planned += 1; t.totals.planned += 1; }
     else if (outcome === "parked") { t.outcomes.parked += 1; t.totals.parked += 1; }
     else if (outcome === "needs_human") { t.outcomes.needs_human += 1; t.totals.needsHuman += 1; }
@@ -511,9 +515,18 @@ export function getLadderState(repo: string): LadderState | null {
 /** Append a shadow-decision audit row and advance the earned tier. Returns the
  * new LadderState (also when the store is closed — then it is the pure
  * transition, unpersisted). This is the ONE writer of the earning streak, gated
- * by loop.ts behind a stillOurs() re-check so a stale PR never advances it. */
+ * by loop.ts behind a stillOurs() re-check so a stale PR never advances it.
+ *
+ * B9: also gated on isEnrolled(repo) — a repo that has not opted into the
+ * ladder must not accrue a clean streak (or even seed a merge_ladder row) at
+ * all. Before this gate, effectiveMergeTier hid the earned tier from an
+ * un-enrolled repo but recordShadowDecision kept advancing it underneath, so
+ * the repo could jump straight past shadow the moment a human DID enroll it —
+ * voiding "earn after opt-in". A not-yet-enrolled repo now returns `prev`
+ * (unpersisted, unadvanced) instead of writing anything. */
 export function recordShadowDecision(repo: string, issueKey: string, decision: MergeDecision, ev: MergeEvidence): LadderState {
   const prev = getLadderState(repo) ?? seedLadderState(repo);
+  if (!isEnrolled(repo)) return prev;
   const next = advanceLadder(prev, decision.wouldMerge, {
     promoteAfter: config.mergeLadder.promoteAfter,
     ceiling: ceilingForRepo(repo),
@@ -579,4 +592,16 @@ export function closeTestDatabase(): void {
   try { db?.close(); } catch { /* already closed */ }
   db = null;
   telemetryCache = null;
+}
+
+/** Test-only: insert a raw event row directly into the durable log, bypassing
+ *  the bus subscription (openTestDatabase() deliberately wires up no bus — see
+ *  above). Lets tests exercise the READ paths that scan the `events` table
+ *  (getTelemetry, issueEvents, …) without a real file + bus.subscribe. No-op
+ *  when the test store isn't open. */
+export function insertTestEvent(type: string, body: Record<string, unknown>, at = Date.now()): void {
+  if (!db) return;
+  const key = typeof body.issueKey === "string" ? body.issueKey : null;
+  db.prepare("INSERT INTO events (seq, at, type, issue_key, json) VALUES (?, ?, ?, ?, ?)")
+    .run(0, at, type, key, JSON.stringify({ type, seq: 0, at, ...body }));
 }

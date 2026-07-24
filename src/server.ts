@@ -2,25 +2,45 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
-import { getIssueDetail } from "./linear.ts";
+import { getIssueDetail, type IssueDetail } from "./linear.ts";
+import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView, type StageView } from "./events.ts";
+import { killSwitch } from "./control.ts";
 
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
 // Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
 // file reads outside ui/dist and factory-history.jsonl. The exceptions are the
-// two guarded POSTs: /catalog/save (the catalog manager), which reads a bounded
-// JSON body and writes ONE validated card/skill file under
-// agents|skills|groundskeepers, then commits it — and /lessons/archive, which
-// flips archived=1 on ONE lesson row (never a delete) — both a human editing
-// the org through the loopback UI, both behind the same guardedJsonBody()
-// CSRF/DNS-rebinding gate. All emitted payload strings were redacted at emit
-// time. node:http only (Bun implements it) — no new dependencies.
+// three guarded POSTs: /catalog/save (the catalog manager), which reads a
+// bounded JSON body and writes ONE validated card/skill file under
+// agents|skills|groundskeepers, then commits it; /lessons/archive, which flips
+// archived=1 on ONE lesson row (never a delete); and /stop (B6 kill switch,
+// prerequisite-0), which aborts every in-flight stage and enters drain mode —
+// all three are a human acting through the loopback UI, all three behind the
+// same guardedJsonBody() CSRF/DNS-rebinding gate. All emitted payload strings
+// were redacted at emit time. node:http only (Bun implements it) — no new
+// dependencies.
 
 const UI_DIST = fileURLToPath(new URL("../ui/dist", import.meta.url));
+
+/** B10: getIssueDetail() forwards Linear ticket content verbatim — the only
+ * browser-bound path that isn't already redacted at emit time (unlike bus
+ * events, which run through redactSecrets() before publish). Scrub every
+ * free-text field Linear supplies before this ever reaches the response. */
+export function redactIssueDetail(detail: IssueDetail): IssueDetail {
+  const cleanNode = <T extends { title: string }>(n: T): T => ({ ...n, title: redactSecrets(n.title).clean });
+  return {
+    ...detail,
+    title: redactSecrets(detail.title).clean,
+    description: redactSecrets(detail.description).clean,
+    parent: detail.parent ? cleanNode(detail.parent) : null,
+    children: detail.children.map(cleanNode),
+    siblings: detail.siblings.map(cleanNode),
+  };
+}
 
 function initialMission(): MissionState {
   return { seq: 0, daemon: null, board: [], boardAt: null, runs: {}, needsHuman: [] };
@@ -435,6 +455,25 @@ export function startDashboard(): {
       return;
     }
 
+    // Write route: kill switch (B6, prerequisite-0). Same guard as /catalog/save
+    // and /lessons/archive. Aborts every in-flight stage's AbortController
+    // (agents.ts) AND enters drain mode (control.ts) so index.ts stops claiming
+    // new work starting next tick — a human acting on a runaway factory needs
+    // ONE button, not a `pkill` (docs/planning/autonomy.md "Prerequisite 0").
+    if (url.pathname === "/stop") {
+      void guardedJsonBody(req, res).then((guarded) => {
+        if (guarded === null) return; // refusal already written
+        const reasonRaw = (guarded.body as { reason?: unknown } | null)?.reason;
+        const reason = typeof reasonRaw === "string" && reasonRaw.trim() !== ""
+          ? reasonRaw.trim().slice(0, 200)
+          : "manual /stop";
+        const { abortedStages } = killSwitch(reason);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, draining: true, abortedCount: abortedStages.length, abortedStages }));
+      });
+      return;
+    }
+
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain" });
       res.end("method not allowed");
@@ -489,7 +528,7 @@ export function startDashboard(): {
       const key = url.searchParams.get("key") ?? "";
       if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
       getIssueDetail(key)
-        .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(detail)); })
+        .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(redactIssueDetail(detail))); })
         .catch((error: unknown) => {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: String(error instanceof Error ? error.message : error).slice(0, 200) }));

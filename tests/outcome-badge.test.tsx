@@ -11,6 +11,7 @@ import type { RunOutcome } from "../src/events.ts";
 // fails loudly the next time the union grows without MAP keeping up.
 const OUTCOMES: RunOutcome[] = [
   "pr_open",
+  "merged",
   "planned",
   "parked",
   "needs_human",

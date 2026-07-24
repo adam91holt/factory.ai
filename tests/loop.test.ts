@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, countDiffLines } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -174,10 +174,151 @@ describe("securityReviewOutstanding", () => {
   });
 });
 
+// B22: the taste gate must fail CLOSED on an errored design reviewer (no
+// verdict produced — deadline/budget-killed mid-run, or any other stage
+// error), matching securityReviewOutstanding's fail-closed fold. The old
+// `r.error !== undefined || !/TASTE:\s*fail/.test(r.text)` treated an errored
+// reviewer as an implicit PASS — this held the PR open with zero taste
+// coverage instead of forcing needs_human.
+describe("parseTasteVerdict (B22)", () => {
+  test("an errored stage (no verdict produced) is its own outcome, not a pass", () => {
+    expect(parseTasteVerdict({ error: "stage deadline reached", text: "" })).toBe("error");
+  });
+
+  test("an errored stage with leftover partial text is still 'error', never inferred from text", () => {
+    expect(parseTasteVerdict({ error: "stage deadline reached", text: "TASTE: pass" })).toBe("error");
+  });
+
+  test("an explicit TASTE: fail (no error) is 'fail'", () => {
+    expect(parseTasteVerdict({ text: "found template-default soup\nTASTE: fail" })).toBe("fail");
+  });
+
+  test("an explicit TASTE: pass (no error) is 'pass'", () => {
+    expect(parseTasteVerdict({ text: "looks distinctive\nTASTE: pass" })).toBe("pass");
+  });
+
+  test("no error and no explicit fail line defaults to 'pass' (mirrors parseSecurityVerdict)", () => {
+    expect(parseTasteVerdict({ text: "no verdict line at all" })).toBe("pass");
+  });
+
+  test("'error' folds into needsHuman just like a genuine 'fail' would", () => {
+    // The loop sets designReviewOutstanding=true on "error" and pushes a holdReason
+    // exactly as it does for tasteFindings on "fail" — either alone forces needsHuman,
+    // which forces wouldMerge=false even at the most permissive tier.
+    const ev = buildMergeEvidence({
+      summary: { green: true, strength: "strong" }, guarded: [], needsHuman: true,
+      security: "pass", browser: "not-required", diffLines: 10,
+    });
+    const d = decideMerge("auto", ev, { lowRiskMaxDiff: 40 });
+    expect(d.wouldMerge).toBe(false);
+    expect(d.act).toBe(false);
+  });
+});
+
 describe("countDiffLines", () => {
   test("counts changed lines, excluding the +++/--- file headers", () => {
     const diff = ["diff --git a/x b/x", "--- a/x", "+++ b/x", "@@ -1 +1,2 @@", "-old", "+new", "+added", " context"].join("\n");
     expect(countDiffLines(diff)).toBe(3);
+  });
+});
+
+// G2-prereq0 (kill switch drain awareness): processIssue's Budget class folds
+// isDraining() into `expired` so every existing "if (budget.expired) park" guard
+// and "!budget.expired" loop/gate ALREADY sprinkled through the pipeline also
+// halts once a human hits /stop — a drained issue must not spend on the NEXT
+// stage. budgetExpired/budgetExpiredReason are the pure decision Budget
+// delegates to; asserted directly here since Budget itself isn't exported and
+// isDraining() reads control.ts's module-level flag (out of scope for a pure
+// unit test — control.test.ts covers that flag's own transitions).
+describe("budgetExpired (G2-prereq0: kill switch must halt an in-flight issue)", () => {
+  const future = Date.now() + 60_000;
+  const past = Date.now() - 1;
+
+  test("draining forces expired even with time and budget both remaining", () => {
+    expect(budgetExpired(Date.now(), future, 5, true)).toBe(true);
+  });
+
+  test("not draining, deadline and budget both fine → not expired", () => {
+    expect(budgetExpired(Date.now(), future, 5, false)).toBe(false);
+  });
+
+  test("not draining but past the deadline → expired", () => {
+    expect(budgetExpired(Date.now(), past, 5, false)).toBe(true);
+  });
+
+  test("not draining but budget exhausted → expired", () => {
+    expect(budgetExpired(Date.now(), future, 0, false)).toBe(true);
+    expect(budgetExpired(Date.now(), future, -0.01, false)).toBe(true);
+  });
+});
+
+describe("budgetExpiredReason", () => {
+  const future = Date.now() + 60_000;
+  const past = Date.now() - 1;
+
+  test("draining wins over an also-expired deadline — a human reading the park reason sees WHY", () => {
+    expect(budgetExpiredReason(Date.now(), past, true)).toBe("factory is draining (kill switch or spend cap) — halting before the next stage");
+  });
+
+  test("not draining: distinguishes wall-clock cap from budget exhaustion by deadline alone", () => {
+    expect(budgetExpiredReason(Date.now(), past, false)).toBe("wall-clock cap reached");
+    expect(budgetExpiredReason(Date.now(), future, false)).toBe("issue budget exhausted");
+  });
+});
+
+// B3: park's own Linear mutations (label / transition / release) used to be
+// one-shot `.catch(() => {})`, so a transient Linear outage during THAT SAME
+// park() call silently stranded the ticket (Executing label attached, no
+// Parked label). retryMutation is the bounded-backoff wrapper closing that
+// gap; `sleep` is injected so these tests never wait on a real timer.
+describe("retryMutation (B3: bounded retry for park's own mutations)", () => {
+  test("succeeds on the first try — never sleeps, never retries", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(async () => { calls += 1; }, { sleep: async (ms) => { sleeps.push(ms); } });
+    expect(result).toEqual({ ok: true });
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("recovers on a later attempt after transient failures, with exponential backoff between tries", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(
+      async () => { calls += 1; if (calls < 3) throw new Error(`transient ${calls}`); },
+      { attempts: 5, baseDelayMs: 100, sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    expect(result).toEqual({ ok: true });
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([100, 200]); // doubles each attempt: 100 * 2^0, 100 * 2^1
+  });
+
+  test("exhausting every attempt reports ok:false with the LAST error — never throws", async () => {
+    let calls = 0;
+    const result = await retryMutation(
+      async () => { calls += 1; throw new Error(`fail ${calls}`); },
+      { attempts: 3, baseDelayMs: 1, sleep: async () => {} },
+    );
+    expect(result).toEqual({ ok: false, error: "fail 3" });
+    expect(calls).toBe(3);
+  });
+
+  test("attempts:1 tries exactly once and never sleeps, even on failure", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const result = await retryMutation(
+      async () => { calls += 1; throw new Error("nope"); },
+      { attempts: 1, sleep: async (ms) => { sleeps.push(ms); } },
+    );
+    expect(result).toEqual({ ok: false, error: "nope" });
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test("a non-Error throw is stringified rather than crashing", async () => {
+    const result = await retryMutation(async () => { throw "plain string failure"; },
+      { attempts: 1, sleep: async () => {} });
+    expect(result).toEqual({ ok: false, error: "plain string failure" });
   });
 });
 
