@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.ts";
-import { summarizeToolInput, type AgentStreamEvent } from "./events.ts";
+import { bus, summarizeToolInput, type AgentStreamEvent } from "./events.ts";
 
 // Stage runner. Claude roles on DIRECT SDK auth; the Codex reviewer is the only
 // proxy leg. Hardened per code-review verdict 2026-07-20: whitelist-only worker
@@ -38,6 +38,12 @@ interface StageOptions {
   onEvent?: (event: AgentStreamEvent) => void;   // live stage telemetry (UI observes)
   resume?: string;                               // resume a prior session (interrupted-run recovery)
   onSessionId?: (id: string) => void;            // fired on session init — persist for resume
+  // #14/#11: per-call override of config.fallbackModel — the model runStage
+  // fails over to once `model` above exhausts its transient-error retries.
+  // Optional; callers that omit it still get config.fallbackModel (the global
+  // default). Same operator-configured-only trust level as `model` itself —
+  // never derived from ticket text.
+  fallbackModel?: string;
 }
 
 // B8: the SDK needs a strictly positive maxBudgetUsd to attempt real work, so a
@@ -92,12 +98,103 @@ export function activeStageCount(): number {
   return activeStages.size;
 }
 
-export async function runStage(label: string, prompt: string, opts: StageOptions): Promise<StageResult> {
+// ---------------------------------------------------------------------------
+// #14/#11 resilience: bounded retry + model failover for TRANSIENT stage
+// failures. Before this, a single 429 ("all credentials for model X are
+// cooling down") HARD-FAILED the stage — and with the whole roster sharing one
+// model, that took the entire factory down (reviews aborted, tasks parked,
+// steward failed). RETRY_ATTEMPTS is how many extra tries the PRIMARY model
+// gets (same model, backed off) before a configured FALLBACK model — if any —
+// gets exactly one run. Only after both are exhausted does the stage error
+// out, exactly as it always did. Real content/logic errors (a genuine tool
+// failure, max-turns, max-budget) are never retried — see
+// isTransientStageError — so this never turns a real bug into an infinite
+// retry loop that burns budget.
+// ---------------------------------------------------------------------------
+const RETRY_ATTEMPTS = 2;       // retries on the primary model (3 tries total)
+const RETRY_BASE_MS = 1_000;
+const RETRY_MAX_MS = 8_000;
+
+/** True when `error` (the already-redacted string StageResult.error carries)
+ *  looks like a transient provider/network hiccup rather than a genuine
+ *  content or logic failure. Deliberately excludes our OWN abort reasons — a
+ *  stage that hit its deadline or was killed via /stop must fail immediately,
+ *  never retry into a window that's already gone — and turn/budget
+ *  exhaustion, which reflects real work the stage did, not a provider outage.
+ *  Exported for tests. */
+export function isTransientStageError(error: string): boolean {
+  if (/stage deadline reached|kill switch:/i.test(error)) return false;
+  if (/error_max_turns|error_max_budget_usd/i.test(error)) return false;
+  return /\b429\b|rate.?limit(ed)?|cooling down|overloaded|too many requests|service unavailable|temporarily unavailable|\bECONNRESET\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|\bENOTFOUND\b|\bEPIPE\b|fetch failed|socket hang up|network (error|timeout)/i.test(error);
+}
+
+function backoffMs(attempt: number): number {
+  const base = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
+  return Math.round(base * (0.5 + Math.random() * 0.5)); // jittered, 50-100% of the cap
+}
+
+// Narrow shape of the SDK's `query()` — only what runOneAttempt actually
+// consumes (an async iterable of message objects). Kept separate from the
+// SDK's own `Query` return type (a large control-request interface this code
+// never uses) so tests can fake it with a plain async generator instead of
+// hand-implementing interrupt()/setModel()/close()/etc.
+type StageQueryFn = (params: { prompt: string; options: Record<string, unknown> }) => AsyncIterable<unknown>;
+
+export interface StageDeps {
+  query: StageQueryFn;
+  sleep: (ms: number) => Promise<void>;
+}
+
+const defaultDeps: StageDeps = {
+  // Thin adapter over the real SDK export — isolates the one cast needed to
+  // present it through the narrower StageQueryFn shape tests fake against.
+  query: (params) => sdkQuery(params as unknown as Parameters<typeof sdkQuery>[0]),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+export async function runStage(label: string, prompt: string, opts: StageOptions, deps: StageDeps = defaultDeps): Promise<StageResult> {
+  const t0 = Date.now();
+  const primaryModel = opts.model;
+  let attempt = 1;
+  let last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+  while (last.error && isTransientStageError(last.error) && attempt < 1 + RETRY_ATTEMPTS) {
+    const waitMs = backoffMs(attempt);
+    // Don't retry into a window that's already gone — leave enough runway
+    // (the wait itself, plus a floor for the attempt) or stop trying.
+    if (opts.deadlineMs - Date.now() < waitMs + 5_000) break;
+    await deps.sleep(waitMs);
+    attempt += 1;
+    last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+  }
+  if (last.error && isTransientStageError(last.error)) {
+    const fallbackModel = opts.fallbackModel ?? config.fallbackModel;
+    if (fallbackModel && fallbackModel !== primaryModel && Date.now() < opts.deadlineMs) {
+      console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}); failing over to ${fallbackModel}`);
+      bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: fallbackModel, reason: last.error });
+      const fromFallback = await runOneAttempt(label, prompt, opts, fallbackModel, deps);
+      // Ran on a non-primary model — surface that like reviewer-fallback does,
+      // so the report/UI can flag it even when the fallback run succeeded.
+      return { ...fromFallback, wallSeconds: Math.round((Date.now() - t0) / 1000), degraded: true };
+    }
+    // No usable fallback (unconfigured, same as primary, or the deadline is
+    // already gone) — fail exactly as before this fix, but say so loudly:
+    // this is precisely the gap that took the whole factory down.
+    console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}) and no fallback model configured (FALLBACK_MODEL) — a fallback would likely have helped.`);
+    bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: null, reason: last.error });
+  }
+  return { ...last, wallSeconds: Math.round((Date.now() - t0) / 1000) };
+}
+
+/** One SDK call for `label` on `model` — no retry/failover logic here, just
+ *  the mechanics (env, abort/deadline, message loop, result shaping). Split
+ *  out of runStage so the retry loop above can call it multiple times against
+ *  different models without duplicating any of this. */
+async function runOneAttempt(label: string, prompt: string, opts: StageOptions, model: string, deps: StageDeps): Promise<StageResult> {
   const t0 = Date.now();
   // Non-claude models route via the proxy automatically (any role can be either
   // vendor); an explicit opts.viaProxy still overrides.
-  const viaProxy = opts.viaProxy ?? (config.proxyAll || (!opts.model.startsWith("claude") && !["opus", "sonnet", "haiku", "fable"].includes(opts.model)));
-  opts.onEvent?.({ kind: "stage_started", stage: label, model: opts.model, viaProxy });
+  const viaProxy = opts.viaProxy ?? (config.proxyAll || (!model.startsWith("claude") && !["opus", "sonnet", "haiku", "fable"].includes(model)));
+  opts.onEvent?.({ kind: "stage_started", stage: label, model, viaProxy });
   // Whitelist ONLY. HOME is required for direct SDK auth (~/.claude); the OS
   // sandbox that would confine it is tracked hardening (C19 — interim: scoped
   // Bash allowlists set by callers, attended operation).
@@ -123,10 +220,10 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   activeStages.set(stageId, { label, controller: abort });
   try {
     let result: Record<string, unknown> | null = null;
-    const q = query({
+    const q = deps.query({
       prompt,
       options: {
-        model: opts.model,
+        model,
         cwd: opts.cwd,
         allowedTools: opts.allowedTools ?? [],
         disallowedTools: DENY_ORCHESTRATION,

@@ -66,6 +66,28 @@ export const config = {
     distiller: process.env.DISTILLER_MODEL ?? "haiku",
   },
 
+  // #14/#11 resilience: optional GLOBAL fallback model agents.ts's runStage
+  // fails a stage over to once its primary model exhausts bounded retries on a
+  // TRANSIENT error (429 / "cooling down" / network drop — see agents.ts
+  // isTransientStageError). This is the direct fix for the outage where one
+  // rate-limited provider — with the whole roster on a single model — took the
+  // entire factory down (reviews aborted, tasks parked, steward failed).
+  // Operator-set only, via env var: NEVER sourced from ticket text. meta.ts's
+  // per-ticket `model:` override is untouched by this addition and keeps
+  // validating against Object.values(config.models) exactly as before, so a
+  // ticket can never smuggle an unvetted model in through this door either —
+  // this is a pure resilience knob, not a new authority surface. Validated
+  // against the same plain-identifier shape every model id in this file has
+  // (short alias like "opus"/"fable" or a vendor id like "gpt-5.6-sol"); a
+  // malformed value (empty, whitespace, control characters) is dropped rather
+  // than handed to the SDK. Empty (default, unset) = no fallback configured —
+  // a stage that exhausts retries on a genuine 429 still fails exactly as it
+  // did before this fix; agents.ts logs loudly that a fallback would have
+  // helped, so an operator can see the gap instead of just seeing "parked".
+  fallbackModel: /^[A-Za-z0-9._-]{1,80}$/.test((process.env.FALLBACK_MODEL ?? "").trim())
+    ? (process.env.FALLBACK_MODEL ?? "").trim()
+    : "",
+
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
 
   caps: {

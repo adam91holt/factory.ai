@@ -51,6 +51,17 @@ export function toAlertPayload(e: FactoryEvent): AlertPayload | null {
       // is exactly the "invisible in-flight forever" failure mode T5 exists to
       // surface.
       return { event: e.type, message: `${e.issueKey} STRANDED after park: ${e.failures.join("; ")}`, at: e.at };
+    case "provider_failover":
+      // #14/#11: a stage exhausted its transient-error retries. Always alerts
+      // — whether it recovered onto a fallback model or gave up with none
+      // configured, a human should know the primary model is having trouble.
+      return {
+        event: e.type,
+        message: e.toModel
+          ? `${e.stage} failed over ${e.fromModel} → ${e.toModel}: ${e.reason}`
+          : `${e.stage} exhausted retries on ${e.fromModel} (no fallback configured): ${e.reason}`,
+        at: e.at,
+      };
     default:
       return null;
   }
