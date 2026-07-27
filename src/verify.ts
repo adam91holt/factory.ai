@@ -6,6 +6,17 @@ import type { Workspace } from "./repos.ts";
 // Capability-detecting, BASELINED verify gate. Hardened per code-review verdict
 // 2026-07-20: dependencies are installed before any gate runs — install failure
 // parks, it is NOT a no-gate (C4); gate-name detection broadened (M7).
+//
+// #12a (FAC-34/B11): a baseline gate run that ERRORS or TIMES OUT (spawn
+// failure, or our own timeout kills it) is a transient infrastructure hiccup —
+// distinct from a CLEAN non-zero exit, which means the command ran to
+// completion and genuinely failed. FAC-34 parked "gates fail on clean
+// baseline / no usable gate" and discarded ~$6/139 turns of implementer work
+// because a transient install/timeout on the pristine worktree got
+// misclassified as "genuinely red" and the whole repo was written off as
+// no-gate. runWithRetryOnError() retries ONLY the errored/timed-out case,
+// once, before any baseline/install verdict is recorded — a clean failure is
+// never retried, so this can never mask a real red baseline.
 
 export interface GateResult {
   name: string;
@@ -35,9 +46,25 @@ function npmScripts(dir: string): Record<string, string> {
   }
 }
 
-function run(dir: string, cmd: string, args: string[], timeoutMs = 300_000): { ok: boolean; out: string } {
+export interface RunResult { ok: boolean; out: string; errored: boolean }
+
+function run(dir: string, cmd: string, args: string[], timeoutMs = 300_000): RunResult {
   const r = spawnSync(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs });
-  return { ok: r.status === 0, out: ((r.stdout ?? "") + (r.stderr ?? "")).slice(-3000) };
+  // errored: the command could not be run to COMPLETION — a spawn error (bad
+  // cmd, permissions) or our timeout killed it (a signal, not an exit code).
+  // Distinct from a clean non-zero exit (r.status is a number, r.signal null,
+  // r.error undefined), which means the command ran and genuinely failed.
+  const errored = r.error !== undefined || r.signal !== null;
+  return { ok: r.status === 0, out: ((r.stdout ?? "") + (r.stderr ?? "")).slice(-3000), errored };
+}
+
+/** Retry-once-on-error/timeout policy shared by ensureDeps and baseline (#12a).
+ * Pure w.r.t. the injected `attempt` so the policy is unit-testable without
+ * shelling out or waiting on a real timeout. Never retries a clean non-zero
+ * exit — only a run that could not complete gets the second try. */
+export function runWithRetryOnError(attempt: () => RunResult): RunResult {
+  const first = attempt();
+  return first.errored ? attempt() : first;
 }
 
 /** Per-repo package manager: respect the TARGET repo's lockfile — the factory
@@ -53,12 +80,16 @@ export function packageManager(dir: string): { name: "bun" | "npm"; install: str
 }
 
 /** Install dependencies in a fresh worktree. Distinct outcomes: no package.json
- * (fine, no-gate repo) vs install failed (park — verification impossible). */
-export function ensureDeps(ws: Workspace): { ok: boolean; detail: string } {
+ * (fine, no-gate repo) vs install failed (park — verification impossible).
+ * #12a: an install that could not complete (network blip, timeout) is retried
+ * once before failing (runWithRetryOnError); `transient: true` on a failure
+ * that survived the retry tells the caller this is worth a plain requeue
+ * rather than a deeper look — FAC-34's "transient install/timeout" case. */
+export function ensureDeps(ws: Workspace): { ok: boolean; detail: string; transient?: boolean } {
   if (!existsSync(join(ws.dir, "package.json"))) return { ok: true, detail: "no package.json" };
   const pm = packageManager(ws.dir);
-  const r = run(ws.dir, pm.name, [...pm.install], 600_000);
-  return r.ok ? { ok: true, detail: `${pm.name} ${pm.install[0]}` } : { ok: false, detail: r.out.slice(-800) };
+  const r = runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.install], 600_000));
+  return r.ok ? { ok: true, detail: `${pm.name} ${pm.install[0]}` } : { ok: false, detail: r.out.slice(-800), transient: r.errored };
 }
 
 /** Whether this repo can run Playwright browser checks — a dependency or a
@@ -80,11 +111,15 @@ export function detectGates(ws: Workspace): string[] {
   return CANDIDATES.filter((c) => scripts[c] && !/exit 1|no test specified/.test(scripts[c] ?? ""));
 }
 
-/** Run on the pristine worktree BEFORE the implementer touches anything. */
+/** Run on the pristine worktree BEFORE the implementer touches anything. #12a:
+ * a gate run that errored/timed out (not a clean non-zero exit) is retried
+ * once via runWithRetryOnError before its baselinePassed verdict is recorded —
+ * a transient hiccup here used to be indistinguishable from a genuinely red
+ * baseline, classing the gate no-gate (FAC-34/B11). */
 export function baseline(ws: Workspace, gates: string[]): Map<string, boolean> {
   const pm = packageManager(ws.dir);
   const result = new Map<string, boolean>();
-  for (const gate of gates) result.set(gate, run(ws.dir, pm.name, [...pm.runner, gate]).ok);
+  for (const gate of gates) result.set(gate, runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.runner, gate])).ok);
   return result;
 }
 

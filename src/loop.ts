@@ -271,7 +271,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
 
     const deps = ensureDeps(ws);
-    if (!deps.ok) { await park(issue, repo, stages, `dependency install failed: ${deps.detail.slice(0, 300)}`); return; }
+    if (!deps.ok) { await park(issue, repo, stages, `dependency install failed${deps.transient ? " (transient — safe to requeue)" : ""}: ${deps.detail.slice(0, 300)}`, ws); return; }
     const gates = detectGates(ws);
     const baselines = baseline(ws, gates);
 
@@ -289,13 +289,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (!config.dryRun) {
       const decision = await checkFreshness(issue.identifier, issue.description, { repo, worktreeDir: ws.dir });
       if (decision.action === "cancel") { await resolveStale(issue, repo, stages, decision.reason); return; }
-      if (decision.action === "park") { await park(issue, repo, stages, `freshness: ${decision.reason}`); return; }
+      if (decision.action === "park") { await park(issue, repo, stages, `freshness: ${decision.reason}`, ws); return; }
     }
 
     // G2-prereq0: a drain entered while claim/workspace-setup/freshness ran
     // above must stop BEFORE the first (most expensive) stage spends anything —
     // mirrors every other "if (budget.expired) park+return" boundary below.
-    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason, ws); return; }
 
     // ---- implementer
     // Feed-forward lessons: bounded, newest-first heuristics for this repo,
@@ -320,18 +320,18 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     clearStageSession(issue.identifier, "implementer"); // stage returned → not cut off
     stages.push(implementer);
     await postStageComment(issue, implementer);
-    if (implementer.error) { await park(issue, repo, stages, `implementer: ${implementer.error}`); return; }
+    if (implementer.error) { await park(issue, repo, stages, `implementer: ${implementer.error}`, ws); return; }
     // Resume-safe: a prior attempt may have committed the work before failing a
     // later step (e.g. transient diff). Only park if there is genuinely nothing
     // — neither a fresh commit this run nor prior commits ahead of base.
-    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`) && !hasCommitsAheadOfBase(ws)) { await park(issue, repo, stages, "implementer produced no committable changes"); return; }
-    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
+    if (!commitAll(ws, `${issue.identifier}: implement ${issue.title}`) && !hasCommitsAheadOfBase(ws)) { await park(issue, repo, stages, "implementer produced no committable changes", ws); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason, ws); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "implementation"); return; }
 
     // ---- adversarial review: framing-stripped (spec + diff ONLY), tool-less
     let diff: string;
     try { diff = diffAgainstBase(ws); }
-    catch (error) { await park(issue, repo, stages, `diff failed: ${error instanceof Error ? error.message : error}`); return; }
+    catch (error) { await park(issue, repo, stages, `diff failed: ${error instanceof Error ? error.message : error}`, ws); return; }
 
     const reviewPrompt = (lens: string) =>
       `You are an adversarial code reviewer in an automated pipeline. Assume the change is BROKEN until proven otherwise. Lens: ${lens}. You get ONLY the ticket and the diff — no author reasoning. For each real problem: exact input/scenario that fails, expected vs actual, responsible hunk. No praise. If nothing after genuine effort: NO-FINDINGS.\n\n${spec}\n\n<diff>\n${diff.slice(0, 180_000)}\n</diff>`;
@@ -359,7 +359,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     stages.push(reviewClaude, reviewCodex);
     await postStageComment(issue, reviewClaude);
     await postStageComment(issue, reviewCodex);
-    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason, ws); return; }
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
     const fixer = await runStage("fixer",
@@ -368,9 +368,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     await postStageComment(issue, fixer);
-    if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`); return; }
+    if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`, ws); return; }
     commitAll(ws, `${issue.identifier}: apply review feedback`);
-    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason); return; }
+    if (budget.expired) { await park(issue, repo, stages, budget.expiredReason, ws); return; }
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "review"); return; }
 
     // ---- design review (taste gate): UI diffs are held to a taste bar, not
@@ -441,7 +441,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
           outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
     }
-    if (!summary.green) { await park(issue, repo, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`); return; }
+    if (!summary.green) { await park(issue, repo, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`, ws); return; }
 
     // ---- tester (after gates): executes the ticket's ## Verifications and drives
     // the app in a browser. Gap 2 makes this REQUIRED, not just ticket-opt-in:
@@ -491,7 +491,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     // ---- deliver (guarded paths / test deletion stop auto-advance — C17)
     const removedTests = testFilesRemoved(ws);
-    if (removedTests.length > 0) { await park(issue, repo, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`); return; }
+    if (removedTests.length > 0) { await park(issue, repo, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`, ws); return; }
     const guarded = guardedPathsTouched(ws);
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "delivery"); return; }
 
@@ -668,14 +668,40 @@ export async function retryMutation(
   return { ok: false, error: lastError };
 }
 
-async function park(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
+/** #12b (FAC-34): a park must never silently strand committed work — if the
+ * worktree has commits ahead of base, push the branch anyway (best-effort; a
+ * push failure never blocks or fails the park) and return its URL for the
+ * report. Injectable `hasCommits`/`push` so this is unit-testable without a
+ * real git remote (mirrors retryMutation's injectable `sleep`). */
+export function pushOnPark(
+  ws: Workspace,
+  opts: { hasCommits?: (ws: Workspace) => boolean; push?: (ws: Workspace) => void } = {},
+): string | null {
+  const hasCommits = opts.hasCommits ?? hasCommitsAheadOfBase;
+  const push = opts.push ?? pushBranch;
+  if (!hasCommits(ws)) return null;
+  try {
+    push(ws);
+    return `https://github.com/${ws.repo}/tree/${ws.branch}`;
+  } catch (e) {
+    console.error(`best-effort push-on-park failed for ${ws.repo}/${ws.branch}: ${e}`);
+    return null;
+  }
+}
+
+async function park(issue: linear.Issue, repo: string, stages: StageResult[], reason: string, ws?: Workspace): Promise<void> {
   // Caps and failures PARK, never destroy: worktree kept, Factory-Parked label
   // keeps it out of the queue until a human clears it (C6); comment best-effort,
   // label/release guaranteed (C10). `repo` is threaded in from processIssue so
   // the distilled lesson is repo-scoped (run_finished doesn't carry repo).
+  // #12b: `ws`, when the caller has one, lets a park with committed work push
+  // the branch anyway so nothing is silently lost (never on dry-run — no real
+  // remote to push to).
+  const parkedBranchUrl = ws && !config.dryRun ? pushOnPark(ws) : null;
   const input: ReportInput = {
     issueKey: issue.identifier, prUrl: null, outcome: "parked", reason,
     stages, gates: [], gateStrength: "none", guardedPaths: [],
+    ...(parkedBranchUrl ? { parkedBranchUrl } : {}),
   };
   bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "parked",
     reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,

@@ -1,4 +1,4 @@
-import { SENTINEL } from "./linear.ts";
+import { SENTINEL, PARKED_LABEL } from "./linear.ts";
 import type { StageResult } from "./agents.ts";
 import type { GateResult } from "./verify.ts";
 
@@ -20,6 +20,9 @@ export interface ReportInput {
   reviewFindingsSummary?: string;
   designReview?: string;   // taste-gate findings when TASTE: fail persisted
   verification?: string;   // tester verification report, when it ran
+  // #12b (FAC-34): set when park pushed the worktree's committed work
+  // best-effort so a human can salvage it instead of it being silently lost.
+  parkedBranchUrl?: string;
 }
 
 export function buildReport(input: ReportInput): string {
@@ -38,6 +41,16 @@ export function buildReport(input: ReportInput): string {
     lines.push(`**Outcome:** ${input.outcome}${input.reason ? ` — ${input.reason}` : ""}`, "");
   }
 
+  if (input.outcome === "parked") {
+    // #13: a parked ticket stays in Todo — only the label keeps it out of the
+    // queue (fetchQueue's skip-set) — so requeue is a single reversible edit.
+    lines.push(`Remove the \`${PARKED_LABEL}\` label to requeue.`, "");
+  }
+  if (input.parkedBranchUrl) {
+    // #12b: committed work was pushed best-effort so it is never silently
+    // lost even though the pipeline parked and no PR was opened.
+    lines.push(`🔗 **Work pushed — branch available for salvage:** ${input.parkedBranchUrl}`, "");
+  }
   if (input.gateStrength === "none") {
     lines.push("⚠️ **No usable verify gate in this repo** (nothing runnable, or gates fail on clean baseline). Review accordingly.", "");
   }
@@ -65,6 +78,7 @@ export function buildReport(input: ReportInput): string {
   lines.push(`  pr: ${input.prUrl ?? "null"}`);
   lines.push(`  gate_strength: ${input.gateStrength}`);
   lines.push(`  guarded_paths: ${input.guardedPaths.length}`);
+  lines.push(`  parked_branch: ${JSON.stringify(input.parkedBranchUrl ?? null)}`);
   lines.push(`  degraded: ${degraded}`);
   lines.push(`  cost_usd: ${totalCost.toFixed(4)}`);
   lines.push("  stages:");

@@ -123,7 +123,14 @@ export type FactoryEventBody =
   // (recoverOrphanedClaims). Daemon-only addition, like drain_entered before it —
   // not mirrored to the UI's copy of this union; it's an operability signal for
   // logs/alerts, not something the dashboard renders today.
-  | { type: "park_mutation_failed"; issueKey: string; failures: string[] };
+  | { type: "park_mutation_failed"; issueKey: string; failures: string[] }
+  // #14/#11 resilience: agents.ts's runStage emits this once a stage's primary
+  // model has exhausted its bounded transient-error retries (429 / "cooling
+  // down" / network drop). `toModel` is the fallback model it failed over to,
+  // or null when no fallback was configured/usable — the exact "one 429 took
+  // the whole factory down" scenario this exists to surface. Daemon-only, like
+  // park_mutation_failed above — not mirrored to the UI's copy of this union.
+  | { type: "provider_failover"; stage: string; fromModel: string; toModel: string | null; reason: string };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

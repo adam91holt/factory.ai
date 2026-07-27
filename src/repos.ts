@@ -154,13 +154,49 @@ export const DIFF_FAILED = "<diff-failed>";
 // TRUSTED deploy/smoke shell commands — a PR that adds or edits one must be
 // human-reviewed, so bootstrap REGISTERS via a human-gated PR, never a direct
 // commit.
-const GUARDED_PATH_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /(^|\/)projects\//, /\.test\.|\.spec\.|(^|\/)tests?\//];
+const NON_TEST_GUARDED_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.claude\//, /(^|\/)skills\//, /(^|\/)groundskeepers\//, /(^|\/)agents\//, /(^|\/)projects\//];
+// Split out so guardedPathsTouched can special-case it (#1): a NEWLY-ADDED test
+// file is normal, safe engineering practice — every well-built task adds
+// tests, so guarding on ANY touch made every task stop for a human. Only
+// MODIFYING or DELETING a PRE-EXISTING test stays guarded — that's the real
+// gate-gaming threat (neutering or removing a test to force a gate to pass).
+const TEST_PATH_RE = /\.test\.|\.spec\.|(^|\/)tests?\//;
+const GUARDED_PATH_RES = [...NON_TEST_GUARDED_RES, TEST_PATH_RE];
 
 /** Pure guarded-path classifier: the subset of `files` that any guard regex
  * matches. Extracted from guardedPathsTouched so the policy is unit-testable
- * without shelling out to git — behavior identical. */
+ * without shelling out to git — behavior identical. Status-blind (used where
+ * add-vs-modify doesn't matter, e.g. testFilesRemoved's own deletion filter);
+ * classifyStatusPaths below is the status-aware variant guardedPathsTouched uses. */
 export function classifyPaths(files: string[]): string[] {
   return files.filter((f) => GUARDED_PATH_RES.some((g) => g.test(f)));
+}
+
+/** One `git diff --name-status` entry. For renames git emits `R100\told\tnew`;
+ * `file` is always the current (new) path. */
+export interface NameStatusEntry { status: string; file: string }
+
+/** Parse `git diff --name-status` output into (status, file) pairs. Exported
+ * so parsing is unit-testable without shelling out to git. */
+export function parseNameStatus(out: string): NameStatusEntry[] {
+  return out.split("\n").filter(Boolean).map((line) => {
+    const parts = line.split("\t");
+    return { status: parts[0] ?? "", file: parts[parts.length - 1] ?? "" };
+  }).filter((e) => e.file);
+}
+
+/** Status-aware guarded-path classifier (#1): same guard set as classifyPaths,
+ * but a file matched ONLY via the test-path regex is excluded when its status
+ * is `A` (newly added — nothing pre-existing to neuter). Non-test guarded
+ * paths (.github/, CLAUDE.md, .claude/, skills/, groundskeepers/, agents/,
+ * projects/) stay guarded on ANY status, added included — those directories are
+ * never "just adding tests" and always warrant a human look. Extracted so the
+ * add-vs-modify policy is unit-testable without shelling out to git. */
+export function classifyStatusPaths(entries: NameStatusEntry[]): string[] {
+  return entries
+    .filter(({ file }) => classifyPaths([file]).length > 0)
+    .filter(({ status, file }) => !(status.startsWith("A") && TEST_PATH_RE.test(file) && !NON_TEST_GUARDED_RES.some((re) => re.test(file))))
+    .map(({ file }) => file);
 }
 
 /** Guarded paths force human attention; on any git failure return a sentinel
@@ -172,9 +208,9 @@ export function guardedPathsTouched(ws: Workspace): string[] {
   } catch {
     return [DIFF_FAILED];
   }
-  const diff = git(ws.dir, ["diff", "--name-only", base, "HEAD"]);
+  const diff = git(ws.dir, ["diff", "--name-status", base, "HEAD"]);
   if (!diff.ok) return [DIFF_FAILED];
-  return classifyPaths(diff.stdout.split("\n").filter(Boolean));
+  return classifyStatusPaths(parseNameStatus(diff.stdout));
 }
 
 /** UI files changed by this diff — the taste-gate heuristic (name-only, same

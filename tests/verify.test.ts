@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { detectGates, gateSummary, isE2eGate, hasUiSurface, requiresBrowserEvidence, type GateResult } from "../src/verify.ts";
+import { detectGates, gateSummary, isE2eGate, hasUiSurface, requiresBrowserEvidence, runWithRetryOnError, ensureDeps, type GateResult, type RunResult } from "../src/verify.ts";
 import type { Workspace } from "../src/repos.ts";
 
 const gate = (name: string, passed: boolean | null, baselinePassed = passed !== null): GateResult =>
@@ -195,6 +195,59 @@ describe("hasUiSurface", () => {
       mkdirSync(join(d, "src")); writeFileSync(join(d, "src", "index.ts"), "export const x = 1;");
     });
     try { expect(hasUiSurface(ws)).toBe(false); } finally { rmSync(ws.dir, { recursive: true, force: true }); }
+  });
+});
+
+// #12a (FAC-34/B11): a baseline gate that ERRORS/TIMES OUT (could not complete)
+// must be retried once before its verdict is recorded — a transient install/
+// timeout on a pristine worktree previously got misclassified as "genuinely
+// red baseline" and the whole repo written off as no-gate, discarding ~$6/139
+// turns of implementer work. A CLEAN non-zero exit must never be retried — that
+// is a real signal (the gate genuinely failed on baseline).
+describe("runWithRetryOnError (#12a: baseline gate that errors/times out is retried once)", () => {
+  const errored = (out = ""): RunResult => ({ ok: false, out, errored: true });
+  const cleanFail = (out = "boom"): RunResult => ({ ok: false, out, errored: false });
+  const pass = (): RunResult => ({ ok: true, out: "", errored: false });
+
+  test("an errored/timed-out first attempt is retried once, and the retry's verdict wins", () => {
+    let calls = 0;
+    const r = runWithRetryOnError(() => { calls++; return calls === 1 ? errored() : pass(); });
+    expect(calls).toBe(2);
+    expect(r).toEqual(pass());
+  });
+
+  test("a CLEAN non-zero exit (genuinely red baseline) is NOT retried", () => {
+    let calls = 0;
+    const r = runWithRetryOnError(() => { calls++; return cleanFail(); });
+    expect(calls).toBe(1);
+    expect(r.ok).toBe(false);
+  });
+
+  test("an attempt that keeps erroring/timing out stays failed after the single retry (no infinite retry)", () => {
+    let calls = 0;
+    const r = runWithRetryOnError(() => { calls++; return errored(); });
+    expect(calls).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(r.errored).toBe(true);
+  });
+
+  test("a first-attempt pass is never retried", () => {
+    let calls = 0;
+    const r = runWithRetryOnError(() => { calls++; return pass(); });
+    expect(calls).toBe(1);
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("ensureDeps (#12a: install is retried once on error/timeout via runWithRetryOnError)", () => {
+  test("no package.json → ok, no install attempted (fine, no-gate repo)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "factory-ensuredeps-"));
+    try {
+      const ws: Workspace = { repo: "acme/x", dir, branch: "factory/x", baseRef: "refs/remotes/origin/main" };
+      expect(ensureDeps(ws)).toEqual({ ok: true, detail: "no package.json" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
