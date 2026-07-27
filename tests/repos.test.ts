@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, ghRepoCreateArgs, redactRevertWhy, repoFromTicket, revertMerge } from "../src/repos.ts";
+import { classifyPaths, classifyStatusPaths, ghRepoCreateArgs, guardedPathsTouched, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
 
 describe("classifyPaths — guarded-path detection", () => {
   test("guards factory governance directories at root and nested", () => {
@@ -55,6 +55,145 @@ describe("classifyPaths — guarded-path detection", () => {
 
   test("empty input → empty output", () => {
     expect(classifyPaths([])).toEqual([]);
+  });
+});
+
+describe("parseNameStatus — git diff --name-status parsing", () => {
+  test("parses simple add/modify/delete lines", () => {
+    expect(parseNameStatus("A\tsrc/foo.test.ts")).toEqual([{ status: "A", file: "src/foo.test.ts" }]);
+    expect(parseNameStatus("M\tsrc/foo.test.ts")).toEqual([{ status: "M", file: "src/foo.test.ts" }]);
+    expect(parseNameStatus("D\tsrc/foo.test.ts")).toEqual([{ status: "D", file: "src/foo.test.ts" }]);
+  });
+
+  test("a rename keeps the NEW path (last tab-separated field)", () => {
+    expect(parseNameStatus("R100\told/name.ts\tnew/name.ts")).toEqual([{ status: "R100", file: "new/name.ts" }]);
+  });
+
+  test("blank lines and trailing newline are dropped", () => {
+    expect(parseNameStatus("A\ta.ts\n\nM\tb.ts\n")).toEqual([
+      { status: "A", file: "a.ts" },
+      { status: "M", file: "b.ts" },
+    ]);
+  });
+
+  test("empty input → empty output", () => {
+    expect(parseNameStatus("")).toEqual([]);
+  });
+});
+
+describe("classifyStatusPaths — added-vs-modified guarded-path policy (#1)", () => {
+  test("a newly-ADDED test file is NOT guarded", () => {
+    expect(classifyStatusPaths([{ status: "A", file: "tests/new-feature.test.ts" }])).toEqual([]);
+    expect(classifyStatusPaths([{ status: "A", file: "src/new-feature.spec.ts" }])).toEqual([]);
+  });
+
+  test("a MODIFIED pre-existing test file IS guarded", () => {
+    expect(classifyStatusPaths([{ status: "M", file: "tests/existing.test.ts" }])).toEqual(["tests/existing.test.ts"]);
+  });
+
+  test("a DELETED pre-existing test file IS guarded", () => {
+    expect(classifyStatusPaths([{ status: "D", file: "tests/existing.test.ts" }])).toEqual(["tests/existing.test.ts"]);
+  });
+
+  test("a RENAMED test file IS guarded (not treated as a fresh add)", () => {
+    expect(classifyStatusPaths([{ status: "R100", file: "tests/renamed.test.ts" }])).toEqual(["tests/renamed.test.ts"]);
+  });
+
+  test("non-test guarded paths stay guarded even when newly ADDED — self-mod dirs are never 'just adding tests'", () => {
+    expect(classifyStatusPaths([{ status: "A", file: "agents/new-agent.md" }])).toEqual(["agents/new-agent.md"]);
+    expect(classifyStatusPaths([{ status: "A", file: ".github/workflows/new.yml" }])).toEqual([".github/workflows/new.yml"]);
+    expect(classifyStatusPaths([{ status: "A", file: "projects/new-project.md" }])).toEqual(["projects/new-project.md"]);
+  });
+
+  test("non-guarded paths pass through untouched regardless of status", () => {
+    expect(classifyStatusPaths([{ status: "A", file: "src/loop.ts" }])).toEqual([]);
+    expect(classifyStatusPaths([{ status: "M", file: "src/loop.ts" }])).toEqual([]);
+  });
+
+  test("mixed change set: only the guarded, non-added-test subset survives", () => {
+    const entries = [
+      { status: "A", file: "src/verify.ts" },
+      { status: "A", file: "tests/new.test.ts" },       // added test — not guarded
+      { status: "M", file: "tests/setup.ts" },           // modified pre-existing test — guarded
+      { status: "D", file: "tests/old.test.ts" },        // deleted pre-existing test — guarded
+      { status: "M", file: "agents/fixer.md" },          // self-mod dir — guarded
+      { status: "A", file: "README.md" },
+    ];
+    expect(classifyStatusPaths(entries)).toEqual(["tests/setup.ts", "tests/old.test.ts", "agents/fixer.md"]);
+  });
+});
+
+// Real git integration: guardedPathsTouched shells out to `git diff --name-status`
+// against ws.baseRef, so these prove the added-vs-modified policy end-to-end
+// through an actual worktree, not just the pure classifier above.
+describe("guardedPathsTouched — real git worktree (#1: added tests don't halt the pipeline)", () => {
+  const git = (cwd: string, args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8" });
+
+  function makeWorkspace(): { ws: Workspace; root: string } {
+    const root = mkdtempSync(join(tmpdir(), "factory-guarded-"));
+    const originDir = join(root, "origin.git");
+    const workDir = join(root, "work");
+    git(root, ["init", "--bare", "-b", "main", originDir]);
+    git(root, ["clone", originDir, workDir]);
+    git(workDir, ["config", "user.email", "t@t.t"]);
+    git(workDir, ["config", "user.name", "t"]);
+    mkdirSync(join(workDir, "tests"), { recursive: true });
+    writeFileSync(join(workDir, "tests", "existing.test.ts"), "// pre-existing test\n");
+    git(workDir, ["add", "-A"]);
+    git(workDir, ["commit", "-m", "init"]);
+    git(workDir, ["push", "origin", "main"]);
+    git(workDir, ["checkout", "-b", "feature"]);
+    const ws: Workspace = { repo: "acme/kiwi", dir: workDir, branch: "feature", baseRef: "refs/remotes/origin/main" };
+    return { ws, root };
+  }
+
+  test("adding a brand-new *.test.ts is NOT guarded", () => {
+    const { ws, root } = makeWorkspace();
+    try {
+      writeFileSync(join(ws.dir, "tests", "new-feature.test.ts"), "// new test\n");
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "add new test"]);
+      expect(guardedPathsTouched(ws)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("modifying a pre-existing test file IS guarded", () => {
+    const { ws, root } = makeWorkspace();
+    try {
+      writeFileSync(join(ws.dir, "tests", "existing.test.ts"), "// modified pre-existing test\n");
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "modify existing test"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("deleting a pre-existing test file IS guarded", () => {
+    const { ws, root } = makeWorkspace();
+    try {
+      rmSync(join(ws.dir, "tests", "existing.test.ts"));
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "delete existing test"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("adding a new test alongside an unrelated source change is still NOT guarded", () => {
+    const { ws, root } = makeWorkspace();
+    try {
+      writeFileSync(join(ws.dir, "src-feature.ts"), "export const x = 1;\n");
+      writeFileSync(join(ws.dir, "tests", "new-feature.test.ts"), "// new test\n");
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "feature + test"]);
+      expect(guardedPathsTouched(ws)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
