@@ -155,8 +155,26 @@ const defaultDeps: StageDeps = {
 export async function runStage(label: string, prompt: string, opts: StageOptions, deps: StageDeps = defaultDeps): Promise<StageResult> {
   const t0 = Date.now();
   const primaryModel = opts.model;
+  // B-model-failover adversarial review: every runOneAttempt() below — the
+  // initial try, each retry, and a fallback run — spends real money, but
+  // runStage used to return only the LAST attempt's StageResult. loop.ts sums
+  // exactly the returned costUsd/turns into Budget.spent, so a run that burned
+  // two failed attempts before succeeding on the third was under-billed by the
+  // first two attempts' spend, letting an issue with recurring transient
+  // errors blow past its per-issue budget. Accumulate across every attempt and
+  // report the total, not just the winning (or final failing) one.
+  let totalCost = 0;
+  let totalTurns = 0;
+  let mergedUsage: ModelUsageCompact | undefined;
+  const accumulate = (r: StageResult): void => {
+    totalCost += r.costUsd;
+    totalTurns += r.turns;
+    mergedUsage = mergeModelUsage(mergedUsage, r.modelUsage);
+  };
+
   let attempt = 1;
   let last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+  accumulate(last);
   while (last.error && isTransientStageError(last.error) && attempt < 1 + RETRY_ATTEMPTS) {
     const waitMs = backoffMs(attempt);
     // Don't retry into a window that's already gone — leave enough runway
@@ -165,6 +183,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     await deps.sleep(waitMs);
     attempt += 1;
     last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+    accumulate(last);
   }
   if (last.error && isTransientStageError(last.error)) {
     const fallbackModel = opts.fallbackModel ?? config.fallbackModel;
@@ -172,9 +191,17 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
       console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}); failing over to ${fallbackModel}`);
       bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: fallbackModel, reason: last.error });
       const fromFallback = await runOneAttempt(label, prompt, opts, fallbackModel, deps);
+      accumulate(fromFallback);
       // Ran on a non-primary model — surface that like reviewer-fallback does,
       // so the report/UI can flag it even when the fallback run succeeded.
-      return { ...fromFallback, wallSeconds: Math.round((Date.now() - t0) / 1000), degraded: true };
+      return {
+        ...fromFallback,
+        costUsd: totalCost,
+        turns: totalTurns,
+        ...(mergedUsage ? { modelUsage: mergedUsage } : {}),
+        wallSeconds: Math.round((Date.now() - t0) / 1000),
+        degraded: true,
+      };
     }
     // No usable fallback (unconfigured, same as primary, or the deadline is
     // already gone) — fail exactly as before this fix, but say so loudly:
@@ -182,7 +209,13 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}) and no fallback model configured (FALLBACK_MODEL) — a fallback would likely have helped.`);
     bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: null, reason: last.error });
   }
-  return { ...last, wallSeconds: Math.round((Date.now() - t0) / 1000) };
+  return {
+    ...last,
+    costUsd: totalCost,
+    turns: totalTurns,
+    ...(mergedUsage ? { modelUsage: mergedUsage } : {}),
+    wallSeconds: Math.round((Date.now() - t0) / 1000),
+  };
 }
 
 /** One SDK call for `label` on `model` — no retry/failover logic here, just
@@ -342,6 +375,25 @@ function compactModelUsage(raw: unknown): ModelUsageCompact | undefined {
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Sum two (possibly absent) ModelUsageCompact maps, model-id by model-id —
+ *  used to accumulate token/cost usage across runStage's retry/failover
+ *  attempts (each is already a distinct, redacted, size-bounded map from
+ *  compactModelUsage, so no re-redaction or re-capping is needed here). */
+function mergeModelUsage(a: ModelUsageCompact | undefined, b: ModelUsageCompact | undefined): ModelUsageCompact | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const out: ModelUsageCompact = { ...a };
+  for (const [key, entry] of Object.entries(b)) {
+    const prev = out[key];
+    out[key] = prev === undefined ? entry : {
+      in: prev.in + entry.in, out: prev.out + entry.out,
+      cacheRead: prev.cacheRead + entry.cacheRead, cacheWrite: prev.cacheWrite + entry.cacheWrite,
+      costUsd: prev.costUsd + entry.costUsd,
+    };
+  }
+  return out;
 }
 
 /** Untrusted-input delimiting with an unguessable per-call marker; embedded

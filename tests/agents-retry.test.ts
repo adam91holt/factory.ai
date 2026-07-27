@@ -45,6 +45,17 @@ async function* success(text = "ok"): AsyncGenerator<unknown> {
   yield { type: "result", subtype: "success", result: text, total_cost_usd: 0.02, num_turns: 3 };
 }
 
+function successWithSpend(costUsd: number, turns: number, model: string, text = "ok"): () => AsyncGenerator<unknown> {
+  return async function* (): AsyncGenerator<unknown> {
+    yield { type: "system", subtype: "init", session_id: "s" };
+    yield {
+      type: "result", subtype: "success", result: text,
+      total_cost_usd: costUsd, num_turns: turns,
+      modelUsage: { [model]: { inputTokens: 200, outputTokens: 80, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: costUsd } },
+    };
+  };
+}
+
 async function* transient429(): AsyncGenerator<unknown> {
   yield { type: "system", subtype: "init", session_id: "s" };
   yield { type: "result", subtype: "error_during_execution",
@@ -54,6 +65,21 @@ async function* transient429(): AsyncGenerator<unknown> {
 async function* realError(): AsyncGenerator<unknown> {
   yield { type: "system", subtype: "init", session_id: "s" };
   yield { type: "result", subtype: "error_max_turns" };
+}
+
+// A transient failure that still burned real spend before hitting the
+// network hiccup (the review's example: "a mid-stream ECONNRESET can carry
+// non-zero total_cost_usd") — used to prove runStage no longer discards it.
+function transientWithSpend(costUsd: number, turns: number, model: string): () => AsyncGenerator<unknown> {
+  return async function* (): AsyncGenerator<unknown> {
+    yield { type: "system", subtype: "init", session_id: "s" };
+    yield {
+      type: "result", subtype: "error_during_execution",
+      total_cost_usd: costUsd, num_turns: turns,
+      errors: ["429 · all credentials for model X are cooling down"],
+      modelUsage: { [model]: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: costUsd } },
+    };
+  };
 }
 
 /** Collect provider_failover events emitted during `fn`, without touching the
@@ -162,5 +188,54 @@ describe("runStage — retries exhausted + fallback", () => {
     expect(result.error).toBe("error_during_execution: 429 · all credentials for model X are cooling down");
     expect(deps.calls).toEqual(["sonnet", "sonnet", "sonnet"]);
     expect(events[0]).toMatchObject({ type: "provider_failover", fromModel: "sonnet", toModel: null });
+  });
+});
+
+// Adversarial-review fix (B-model-failover): runStage used to return only the
+// LAST attempt's StageResult, silently discarding costUsd/turns from every
+// earlier failed attempt. loop.ts sums exactly the returned costUsd into
+// Budget.spent (gating config.caps.budgetUsdPerIssue) — so a transient error
+// that still burned spend (e.g. a mid-stream ECONNRESET) before the retry or
+// fallback succeeded was undercounted, letting an issue with recurring
+// transient errors run stages past its per-issue budget.
+describe("runStage — cost accumulation across attempts", () => {
+  test("a retry that recovers sums costUsd/turns/modelUsage across BOTH attempts, not just the winning one", async () => {
+    config.fallbackModel = "";
+    const deps = fakeDeps([transientWithSpend(0.01, 2, "sonnet"), successWithSpend(0.02, 3, "sonnet")]);
+    const result = await runStage("implementer", "do the thing", baseOpts(), deps);
+    expect(result.error).toBeUndefined();
+    expect(result.costUsd).toBeCloseTo(0.03, 6); // 0.01 (failed attempt) + 0.02 (successful retry)
+    expect(result.turns).toBe(5); // 2 + 3
+    expect(result.modelUsage?.sonnet).toMatchObject({ in: 300, out: 130, costUsd: expect.closeTo(0.03, 6) });
+  });
+
+  test("exhausted retries + a successful fallback sum spend across ALL primary attempts plus the fallback", async () => {
+    config.fallbackModel = "opus";
+    const deps = fakeDeps([
+      transientWithSpend(0.01, 1, "sonnet"),
+      transientWithSpend(0.01, 1, "sonnet"),
+      transientWithSpend(0.01, 1, "sonnet"),
+      successWithSpend(0.02, 3, "opus"),
+    ]);
+    const result = await runStage("implementer", "do the thing", baseOpts(), deps);
+    expect(result.error).toBeUndefined();
+    expect(result.degraded).toBe(true);
+    expect(result.costUsd).toBeCloseTo(0.05, 6); // 3 × 0.01 on sonnet + 0.02 on the fallback
+    expect(result.turns).toBe(6); // 1+1+1 + 3
+    expect(result.modelUsage?.sonnet).toMatchObject({ costUsd: expect.closeTo(0.03, 6) });
+    expect(result.modelUsage?.opus).toMatchObject({ costUsd: expect.closeTo(0.02, 6) });
+  });
+
+  test("retries that exhaust with no fallback still sum spend across every failed attempt", async () => {
+    config.fallbackModel = "";
+    const deps = fakeDeps([
+      transientWithSpend(0.01, 1, "sonnet"),
+      transientWithSpend(0.015, 1, "sonnet"),
+      transientWithSpend(0.02, 1, "sonnet"),
+    ]);
+    const result = await runStage("implementer", "do the thing", baseOpts(), deps);
+    expect(result.error).toBeDefined();
+    expect(result.costUsd).toBeCloseTo(0.045, 6); // 0.01 + 0.015 + 0.02 — none discarded
+    expect(result.turns).toBe(3);
   });
 });
