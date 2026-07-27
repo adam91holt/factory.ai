@@ -80,6 +80,48 @@ export function readChildren(dir: string): ChildSpec[] {
   return children;
 }
 
+// Gap 9: parallel siblings collided on undeclared SHARED/GLUE files (global
+// stylesheet, app layout/shell, package.json, the router) because a child
+// edited one without declaring it in ## Touches, so the DAG never serialized
+// the collision. Matched by basename (not full path) since repos name these
+// differently — the goal is visibility, not precision.
+const KNOWN_GLUE_BASENAMES = [
+  "index.css", "app.css", "global.css", "globals.css", "styles.css",
+  "package.json", "package-lock.json", "bun.lock", "bun.lockb", "yarn.lock", "pnpm-lock.yaml",
+  "layout.tsx", "layout.jsx", "layout.ts", "_layout.tsx", "root.tsx", "app.tsx",
+  "router.tsx", "router.ts", "routes.tsx", "routes.ts",
+];
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Advisory static check (Gap 9): for each child, scan its FULL description
+ * text (not just ## Touches) for a mention of a well-known shared/glue file
+ * by basename. If the file is named in the body but the child's DECLARED
+ * ## Touches never included it (by basename), the decomposer likely missed
+ * declaring a real edit — this is exactly the undeclared-collision shape
+ * (index.css / layout / package.json / router) that let parallel siblings
+ * conflict. Cheap (regex over already-parsed text, no repo access) and
+ * PURELY ADVISORY: it returns warning strings for the caller to log, never
+ * throws and never blocks planning — a false positive costs a log line, a
+ * false negative silently reintroduces the sibling file-race this exists to
+ * surface, so it deliberately errs toward flagging. */
+export function findUndeclaredGlueTouches(children: ChildSpec[]): string[] {
+  const warnings: string[] = [];
+  for (const child of children) {
+    const declared = new Set(child.touches.map((t) => (t.split("/").pop() ?? "").toLowerCase()));
+    for (const glue of KNOWN_GLUE_BASENAMES) {
+      if (declared.has(glue)) continue;
+      const mentioned = new RegExp(`\\b${escapeRegExp(glue)}\\b`, "i").test(child.description);
+      if (mentioned) {
+        warnings.push(`child ${child.ordinal} ("${child.title}") mentions shared/glue file "${glue}" but does not declare it in ## Touches`);
+      }
+    }
+  }
+  return warnings;
+}
+
 /** Create the children in ascending ordinal order, resolving each child's
  * ordinal dependencies to the Linear identifiers of the already-created lower
  * ordinals, and stamping the factory meta block (repo, type:task, optional
@@ -189,6 +231,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
           "You are the decomposer in a software factory's planning stage. Using the epic and the scout's research brief, produce 2-6 child tickets that TOGETHER deliver the epic. HARD RULES:",
           '- The children form a DAG, not a flat parallel list. For any child that MUST follow another, declare a "## Depends-on" section listing the ordinals of the files it depends on (reference LOWER-NUMBERED files only, e.g. "01, 02"). A child with no ## Depends-on runs as soon as capacity allows.',
           '- Declare a "## Touches" section listing EVERY path glob the child will modify (e.g. "src/foo/**, src/bar.ts"). Any child whose ## Touches overlap an EARLIER-numbered sibling\'s is given an implicit build-order dependency on it: the later child does not start until the earlier one has MERGED, so overlap costs parallelism (not correctness) — number overlapping children in the order they should build. You MUST declare touches honestly and completely: an omitted path reintroduces the sibling file-race. Prefer honest overlap (safe, serialized) over false independence.',
+          '- SHARED/GLUE files are the most common place touches go undeclared: if a child adds a dependency, a global style, a shared layout change, or a route, it is touching a file OTHER children also touch, and that file MUST be named in ## Touches even if the child\'s "main" work is elsewhere. Call out by name whenever they are edited: the global stylesheet (e.g. index.css), the app layout/shell, package.json (or the lockfile), and the router. Two siblings that both silently edit the same shared file and never declare it will run in parallel and conflict — the DAG can only serialize collisions it is TOLD about.',
           `- Every child description MUST contain exactly these sections: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo}), ## Verifications (Automated/Manual/Visual), ## Touches, optionally ## Depends-on, and optionally ## Implementation approach.`,
           "- Size each child to fit one implementer session (~40 turns / 45 min).",
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
@@ -200,6 +243,11 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
 
     const children = readChildren(join(scratch, "children"));
+    // Gap 9 (advisory only — never blocks planning): log a visible warning for
+    // any child that mentions a well-known shared/glue file in its body without
+    // declaring it in ## Touches, so an undeclared-collision risk is caught
+    // before the DAG runs siblings in parallel.
+    for (const w of findUndeclaredGlueTouches(children)) console.warn(`[${issue.identifier}] ${w}`);
     if (config.dryRun) {
       console.log(`[${issue.identifier}] dry-run: would create ${children.length} children: ${children.map((c) => c.title).join(" | ")}`);
       finish("planned", `dry-run: planned ${children.length} children`);

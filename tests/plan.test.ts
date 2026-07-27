@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readChildren, createChildren, type ChildSpec } from "../src/plan.ts";
+import { readChildren, createChildren, findUndeclaredGlueTouches, type ChildSpec } from "../src/plan.ts";
 import { config } from "../src/config.ts";
 
 // A model in the configured roster (parseFactoryMeta drops unlisted models — a
@@ -76,6 +76,56 @@ describe("readChildren — DAG validation (fail-closed → epic parks)", () => {
     writeChild("01-a.md", `# A\n${FILLER}\n\n## Depends-on\n02`);
     writeChild("02-b.md", `# B\n${FILLER}\n\n## Depends-on\n01`);
     expect(() => readChildren(dir)).toThrow();
+  });
+});
+
+describe("findUndeclaredGlueTouches — Gap 9 advisory shared/glue check", () => {
+  test("flags a child that mentions a glue file in its body but not in ## Touches", () => {
+    const children: ChildSpec[] = [
+      {
+        title: "Add nav", ordinal: 1, dependsOn: [], touches: ["src/nav/**"],
+        description: "## Implementation approach\nAdd a NavBar and wire it into src/index.css for the new theme colors.",
+      },
+    ];
+    const warnings = findUndeclaredGlueTouches(children);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('child 1 ("Add nav")');
+    expect(warnings[0]).toContain("index.css");
+  });
+
+  test("does not flag a child that DID declare the glue file in ## Touches", () => {
+    const children: ChildSpec[] = [
+      {
+        title: "Theme", ordinal: 1, dependsOn: [], touches: ["src/index.css"],
+        description: "## Implementation approach\nUpdate src/index.css with the new palette.",
+      },
+    ];
+    expect(findUndeclaredGlueTouches(children)).toEqual([]);
+  });
+
+  test("does not flag a child whose body never mentions any known glue file", () => {
+    const children: ChildSpec[] = [
+      { title: "Widget", ordinal: 1, dependsOn: [], touches: ["src/widget/**"], description: "## Goal\nBuild a standalone widget." },
+    ];
+    expect(findUndeclaredGlueTouches(children)).toEqual([]);
+  });
+
+  test("flags each undeclared glue mention across multiple children", () => {
+    const children: ChildSpec[] = [
+      { title: "A", ordinal: 1, dependsOn: [], touches: [], description: "Adds a dependency, so it edits package.json too." },
+      { title: "B", ordinal: 2, dependsOn: [], touches: [], description: "Adds a new route to the router." },
+    ];
+    const warnings = findUndeclaredGlueTouches(children);
+    expect(warnings.some((w) => w.includes("package.json"))).toBe(true);
+    expect(warnings.some((w) => w.includes("router.ts") || w.includes("router.tsx"))).toBe(false); // "router" alone isn't a basename match — only exact known filenames trigger
+  });
+
+  test("is case-insensitive and matches by basename regardless of declared path form", () => {
+    const children: ChildSpec[] = [
+      { title: "Layout", ordinal: 1, dependsOn: [], touches: ["app/Layout.tsx"], description: "Edits the shared layout.tsx shell." },
+    ];
+    // Declared as "app/Layout.tsx" (basename "layout.tsx" after lowercasing) — matches the mention, no warning.
+    expect(findUndeclaredGlueTouches(children)).toEqual([]);
   });
 });
 

@@ -14,6 +14,10 @@ Also include:
 - A README.
 - A .gitignore that excludes .env and any secrets.
 
-Do NOT add heavy dependencies; keep it minimal so `install` is fast. Do NOT write any secrets or credentials. When done, reply with a one-paragraph summary of what you scaffolded.
+Do NOT add heavy dependencies; keep it minimal so `install` is fast. Do NOT write any secrets or credentials.
+
+If the stack includes a backend/BFF/API server, it MUST NOT default to port 8787 — that port is the factory's OWN dashboard, and a scaffolded app defaulting to it collides (EADDRINUSE) whenever it runs alongside the factory. Pick an uncommon default port instead (something outside the common 3000/5173/8080/8787 range, e.g. a random-ish 5-digit port in the 20000-59999 range), or better, have the server auto-pick a free port at startup (port 0 / an "any free port" helper) and print the one it bound. Either way, document the chosen port (or how to discover it) in the README.
+
+When done, reply with a one-paragraph summary of what you scaffolded.
 
 {{spec}}
