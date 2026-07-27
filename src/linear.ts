@@ -9,6 +9,11 @@ import { bus } from "./events.ts";
 
 const ENDPOINT = "https://api.linear.app/graphql";
 export const EXECUTING_LABEL = "Factory-Executing";
+// #13: a parked ticket is deliberately left in Todo (queue) state — only the
+// Factory-Parked label keeps it out of fetchQueue/fetchTeamQueue's skip-set
+// below. Re-queue = remove the label; no state transition is required or
+// taken, keeping parked→requeue a single reversible edit (the park report
+// says this explicitly — see report.ts buildReport).
 export const PARKED_LABEL = "Factory-Parked";
 export const NEEDS_HUMAN_LABEL = "Factory-Needs-Human";
 export const EPIC_LABEL = "Factory-Epic";

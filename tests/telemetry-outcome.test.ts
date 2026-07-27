@@ -65,3 +65,43 @@ describe("buildReport — B16 'merged' outcome renders distinctly from pr_open",
     expect(text).toContain("PR ready for review: https://github.com/acme/x/pull/9");
   });
 });
+
+// #12b/#13 (FAC-34): a parked report must (a) tell a human that re-queue is a
+// single label removal, and (b) surface the salvage branch URL when park's
+// best-effort push landed.
+describe("buildReport — parked outcome (#12b push-on-park, #13 requeue-by-label)", () => {
+  test("every parked report instructs how to requeue: remove the Factory-Parked label", () => {
+    const text = buildReport({
+      issueKey: "FAC-1", prUrl: null, outcome: "parked", reason: "gates still failing",
+      stages: [], gates: [], gateStrength: "none", guardedPaths: [],
+    });
+    expect(text).toContain("Remove the `Factory-Parked` label to requeue.");
+  });
+
+  test("a parked report with a pushed branch surfaces the salvage URL and records it in the yaml meta", () => {
+    const text = buildReport({
+      issueKey: "FAC-1", prUrl: null, outcome: "parked", reason: "gates still failing",
+      stages: [], gates: [], gateStrength: "none", guardedPaths: [],
+      parkedBranchUrl: "https://github.com/acme/widgets/tree/factory/fac-1",
+    });
+    expect(text).toContain("Work pushed — branch available for salvage:** https://github.com/acme/widgets/tree/factory/fac-1");
+    expect(text).toContain('parked_branch: "https://github.com/acme/widgets/tree/factory/fac-1"');
+  });
+
+  test("a parked report with no pushed branch (nothing to salvage) omits the salvage line and records null", () => {
+    const text = buildReport({
+      issueKey: "FAC-1", prUrl: null, outcome: "parked", reason: "workspace setup failed",
+      stages: [], gates: [], gateStrength: "none", guardedPaths: [],
+    });
+    expect(text).not.toContain("available for salvage");
+    expect(text).toContain("parked_branch: null");
+  });
+
+  test("a non-parked report never carries the requeue-by-label instruction", () => {
+    const text = buildReport({
+      issueKey: "FAC-1", prUrl: "https://github.com/acme/x/pull/9", outcome: "pr_open",
+      stages: [], gates: [], gateStrength: "strong", guardedPaths: [],
+    });
+    expect(text).not.toContain("Factory-Parked");
+  });
+});

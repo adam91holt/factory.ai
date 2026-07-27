@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation } from "../src/loop.ts";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation, pushOnPark } from "../src/loop.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
+import type { Workspace } from "../src/repos.ts";
 
 const issue = (description: string): Issue => ({
   id: "id-1", identifier: "FAC-1", title: "t", description, url: "https://linear.app/x",
@@ -319,6 +320,34 @@ describe("retryMutation (B3: bounded retry for park's own mutations)", () => {
     const result = await retryMutation(async () => { throw "plain string failure"; },
       { attempts: 1, sleep: async () => {} });
     expect(result).toEqual({ ok: false, error: "plain string failure" });
+  });
+});
+
+// #12b (FAC-34): a park must never silently strand committed work — if the
+// worktree has commits ahead of base, push the branch anyway (best-effort) and
+// surface its URL for the report. `hasCommits`/`push` are injected so this is
+// unit-testable without a real git remote (mirrors retryMutation's injected
+// `sleep`) — this IS the "mock the git push seam" for park().
+describe("pushOnPark (#12b: park with commits pushes the branch, best-effort)", () => {
+  const ws: Workspace = { repo: "acme/widgets", dir: "/tmp/factory-ws", branch: "factory/fac-1", baseRef: "refs/remotes/origin/main" };
+
+  test("no commits ahead of base → never pushes, returns null", () => {
+    let pushed = false;
+    const url = pushOnPark(ws, { hasCommits: () => false, push: () => { pushed = true; } });
+    expect(pushed).toBe(false);
+    expect(url).toBeNull();
+  });
+
+  test("commits ahead of base → pushes and returns the branch URL for the park report", () => {
+    let pushed = false;
+    const url = pushOnPark(ws, { hasCommits: () => true, push: () => { pushed = true; } });
+    expect(pushed).toBe(true);
+    expect(url).toBe("https://github.com/acme/widgets/tree/factory/fac-1");
+  });
+
+  test("a push failure is swallowed — best-effort, park must never throw on a failed push", () => {
+    const url = pushOnPark(ws, { hasCommits: () => true, push: () => { throw new Error("network down"); } });
+    expect(url).toBeNull();
   });
 });
 
