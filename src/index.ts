@@ -21,6 +21,7 @@ import { startEventStore } from "./db.ts";
 import { isDraining } from "./control.ts";
 import { startAlerts } from "./alerts.ts";
 import { startSpendCap } from "./spend-cap.ts";
+import { LinearBackoff } from "./backoff.ts";
 
 // Watch loop. Serial ticks, WIP-limited, single-instance host lease. Hardened
 // per code-review verdict 2026-07-20: lease guard handles empty/garbage files
@@ -28,6 +29,33 @@ import { startSpendCap } from "./spend-cap.ts";
 // batch (C6), rate-limit ticks back off instead of crashing (C25).
 
 const LEASE = join(config.workRoot, ".factory.pid");
+
+// #3: startup fires a burst of sequential Linear calls — orphan recovery,
+// then the first tick's queue fetch plus steward/reconcile/groundskeeper/
+// postmerge (each of which is itself 1+ calls, reconcile one PER team) — with
+// zero spacing between them, which was enough on its own to trip the rate
+// limit before the daemon had processed a single ticket. `pace()` is a small
+// jittered pause dropped between those calls so the very first burst spreads
+// out over ~1-2s instead of firing as one uninterrupted volley. Injectable
+// `sleep` so nothing here ever depends on a real timer in a test.
+const PACE_BASE_MS = 400;
+const PACE_JITTER_MS = 400;
+async function pace(sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms))): Promise<void> {
+  await sleep(PACE_BASE_MS + Math.random() * PACE_JITTER_MS);
+}
+
+// The four background passes run at the end of every tick path (idle, empty-
+// eligible, and busy) — factored out once so the #3 pacing between them lives
+// in exactly one place instead of three copy-pasted blocks.
+async function runBackgroundPasses(): Promise<void> {
+  await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
+  await pace();
+  await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
+  await pace();
+  await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
+  await pace();
+  await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
+}
 
 function acquireLease(): void {
   mkdirSync(config.workRoot, { recursive: true });
@@ -80,10 +108,7 @@ async function tick(): Promise<boolean> {
   const queue = await fetchQueue();
   if (queue.length === 0) {
     bus.emit({ type: "tick_finished", queued: 0, eligible: 0, markedNeedsHuman: 0, processed: 0 });
-    await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
-    await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
-    await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
-    await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
+    await runBackgroundPasses();
     return false;
   }
 
@@ -142,10 +167,7 @@ async function tick(): Promise<boolean> {
     bus.emit({ type: "tick_finished", queued: queue.length, eligible: 0, markedNeedsHuman: queue.length - eligible.length, processed: 0 });
     // Same background passes as the other two return paths — a board holding
     // only epics/ineligible tickets must not pause steward/groundskeeper forever.
-    await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
-    await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
-    await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
-    await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
+    await runBackgroundPasses();
     return false;
   }
 
@@ -184,13 +206,10 @@ async function tick(): Promise<boolean> {
       .finally(() => inFlight.delete(issue.identifier));
   }
   bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: batch.length });
-  await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
-  await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
-  await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
-  // B7: this busy path omitted postMergeTick while both the empty-queue and
-  // eligible-empty return paths above ran it — deploy verification would starve
-  // whenever merges kept the board busy (masked today by DEPLOY_ENABLED=off).
-  await postMergeTick().catch((error) => console.error(`[postmerge] ${error instanceof Error ? error.message : error}`));
+  // B7: this busy path used to omit postMergeTick while both the empty-queue
+  // and eligible-empty return paths ran it — folded into runBackgroundPasses
+  // so all three paths (and the #3 pacing between its calls) stay identical.
+  await runBackgroundPasses();
   return batch.length > 0 || inFlight.size > 0;
 }
 
@@ -222,6 +241,10 @@ async function main(): Promise<void> {
   // start ticking, so in-flight tickets resume instead of stranding In-Progress.
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);
   if (recovered.length > 0) console.log(`[recover] reset ${recovered.length} orphaned claim(s) from a prior run: ${recovered.join(", ")}`);
+  // #3: give Linear a beat between orphan recovery and the first tick's own
+  // burst (queue fetch + steward/reconcile/groundskeeper/postmerge) — see
+  // pace() above.
+  await pace();
   const dashboard = startDashboard();
   // Prerequisite-0 (B6 kill switch / T5 spend cap + alerting, docs/planning/
   // autonomy.md "Build order" item 0): wire both bus subscribers before the
@@ -239,14 +262,21 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => { draining = true; console.log("draining — will exit after current tick"); });
   process.on("SIGTERM", () => { draining = true; });
 
+  // #2: a single transient 503/429 used to park EVERY tick for a flat 300s —
+  // freezing all claiming for five minutes over one blip. This grows from a
+  // small base and resets to it on the next successful tick, so one blip
+  // costs seconds; only a SUSTAINED outage climbs toward the (much lower) cap.
+  const linearBackoff = new LinearBackoff();
+
   do {
     let backoffSeconds = 0;
     let busy = false;
     try {
       busy = await tick();
+      linearBackoff.reset();
     } catch (error) {
       if (error instanceof LinearRateLimited) {
-        backoffSeconds = 300; // park the whole tick cycle at window scale (C25)
+        backoffSeconds = Math.round(linearBackoff.next()); // whole seconds for the dashboard/log
         bus.emit({ type: "linear_backoff", seconds: backoffSeconds });
         console.error(`[tick] ${error.message} — backing off ${backoffSeconds}s`);
       } else {
