@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, resolveModel, type FactoryMeta } from "../src/meta.ts";
+import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, resolveModel, resolveEffort, isKnownEffort, type FactoryMeta } from "../src/meta.ts";
 import { config } from "../src/config.ts";
 
 // A model guaranteed to be in the configured roster — parseFactoryMeta's allowlist
@@ -394,5 +394,188 @@ describe("injection safety: an untrusted description cannot force an unlisted mo
     const meta = parseFactoryMeta(desc);
     expect(meta.models).toEqual({ totallyMadeUpStage: ROSTER_MODEL });
     expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
+  });
+});
+
+// execution-profiles: effort wiring. Mirrors the models/resolveModel test
+// blocks above almost token-for-token — effort is the same "operator-set
+// allowlisted value, dropped if unrecognized, gate stages pinned" shape as
+// model, just for the SDK's reasoning-effort dial instead of vendor/model.
+describe("isKnownEffort", () => {
+  test("accepts exactly the five SDK levels", () => {
+    for (const v of ["low", "medium", "high", "xhigh", "max"]) expect(isKnownEffort(v)).toBe(true);
+  });
+  test("rejects anything else", () => {
+    for (const v of ["", "LOW", "extreme", "high ", " high", "high;rm -rf", "9001"]) expect(isKnownEffort(v)).toBe(false);
+  });
+});
+
+describe("effort: parsing (execution-profiles)", () => {
+  test("a bare scalar sets the single-default form", () => {
+    expect(parseFactoryMeta("<!-- factory\neffort: high\n-->").effort).toBe("high");
+  });
+
+  test("an unknown scalar value is dropped (no meta.effort at all)", () => {
+    expect(parseFactoryMeta("<!-- factory\neffort: ludicrous\n-->").effort).toBeUndefined();
+  });
+
+  test("a 'stage=level stage2=level2' line parses into a per-stage map", () => {
+    const desc = "<!-- factory\neffort: reviewerClaude=high fixer=low\n-->";
+    expect(parseFactoryMeta(desc).effort).toEqual({ reviewerClaude: "high", fixer: "low" });
+  });
+
+  test("an unknown level in one token drops only that entry, keeps the rest", () => {
+    const desc = "<!-- factory\neffort: implementer=turbo fixer=low\n-->";
+    expect(parseFactoryMeta(desc).effort).toEqual({ fixer: "low" });
+  });
+
+  test("an invalid stage-key shape is dropped even with a valid level", () => {
+    const desc = "<!-- factory\neffort: 123bad=high fixer=low\n-->";
+    expect(parseFactoryMeta(desc).effort).toEqual({ fixer: "low" });
+  });
+
+  test("a malformed token (no '=', or empty stage/level side) is dropped without throwing", () => {
+    const desc = "<!-- factory\neffort: garbage =high fixer=low\n-->";
+    expect(parseFactoryMeta(desc).effort).toEqual({ fixer: "low" });
+  });
+
+  test("a map line where every entry is unknown yields undefined (not an empty object)", () => {
+    expect(parseFactoryMeta("<!-- factory\neffort: implementer=nope fixer=alsonope\n-->").effort).toBeUndefined();
+  });
+
+  test("more than 32 tokens are capped like the other array keys", () => {
+    const many = Array.from({ length: 40 }, (_, i) => `stage${i}=high`).join(" ");
+    const parsed = parseFactoryMeta(`<!-- factory\neffort: ${many}\n-->`);
+    expect(Object.keys(parsed.effort as Record<string, string>)).toHaveLength(32);
+  });
+
+  test("start-anchor: an effort line buried in prose is ignored", () => {
+    const desc = "Some prose.\n\n<!-- factory\neffort: high\n-->\n\nmore";
+    expect(parseFactoryMeta(desc).effort).toBeUndefined();
+  });
+
+  test("an injected effort=high on a gate stage still parses (isKnownEffort only guards the VALUE) — resolveEffort is the enforcement point", () => {
+    const desc = "<!-- factory\neffort: securityReviewer=low\n-->";
+    expect(parseFactoryMeta(desc).effort).toEqual({ securityReviewer: "low" });
+  });
+});
+
+describe("effort: render round-trip", () => {
+  test("scalar form round-trips", () => {
+    const rendered = renderFactoryMeta({ repo: "acme/w", type: "task", effort: "high" });
+    expect(rendered).toBe("<!-- factory\nrepo: acme/w\ntype: task\neffort: high\n-->");
+    expect(parseFactoryMeta(`${rendered}\n\nbody`).effort).toBe("high");
+  });
+
+  test("map form renders as ONE 'effort:' line, sorted by stage key for determinism", () => {
+    const rendered = renderFactoryMeta({ effort: { fixer: "low", implementer: "high" } });
+    expect(rendered).toBe("<!-- factory\neffort: fixer=low implementer=high\n-->");
+    expect(parseFactoryMeta(`${rendered}\n\nbody`).effort).toEqual({ fixer: "low", implementer: "high" });
+  });
+
+  test("an explicitly empty effort map omits the line entirely", () => {
+    expect(renderFactoryMeta({ repo: "acme/w", type: "task", effort: {} })).toBe("<!-- factory\nrepo: acme/w\ntype: task\n-->");
+  });
+
+  test("no effort field at all renders a byte-identical block to today (back-compat)", () => {
+    const meta: FactoryMeta = { repo: "acme/widgets", type: "task", model: ROSTER_MODEL };
+    expect(renderFactoryMeta(meta)).toBe(`<!-- factory\nrepo: acme/widgets\ntype: task\nmodel: ${ROSTER_MODEL}\n-->`);
+    expect(renderFactoryMeta(meta)).not.toContain("effort");
+  });
+
+  test("effort round-trips alongside every other key", () => {
+    const meta: FactoryMeta = {
+      repo: "acme/w", type: "task", model: ROSTER_MODEL, models: { implementer: ROSTER_MODEL_2 },
+      effort: { fixer: "low" }, merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"],
+    };
+    const parsed = parseFactoryMeta(`${renderFactoryMeta(meta)}\n\nbody`);
+    expect(parsed).toMatchObject(meta);
+  });
+
+  test("withFactoryMeta stamps an effort map at offset 0", () => {
+    const stamped = withFactoryMeta("## Goal\ndo it", { repo: "acme/w", type: "task", effort: { implementer: "high" } });
+    expect(parseFactoryMeta(stamped).effort).toEqual({ implementer: "high" });
+  });
+});
+
+describe("resolveEffort precedence (execution-profiles)", () => {
+  test("meta per-stage entry wins over everything", () => {
+    const meta: FactoryMeta = { effort: { implementer: "high", "*": "low" } };
+    expect(resolveEffort("implementer", meta, "medium")).toBe("high");
+  });
+
+  test("meta single-default (scalar) wins over the card", () => {
+    const meta: FactoryMeta = { effort: "low" };
+    expect(resolveEffort("implementer", meta, "high")).toBe("low");
+  });
+
+  test("meta per-stage entry wins over meta single-default too", () => {
+    const meta: FactoryMeta = { effort: { implementer: "xhigh" } };
+    // a map means meta.effort is not a scalar, so there is no competing default —
+    // but a stage NOT named in the map must fall through past the map entirely.
+    expect(resolveEffort("implementer", meta, "low")).toBe("xhigh");
+    expect(resolveEffort("fixer", meta, "low")).toBe("low"); // falls to card, not the map's implementer entry
+  });
+
+  test("the card's frontmatter effort wins when meta carries nothing", () => {
+    expect(resolveEffort("implementer", {}, "high")).toBe("high");
+  });
+
+  test("falls back to config.defaultEffort when neither meta nor card supply one", () => {
+    expect(resolveEffort("implementer", {}, undefined)).toBe(config.defaultEffort);
+    expect(resolveEffort("implementer", {})).toBe(config.defaultEffort);
+  });
+
+  test("an unrelated stage's meta entry does not leak into this stage's resolution", () => {
+    const meta: FactoryMeta = { effort: { reviewerClaude: "xhigh" } };
+    expect(resolveEffort("implementer", meta, undefined)).toBe(config.defaultEffort);
+  });
+
+  test("a malformed/unknown cardEffort is ignored, not passed through", () => {
+    expect(resolveEffort("implementer", {}, "not-a-real-level")).toBe(config.defaultEffort);
+  });
+});
+
+describe("resolveEffort: cross-vendor gate stages are pinned — meta is never consulted (execution-profiles)", () => {
+  const GATE_STAGES = ["reviewerClaude", "reviewerCodex", "securityReviewer"] as const;
+
+  for (const stage of GATE_STAGES) {
+    test(`${stage}: a stage-specific meta.effort entry is ignored`, () => {
+      const meta: FactoryMeta = { effort: { [stage]: "low" } };
+      expect(resolveEffort(stage, meta, "high")).toBe("high"); // falls through to the trusted card, not the meta override
+    });
+
+    test(`${stage}: the meta single-default scalar is ignored`, () => {
+      const meta: FactoryMeta = { effort: "low" };
+      expect(resolveEffort(stage, meta, "high")).toBe("high");
+    });
+
+    test(`${stage}: with no card effort either, falls all the way to config.defaultEffort — never the meta value`, () => {
+      const meta: FactoryMeta = { effort: "low" };
+      expect(resolveEffort(stage, meta, undefined)).toBe(config.defaultEffort);
+    });
+  }
+
+  test("non-gate stages are unaffected by the gate-stage pin (implementer still honors meta overrides)", () => {
+    const meta: FactoryMeta = { effort: { implementer: "low" } };
+    expect(resolveEffort("implementer", meta, "high")).toBe("low");
+  });
+});
+
+describe("injection safety: an untrusted description cannot force an unlisted/oversized effort value", () => {
+  test("an unrecognized scalar effort is dropped at parse time, never reaching resolveEffort as a live value", () => {
+    const desc = "<!-- factory\neffort: ludicrous-speed\n-->";
+    const meta = parseFactoryMeta(desc);
+    expect(meta.effort).toBeUndefined();
+    expect(resolveEffort("implementer", meta, undefined)).toBe(config.defaultEffort);
+  });
+
+  test("a per-stage map entry that names a gate stage with a valid level still never reaches that stage via resolveEffort", () => {
+    const desc = "<!-- factory\neffort: securityReviewer=low\n-->";
+    const meta = parseFactoryMeta(desc);
+    // Parses fine — isKnownEffort only guards the VALUE, same as isKnownModel does for models.
+    expect(meta.effort).toEqual({ securityReviewer: "low" });
+    // resolveEffort is the sole enforcement point for the gate pin.
+    expect(resolveEffort("securityReviewer", meta, "medium")).toBe("medium");
   });
 });

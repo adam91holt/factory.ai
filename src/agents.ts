@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.ts";
 import { bus, summarizeToolInput, type AgentStreamEvent } from "./events.ts";
+import type { Effort } from "./meta.ts";
 
 // Stage runner. Claude roles on DIRECT SDK auth; the Codex reviewer is the only
 // proxy leg. Hardened per code-review verdict 2026-07-20: whitelist-only worker
@@ -44,6 +45,14 @@ interface StageOptions {
   // default). Same operator-configured-only trust level as `model` itself —
   // never derived from ticket text.
   fallbackModel?: string;
+  // execution-profiles: reasoning-effort level passed straight through to the
+  // SDK's query() options.effort. Every value that reaches this field already
+  // passed meta.ts's isKnownEffort allowlist (resolveEffort's only callers are
+  // its own call sites in loop.ts/plan.ts/steward.ts) — same trust boundary as
+  // `model` above. Optional so a caller that omits it (any pre-existing
+  // runStage call this change didn't touch) gets the SDK's own default,
+  // unchanged from before this field existed.
+  effort?: Effort;
 }
 
 // B8: the SDK needs a strictly positive maxBudgetUsd to attempt real work, so a
@@ -263,6 +272,7 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
         permissionMode: "dontAsk", // enforces the allowlist (triage-agent lesson)
         maxTurns: opts.maxTurns,
         maxBudgetUsd: stageBudgetUsd(opts.budgetUsd),
+        ...(opts.effort ? { effort: opts.effort } : {}),
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads

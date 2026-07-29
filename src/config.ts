@@ -16,6 +16,14 @@ function num(name: string, fallback: number): number {
 // Only the four known tiers are accepted; an unknown/typo tier is dropped so a
 // malformed env var can never widen merge authority.
 const LADDER_TIERS = new Set(["human", "shadow", "auto-low-risk", "auto"]);
+// The SDK's reasoning-effort levels (query() options.effort). Duplicated here
+// rather than imported from meta.ts's identical EFFORT_VALUES — meta.ts
+// already value-imports `config` from this module, so importing back would
+// create a circular value dependency; a five-string literal set is cheap
+// enough to keep independently, matching how LADDER_TIERS above is its own
+// local list rather than sourced from merge-ladder.ts.
+const EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
+type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 function parsePairs(raw: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const pair of (raw ?? "").split(",")) {
@@ -87,6 +95,16 @@ export const config = {
   fallbackModel: /^[A-Za-z0-9._-]{1,80}$/.test((process.env.FALLBACK_MODEL ?? "").trim())
     ? (process.env.FALLBACK_MODEL ?? "").trim()
     : "",
+
+  // Global default reasoning-effort (execution-profiles): the fallback every
+  // stage's resolveEffort (meta.ts) lands on when neither the ticket meta nor
+  // the stage's agent card declares one. Operator-set only, via env var, exactly
+  // like fallbackModel above — enum-validated so a malformed/typo'd env value
+  // can never reach the SDK's query() options.effort verbatim; falls back to
+  // "medium" when unset or invalid.
+  defaultEffort: (EFFORT_VALUES.has((process.env.DEFAULT_EFFORT ?? "").trim())
+    ? (process.env.DEFAULT_EFFORT ?? "").trim()
+    : "medium") as EffortLevel,
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
 

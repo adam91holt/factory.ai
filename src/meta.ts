@@ -64,6 +64,33 @@ export interface FactoryMeta {
   // ever STOP work, never grant authority. Default undefined so a child with no
   // preconditions renders a byte-identical block.
   preconditions?: string[];
+  // Per-ticket/per-stage reasoning-effort override (execution-profiles). Two
+  // forms, mirroring `model`/`models` above but folded into ONE field per the
+  // build spec: a bare scalar ("effort: high") sets the default for every
+  // non-gate stage; a "stage=level stage2=level2" line (detected by the "="
+  // in each token, same tokenizing as `models`) sets specific stages. Each
+  // value is independently validated against the fixed EFFORT_VALUES enum —
+  // an unknown/injected level (e.g. "effort: max-plus-plus" or a huge string)
+  // is dropped, never widening to an unbounded value the SDK is handed
+  // verbatim. Like `models`, resolveEffort below never lets this field reach
+  // the cross-vendor gate stages (GATE_STAGES) — an untrusted description
+  // must not be able to weaken a safety reviewer's reasoning depth (e.g.
+  // `effort: securityReviewer=low`) to make a real vulnerability more likely
+  // to slip through; that is a strength downgrade with the same abuse shape
+  // isKnownModel's vendor-pin already defends against, just via effort
+  // instead of model choice. Default undefined so a description with no
+  // `effort:` line renders a byte-identical block to today.
+  effort?: Record<string, string> | string;
+}
+
+// The SDK's reasoning-effort levels (query() options.effort — see
+// @anthropic-ai/claude-agent-sdk's EffortLevel). Fixed enum, never derived
+// from ticket text: parseFactoryMeta only ever stores a value that already
+// passed isKnownEffort, exactly like isKnownModel confines `model`/`models`.
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+const EFFORT_VALUES: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
+export function isKnownEffort(value: string): value is Effort {
+  return EFFORT_VALUES.has(value);
 }
 
 // Caps on the array-valued keys so injected junk in an untrusted description
@@ -136,6 +163,29 @@ export function parseFactoryMeta(description: string): FactoryMeta {
       }
       if (Object.keys(map).length > 0) meta.models = map;
     }
+    else if (key === "effort") {
+      // Same compact tokenizing as `models`, but the scalar form ("effort: high",
+      // exactly one token with no "=") is distinguished from the per-stage map
+      // form ("effort: stage=level ...", one or more "=" tokens) up front — the
+      // two forms are mutually exclusive per line, matching how the DSL reads.
+      const tokens = value.split(/\s+/).filter(Boolean);
+      if (tokens.length === 1 && !tokens[0]!.includes("=")) {
+        if (isKnownEffort(tokens[0]!)) meta.effort = tokens[0];
+        else console.warn(`[meta] dropping unknown effort value "${tokens[0]}"`);
+      } else {
+        const map: Record<string, string> = {};
+        for (const tok of tokens.slice(0, MAX_ARRAY_ENTRIES)) {
+          const eq = tok.indexOf("=");
+          if (eq <= 0 || eq === tok.length - 1) { console.warn(`[meta] dropping malformed effort entry "${tok}" (expected stage=level)`); continue; }
+          const stageKey = tok.slice(0, eq);
+          const effortVal = tok.slice(eq + 1);
+          if (!STAGE_KEY.test(stageKey)) { console.warn(`[meta] dropping effort entry with invalid stage key "${stageKey}"`); continue; }
+          if (!isKnownEffort(effortVal)) { console.warn(`[meta] dropping effort entry for "${stageKey}": unknown effort "${effortVal}"`); continue; }
+          map[stageKey] = effortVal;
+        }
+        if (Object.keys(map).length > 0) meta.effort = map;
+      }
+    }
     else if (key === "merge" && (value === "auto" || value === "shadow" || value === "review")) meta.merge = value;
     else if (key === "depends_on") {
       // Split, trim, drop empties, keep only well-formed identifiers, cap count.
@@ -199,12 +249,18 @@ export function renderFactoryMeta(meta: FactoryMeta): string {
   // deterministic, diff-stable render) — both handled separately from the
   // generic scalar/array loop below.
   const lines = Object.entries(meta)
-    .filter(([k]) => k !== "preconditions" && k !== "models")
+    .filter(([k]) => k !== "preconditions" && k !== "models" && k !== "effort")
     .filter(([, v]) => (Array.isArray(v) ? v.length > 0 : v !== undefined && v !== ""))
     .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
   if (meta.models && Object.keys(meta.models).length > 0) {
     const pairs = Object.entries(meta.models).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`);
     lines.push(`models: ${pairs.join(" ")}`);
+  }
+  if (typeof meta.effort === "string" && meta.effort) {
+    lines.push(`effort: ${meta.effort}`);
+  } else if (meta.effort && typeof meta.effort === "object" && Object.keys(meta.effort).length > 0) {
+    const pairs = Object.entries(meta.effort).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`);
+    lines.push(`effort: ${pairs.join(" ")}`);
   }
   for (const pre of meta.preconditions ?? []) lines.push(`precondition: ${pre}`);
   if (lines.length === 0) return "";
@@ -249,6 +305,33 @@ const GATE_STAGES: ReadonlySet<keyof typeof config.models> = new Set([
 export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta): string {
   if (GATE_STAGES.has(stage)) return config.models[stage];
   return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? config.models[stage];
+}
+
+/** Per-stage reasoning-effort resolution (execution-profiles), the effort
+ * counterpart to resolveModel above. Precedence: meta per-stage entry > meta
+ * single-default (the scalar `effort:` form) > the card's own frontmatter
+ * `effort:` (agents/<stage>.md — operator-authored, git-committed, NOT
+ * ticket-sourced) > config.defaultEffort. `cardEffort` is passed in by the
+ * caller (already read via catalog getCard) rather than looked up here, so
+ * this function stays pure/I/O-free like resolveModel.
+ *
+ * The three cross-vendor GATE_STAGES (reviewerClaude, reviewerCodex,
+ * securityReviewer) are pinned exactly like resolveModel pins their model: an
+ * untrusted description must never be able to dial a safety reviewer's
+ * reasoning effort down to make it more likely to wave through a real
+ * problem. Meta is never consulted for these three; only the trusted card
+ * default (if any) and config.defaultEffort apply — the same "operator-
+ * authored sources only" boundary resolveModel draws for the model itself. */
+export function resolveEffort(stage: keyof typeof config.models, meta: FactoryMeta, cardEffort?: string): Effort {
+  const trustedCardEffort = cardEffort && isKnownEffort(cardEffort) ? cardEffort : undefined;
+  if (GATE_STAGES.has(stage)) return trustedCardEffort ?? config.defaultEffort;
+  const metaMap = typeof meta.effort === "object" ? meta.effort : undefined;
+  const metaScalar = typeof meta.effort === "string" ? meta.effort : undefined;
+  const metaStageValue = metaMap?.[stage];
+  return (metaStageValue && isKnownEffort(metaStageValue) ? metaStageValue : undefined)
+    ?? (metaScalar && isKnownEffort(metaScalar) ? metaScalar : undefined)
+    ?? trustedCardEffort
+    ?? config.defaultEffort;
 }
 
 /** Prepend/replace the block in a description (idempotent). */

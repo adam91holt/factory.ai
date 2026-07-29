@@ -10,8 +10,12 @@ import { fileURLToPath } from "node:url";
 // rather than crashing the daemon — cards are additive, never load-bearing.
 
 export interface Card {
-  /** Frontmatter as flat string values (tools/model/effort/when — reference,
-   *  not execution: runStage still takes model/allowedTools from config/code). */
+  /** Frontmatter as flat string values. tools/model/when remain reference-only
+   *  (runStage still takes model/allowedTools from config/code — model
+   *  resolution never reads the card). `effort` is the one exception
+   *  (execution-profiles): cardEffort() below reads it as the fallback tier in
+   *  meta.ts's resolveEffort precedence, so a card's `effort:` frontmatter is
+   *  now load-bearing, not just documentation. */
   frontmatter: Record<string, string>;
   /** The prompt body verbatim, with {{placeholder}} tokens for runtime values. */
   prompt: string;
@@ -65,6 +69,19 @@ export function listCards(): string[] {
   } catch {
     return [];
   }
+}
+
+/** A card's own frontmatter `effort:` value (agents/<name>.md), or undefined
+ *  when the card is missing or declares none. This is the "card" leg of
+ *  meta.ts's resolveEffort precedence chain — execution-profiles makes the
+ *  frontmatter `effort:` LOAD-BEARING (previously catalog.ts's own doc
+ *  comment called tools/model/effort "reference, not execution"). The raw
+ *  string is NOT validated here — resolveEffort's isKnownEffort check is the
+ *  single enforcement point, exactly like every other effort/model source in
+ *  this file funnels through one allowlist rather than each call site
+ *  re-implementing it. */
+export function cardEffort(name: string): string | undefined {
+  return getCard(name)?.frontmatter.effort;
 }
 
 /**

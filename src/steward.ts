@@ -5,9 +5,9 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
-import { parseFactoryMeta, withFactoryMeta, resolveModel } from "./meta.ts";
+import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
 import { liftPreconditions } from "./precondition.ts";
-import { renderPrompt } from "./catalog.ts";
+import { renderPrompt, cardEffort } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 import { lastParkReasonForIssue } from "./db.ts";
 
@@ -116,7 +116,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         "",
         untrusted(`CHILDREN STATUS + PRS:\n${childReports}`),
       ].join("\n")),
-    { model: resolveModel("steward", epicMeta), cwd: scratch,
+    { model: resolveModel("steward", epicMeta), effort: resolveEffort("steward", epicMeta, cardEffort("steward")), cwd: scratch,
       // Read-only gh: the steward investigates PRs (view/diff/checks/list) but
       // cannot mutate — merge/close/comment/push verbs are simply not granted,
       // so "the human merges" holds by construction, not by prompt discipline.

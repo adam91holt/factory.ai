@@ -4,8 +4,8 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
-import { parseFactoryMeta, withFactoryMeta, resolveModel } from "./meta.ts";
-import { renderPrompt } from "./catalog.ts";
+import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
+import { renderPrompt, cardEffort } from "./catalog.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -147,7 +147,7 @@ export function findUndeclaredGlueTouches(children: ChildSpec[]): string[] {
  * strictly-lower ordinals, so acyclicity is preserved. */
 export async function createChildren(
   children: ChildSpec[],
-  base: { repo: string; model?: string; models?: Record<string, string> },
+  base: { repo: string; model?: string; models?: Record<string, string>; effort?: Record<string, string> | string },
   create: (child: ChildSpec, stampedDescription: string) => Promise<string>,
 ): Promise<string[]> {
   const created: string[] = [];
@@ -171,6 +171,10 @@ export async function createChildren(
       // implementer) reaches the pipeline for each child too, not just the
       // legacy single-`model` override.
       ...(base.models && Object.keys(base.models).length > 0 ? { models: base.models } : {}),
+      // Propagate the epic's effort the same way models is propagated above —
+      // a per-epic effort override (single default or per-stage map) reaches
+      // every child's pipeline run, not just this planning stage's own.
+      ...(base.effort && (typeof base.effort === "string" ? base.effort !== "" : Object.keys(base.effort).length > 0) ? { effort: base.effort } : {}),
       ...(dependsIds.length ? { depends_on: dependsIds } : {}),
       ...(child.touches.length ? { touches: child.touches } : {}),
     });
@@ -225,7 +229,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     const scout = await runStage("scout",
       renderPrompt("scout", { spec },
         `You are the research scout in a software factory's planning stage. Investigate everything needed to break the epic below into parallel implementation tickets: read the repo in the current directory (structure, stack, conventions, reference/ material if present), and use WebSearch/WebFetch for anything external the epic depends on. Return a dense research brief: what exists, what must be built, data sources/APIs with concrete endpoints or file paths, risks, and a suggested split into independent work areas.\n\n${spec}`),
-      { model: resolveModel("scout", epicMeta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("scout", epicMeta), effort: resolveEffort("scout", epicMeta, cardEffort("scout")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
     await postStageComment(issue, scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
@@ -246,7 +250,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
           "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
         ].join("\n")),
-      { model: resolveModel("planner", epicMeta), cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("planner", epicMeta), effort: resolveEffort("planner", epicMeta, cardEffort("decomposer")), cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
     await postStageComment(issue, decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
@@ -266,7 +270,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // type:task, and the epic's model/models (per-epic override propagates to
     // children). This is why children can never fail repo-parse or the epic-race
     // again.
-    const created = await createChildren(children, { repo, model: epicMeta.model, models: epicMeta.models },
+    const created = await createChildren(children, { repo, model: epicMeta.model, models: epicMeta.models, effort: epicMeta.effort },
       (child, stamped) => linear.createSubIssue(issue, child.title, stamped));
 
     await linear.postComment(issue, [
