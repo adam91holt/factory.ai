@@ -526,6 +526,26 @@ describe("resolveEffort precedence (execution-profiles)", () => {
     expect(resolveEffort("implementer", {})).toBe(config.defaultEffort);
   });
 
+  // Regression pin (fix for the effort-wiring review findings): a completely
+  // unconfigured ticket — no meta effort field, no card effort, and no
+  // DEFAULT_EFFORT env var set — must resolve to `undefined`, not a
+  // manufactured "medium". `undefined` is what makes agents.ts omit the SDK
+  // call's `effort` key entirely, which is what lets the SDK's own
+  // documented default ("high") stand — i.e. byte-for-byte the same
+  // reasoning depth every stage got before this feature existed. If this
+  // test ever fails because config.defaultEffort stops being undefined by
+  // default, that is exactly the silent-downgrade regression the review
+  // flagged: a no-effort ticket must behave EXACTLY as it did pre-feature.
+  test("REGRESSION: a fully unconfigured stage resolves to undefined (SDK's own 'high' default stands, not config's medium)", () => {
+    expect(config.defaultEffort).toBeUndefined();
+    expect(resolveEffort("implementer", {}, undefined)).toBeUndefined();
+    expect(resolveEffort("fixer", {})).toBeUndefined();
+    // Holds for the pinned gate stages too — they must not manufacture a
+    // "medium" out of thin air any more than a non-gate stage does.
+    expect(resolveEffort("securityReviewer", {}, undefined)).toBeUndefined();
+    expect(resolveEffort("reviewerClaude", { effort: "low" }, undefined)).toBeUndefined();
+  });
+
   test("an unrelated stage's meta entry does not leak into this stage's resolution", () => {
     const meta: FactoryMeta = { effort: { reviewerClaude: "xhigh" } };
     expect(resolveEffort("implementer", meta, undefined)).toBe(config.defaultEffort);

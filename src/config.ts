@@ -100,11 +100,17 @@ export const config = {
   // stage's resolveEffort (meta.ts) lands on when neither the ticket meta nor
   // the stage's agent card declares one. Operator-set only, via env var, exactly
   // like fallbackModel above — enum-validated so a malformed/typo'd env value
-  // can never reach the SDK's query() options.effort verbatim; falls back to
-  // "medium" when unset or invalid.
+  // can never reach the SDK's query() options.effort verbatim. Deliberately
+  // undefined (not "medium") when DEFAULT_EFFORT is unset: effort is
+  // strictly opt-in end-to-end (see resolveEffort in meta.ts), so a ticket
+  // and operator setup that specify no effort at all fall all the way
+  // through to `undefined`, agents.ts omits the `effort` key from the SDK
+  // call, and the SDK's own documented default ("high") stands — exactly
+  // the behavior every stage had before this feature existed. An operator
+  // who wants a different global floor sets DEFAULT_EFFORT explicitly.
   defaultEffort: (EFFORT_VALUES.has((process.env.DEFAULT_EFFORT ?? "").trim())
     ? (process.env.DEFAULT_EFFORT ?? "").trim()
-    : "medium") as EffortLevel,
+    : undefined) as EffortLevel | undefined,
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
 

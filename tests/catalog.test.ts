@@ -13,9 +13,12 @@ describe("cardEffort", () => {
     expect(cardEffort("implementer")).toBe("high");
   });
 
-  test("a different real card can declare a different level", () => {
-    // agents/reviewer-spec.md declares `effort: medium`.
-    expect(cardEffort("reviewer-spec")).toBe("medium");
+  test("a review-gate card's frontmatter is read the same way as any other card", () => {
+    // agents/reviewer-spec.md declares `effort: high` — bumped from `medium`
+    // (see the effort-wiring fix): the SDK's own default is "high", and a
+    // formerly-decorative card value must not silently downgrade a
+    // cross-vendor gate's reasoning depth the moment it becomes load-bearing.
+    expect(cardEffort("reviewer-spec")).toBe("high");
   });
 
   test("a missing card returns undefined rather than throwing", () => {

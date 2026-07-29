@@ -315,14 +315,28 @@ export function resolveModel(stage: keyof typeof config.models, meta: FactoryMet
  * caller (already read via catalog getCard) rather than looked up here, so
  * this function stays pure/I/O-free like resolveModel.
  *
+ * Effort is strictly OPT-IN: when none of those sources specifies a value,
+ * this returns `undefined` rather than manufacturing one. agents.ts already
+ * omits the SDK call's `effort` key when it receives `undefined` (see its
+ * `...(opts.effort ? { effort: opts.effort } : {})` spread), so an
+ * unconfigured stage falls through to the SDK's own documented default
+ * ("high") verbatim — identical to how every stage behaved before this
+ * feature existed. This is deliberate: a formerly-decorative card value or a
+ * newly-added feature must never manufacture a silent reasoning-depth
+ * reduction that no ticket or operator asked for.
+ *
  * The three cross-vendor GATE_STAGES (reviewerClaude, reviewerCodex,
  * securityReviewer) are pinned exactly like resolveModel pins their model: an
  * untrusted description must never be able to dial a safety reviewer's
  * reasoning effort down to make it more likely to wave through a real
  * problem. Meta is never consulted for these three; only the trusted card
  * default (if any) and config.defaultEffort apply — the same "operator-
- * authored sources only" boundary resolveModel draws for the model itself. */
-export function resolveEffort(stage: keyof typeof config.models, meta: FactoryMeta, cardEffort?: string): Effort {
+ * authored sources only" boundary resolveModel draws for the model itself.
+ * (Their cards are pinned at `effort: high` — see agents/reviewer-spec.md,
+ * agents/reviewer-repo.md, agents/security-reviewer.md — so this pinning
+ * path itself no longer downgrades the gate; it only stops a ticket from
+ * reaching it.) */
+export function resolveEffort(stage: keyof typeof config.models, meta: FactoryMeta, cardEffort?: string): Effort | undefined {
   const trustedCardEffort = cardEffort && isKnownEffort(cardEffort) ? cardEffort : undefined;
   if (GATE_STAGES.has(stage)) return trustedCardEffort ?? config.defaultEffort;
   const metaMap = typeof meta.effort === "object" ? meta.effort : undefined;
