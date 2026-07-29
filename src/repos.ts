@@ -199,8 +199,104 @@ export function classifyStatusPaths(entries: NameStatusEntry[]): string[] {
     .map(({ file }) => file);
 }
 
+// --- MODIFIED-test-file add-vs-weaken classifier -----------------------------
+// classifyStatusPaths (above) exempts a NEWLY-ADDED (status A) test file, but a
+// MODIFIED (status M) pre-existing test still forces needs_human even when the
+// diff is a legitimate extension (+15 assertions / -3 as the state shape
+// grows). That's the common case for a good task, so a human ends up
+// hand-checking "extended, safe" vs "weakened" on nearly every ticket. This
+// classifies the git diff of a MODIFIED test-only file (never a non-test
+// guarded path — those stay guarded on content grounds alone) as an additive
+// extension or a weakening, purely from diff content — never from
+// issue.description (safety envelope: the GRANT side of auto-merge is
+// evidence-only, per repos.ts's guarded-path invariant).
+
+/** True when `file` is guarded ONLY via the test-path regex — i.e. it is not
+ * also inside a non-test guarded directory (.github/, CLAUDE.md, .claude/,
+ * skills/, groundskeepers/, agents/, projects/). Those always stay guarded
+ * regardless of diff content; only a pure test file is eligible for the
+ * add-vs-weaken diff classifier below. */
+function isTestOnlyGuardedPath(file: string): boolean {
+  return TEST_PATH_RE.test(file) && !NON_TEST_GUARDED_RES.some((re) => re.test(file));
+}
+
+const BLOCK_OPENER_RE = /\b(?:it|test|describe)\s*\(/g;
+const ASSERTION_RE = /\b(?:expect|assert)\s*(?:\.\w+)?\s*\(/g;
+// Known no-op / tautological assertion shapes — the "gut a real assertion into
+// a rubber stamp" pattern (e.g. `expect(x).toBe(y)` → `expect(true).toBe(true)`).
+const TRIVIAL_ASSERTION_RE = /expect\(\s*true\s*\)\.(?:toBe\(\s*true\s*\)|toBeTruthy\(\))|expect\(\s*1\s*\)\.toBe\(\s*1\s*\)|assert\(\s*true\s*\)|assert\.ok\(\s*true\s*\)/g;
+function countMatches(re: RegExp, text: string): number {
+  return (text.match(re) ?? []).length;
+}
+
+/** Split a unified diff (as produced by `git diff <base> <head> -- <file>`)
+ * into the bodies of added (`+`) and removed (`-`) lines, dropping the
+ * `+++`/`---` file-header lines and the leading marker itself. */
+function splitDiffLines(diffText: string): { added: string; removed: string } {
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const line of diffText.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) added.push(line.slice(1));
+    else if (line.startsWith("-")) removed.push(line.slice(1));
+  }
+  return { added: added.join("\n"), removed: removed.join("\n") };
+}
+
+/** Pure classifier: does a MODIFIED test file's diff read as a PURELY-ADDITIVE
+ * EXTENSION (safe to exempt from the guard) rather than a WEAKENING (stays
+ * guarded)? Extracted so the add-vs-weaken policy is unit-testable without
+ * shelling out to git (same rationale as classifyPaths/parseNameStatus).
+ *
+ * A unified diff renders ANY rewritten line — a value edit, a loosened
+ * matcher, an added `.not`, a swapped-out it()-block body — as a removed `-`
+ * line paired with an added `+` line. A syntactic counter that only looks at
+ * net counts (e.g. "assertions added minus removed <= tolerance") is
+ * defeated by exactly that rewrite shape: `expect(order.total).toBe(42)` →
+ * `expect(order.total).toBe(order.total)` nets to zero and reads as
+ * "additive". So this classifier does not permit ANY existing
+ * assertion/block line to be removed or rewritten at all — only a diff that
+ * strictly ADDS new assertions/blocks without touching a single pre-existing
+ * one is exempted. That closes value-edit, matcher-loosening, `.not`
+ * inversion, block-swap, and net-zero critical-assertion-for-fluff
+ * vectors in one rule: a genuine extension only adds lines.
+ *
+ * NOT an extension (stays guarded) when any of:
+ *   - any pre-existing it()/test()/describe() block line was removed/rewritten
+ *     (blocksRemoved > 0);
+ *   - any pre-existing assertion line was removed/rewritten
+ *     (assertionsRemoved > 0), regardless of how many were added back —
+ *     there is no tolerance for a 1:1 "removed one, added one" edit;
+ *   - a trivial/tautological assertion was introduced (e.g.
+ *     `expect(true).toBe(true)`), even if nothing else was removed;
+ *   - the diff adds no assertions/blocks at all (comment/formatting-only
+ *     changes are ambiguous, not evidence of an extension).
+ * Conservative by construction: every branch that isn't a clear
+ * strictly-additive signal returns false (stays guarded). */
+export function isAdditiveTestExtension(diffText: string): boolean {
+  const { added, removed } = splitDiffLines(diffText);
+
+  const blocksAdded = countMatches(BLOCK_OPENER_RE, added);
+  const blocksRemoved = countMatches(BLOCK_OPENER_RE, removed);
+  if (blocksRemoved > 0) return false; // any existing test block removed or rewritten
+
+  const trivialAdded = countMatches(TRIVIAL_ASSERTION_RE, added);
+  if (trivialAdded > 0) return false; // a tautological/no-op assertion was introduced
+
+  const assertionsAdded = countMatches(ASSERTION_RE, added);
+  const assertionsRemoved = countMatches(ASSERTION_RE, removed);
+  if (assertionsRemoved > 0) return false; // any existing assertion removed or rewritten — no tolerance
+
+  if (assertionsAdded === 0 && blocksAdded === 0) return false; // nothing added — ambiguous, not evidence of extension
+
+  return true;
+}
+
 /** Guarded paths force human attention; on any git failure return a sentinel
- * that forces review rather than silently passing (C2/C17). */
+ * that forces review rather than silently passing (C2/C17). A MODIFIED
+ * test-only file is further exempted when its own diff classifies as an
+ * additive extension (isAdditiveTestExtension) — evidence read from git diff
+ * content only, never issue.description. */
 export function guardedPathsTouched(ws: Workspace): string[] {
   let base: string;
   try {
@@ -210,7 +306,15 @@ export function guardedPathsTouched(ws: Workspace): string[] {
   }
   const diff = git(ws.dir, ["diff", "--name-status", base, "HEAD"]);
   if (!diff.ok) return [DIFF_FAILED];
-  return classifyStatusPaths(parseNameStatus(diff.stdout));
+  const entries = parseNameStatus(diff.stdout);
+  const guarded = classifyStatusPaths(entries);
+  return guarded.filter((file) => {
+    const entry = entries.find((e) => e.file === file);
+    if (!entry || entry.status !== "M" || !isTestOnlyGuardedPath(file)) return true; // stays guarded
+    const fileDiff = git(ws.dir, ["diff", base, "HEAD", "--", file]);
+    if (!fileDiff.ok) return true; // conservative: git failure keeps it guarded
+    return !isAdditiveTestExtension(fileDiff.stdout);
+  });
 }
 
 /** UI files changed by this diff — the taste-gate heuristic (name-only, same

@@ -173,6 +173,14 @@ export const config = {
     promoteAfter: num("MERGE_LADDER_PROMOTE_AFTER", 10),
     lowRiskMaxDiff: num("MERGE_LADDER_LOW_RISK_MAX_DIFF", 40),
   },
+  // Auto-merge-by-default (operator opt-in via AUTO_MERGE_DEFAULT=1; default OFF so
+  // the capability ships dormant). When ON, a non-self repo defaults to the "auto"
+  // tier instead of "human" — so a CLEAN task (decideMerge.wouldMerge: green+strong,
+  // unguarded, no needs-human fold, security not-fail, browser ok) merges with no
+  // human. This changes ONLY the default tier; every SAFETY condition still routes
+  // to needs_human via decideMerge/the holdReasons folds. Never derived from ticket
+  // text (untrusted description can only WITHHOLD via merge:review, never grant).
+  autoMergeDefault: (process.env.AUTO_MERGE_DEFAULT ?? "0") === "1",
   // Repos where the factory may merge its own green, unguarded PRs. RETAINED but
   // re-interpreted (Gap 2): a repo here is enrolled with ceiling "auto" and STILL
   // starts at shadow — it must earn auto-merge through the ladder, not flip on.
