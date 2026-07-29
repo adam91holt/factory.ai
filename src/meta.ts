@@ -16,7 +16,13 @@ export interface FactoryMeta {
   // like every other key (start-anchor) so injected prose can never reroute a
   // ticket into repo-creation or the intake interview.
   type?: "epic" | "task" | "idea" | "bootstrap";
-  model?: string;                      // per-ticket implementer/fixer model override
+  // Per-ticket model override. Historically scoped to implementer/fixer only;
+  // resolveModel now consults it for every stage EXCEPT the cross-vendor gate
+  // stages (reviewerClaude, reviewerCodex, securityReviewer — see GATE_STAGES
+  // below), which always run their config.models default regardless of this
+  // field, `models`, or the "*" wildcard. A value here still passes isKnownModel
+  // at parse time, same as every other model source.
+  model?: string;                      // per-ticket model override (implementer/fixer/etc — gate stages excluded)
   // Per-STAGE model overrides (execution-profiles). Keys are stage names
   // (matching config.models's keys — implementer, reviewerClaude, reviewerCodex,
   // fixer, scout, planner, steward, designReviewer, tester, securityReviewer,
@@ -29,7 +35,12 @@ export interface FactoryMeta {
   // length): an unrecognized key is simply never read by resolveModel, so it
   // costs nothing and grants nothing — the allowlist protection is entirely on
   // the model VALUE, exactly like `model`. Default undefined so a description
-  // with no `models:` line renders a byte-identical block to today.
+  // with no `models:` line renders a byte-identical block to today. NOTE: even
+  // a stage-specific or "*" entry here is ignored by resolveModel for the
+  // cross-vendor gate stages (reviewerClaude, reviewerCodex, securityReviewer)
+  // — the allowlist confines the VALUE to the roster but places no constraint
+  // on vendor, so pinning those stages to config.models is what actually
+  // defends the cross-vendor invariant (see GATE_STAGES).
   models?: Record<string, string>;
   // per-ticket merge policy. UNREAD today (auto-merge is gated solely on
   // config.autoMergeRepos). If ever wired in, a description-sourced value may
@@ -200,14 +211,35 @@ export function renderFactoryMeta(meta: FactoryMeta): string {
   return `<!-- factory\n${lines.join("\n")}\n-->`;
 }
 
-/** Per-stage model resolution (execution-profiles): stage-specific meta
- * override > wildcard "*" meta override > the legacy scalar `model` field
- * (equivalent to models["*"], kept working for back-compat) > the operator's
- * config.models default for that stage. Pure — no I/O — so every stage call
- * site gets a one-line lookup instead of the old ad-hoc `ovr || config.models.x`
- * that only implementer/fixer ever had; every other stage (reviewers, scout,
- * planner, steward, tester, security/design reviewers) always ran the global
- * config default, so one provider's 429 could take the whole roster down.
+// Cross-vendor safety-gate stages: reviewerClaude + reviewerCodex form the
+// deliberate two-vendor adversarial review pair, and securityReviewer is
+// cross-vendor by design (config.ts: "so a Claude author is not the sole
+// security judge of its own diff"). isKnownModel confines a description-
+// sourced override to the operator's roster but places NO constraint on
+// VENDOR — an untrusted ticket with `models: securityReviewer=opus` (or the
+// blanket `models: *=sonnet`, or even the legacy `model: opus`) would
+// otherwise pass the allowlist and silently collapse the gate onto the same
+// vendor as the implementer. These three stages are therefore pinned to
+// config.models — resolveModel below never consults meta for them, so no
+// description-sourced field (stage-specific, "*", or legacy `model`) can
+// reach them. This is an intentional, absolute exclusion, not a preference:
+// an operator who wants to change a gate stage's model does so via
+// config.models / the stage's env var, never via ticket text.
+const GATE_STAGES: ReadonlySet<keyof typeof config.models> = new Set([
+  "reviewerClaude", "reviewerCodex", "securityReviewer",
+]);
+
+/** Per-stage model resolution (execution-profiles): for every stage EXCEPT
+ * the cross-vendor gate stages (GATE_STAGES above, always pinned to
+ * config.models[stage]) — stage-specific meta override > wildcard "*" meta
+ * override > the legacy scalar `model` field (equivalent to models["*"],
+ * kept working for back-compat, now reaching every non-gate stage rather
+ * than just implementer/fixer) > the operator's config.models default for
+ * that stage. Pure — no I/O — so every non-gate stage call site gets a
+ * one-line lookup instead of the old ad-hoc `ovr || config.models.x` that
+ * only implementer/fixer ever had; every other non-gate stage (scout,
+ * planner, steward, tester, designReviewer) always ran the global config
+ * default, so one provider's 429 could take the whole roster down.
  * `stage` is constrained to config.models's own keys, so the fallback branch
  * is always a real, operator-configured model id — this function performs NO
  * validation itself; every value it can possibly return already passed
@@ -215,6 +247,7 @@ export function renderFactoryMeta(meta: FactoryMeta): string {
  * by the operator (config.models). An unrecognized key in meta.models (one
  * that doesn't match any `stage` ever passed here) is simply never read. */
 export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta): string {
+  if (GATE_STAGES.has(stage)) return config.models[stage];
   return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? config.models[stage];
 }
 

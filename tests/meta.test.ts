@@ -232,6 +232,57 @@ describe("resolveModel precedence (execution-profiles)", () => {
   });
 });
 
+// The cross-vendor safety gates (reviewerClaude/reviewerCodex form the
+// adversarial review pair; securityReviewer is cross-vendor by design so a
+// Claude author is never the sole security judge of its own diff) must be
+// UNREACHABLE from description-sourced meta — stage-specific, wildcard, and
+// the legacy scalar `model` field must all be ignored for these three stages,
+// even though every value involved independently passes isKnownModel.
+describe("resolveModel: cross-vendor gate stages are pinned to config.models (execution-profiles fix)", () => {
+  const GATE_STAGES = ["reviewerClaude", "reviewerCodex", "securityReviewer"] as const;
+
+  for (const stage of GATE_STAGES) {
+    // A roster model that differs from this gate stage's own config default —
+    // guards against a degenerate all-one-model roster producing a false pass.
+    const override = ROSTER_VALUES.find((m) => m !== config.models[stage]) ?? ROSTER_MODEL;
+
+    test(`${stage}: a stage-specific meta.models entry is ignored`, () => {
+      const meta: FactoryMeta = { models: { [stage]: override } };
+      expect(resolveModel(stage, meta)).toBe(config.models[stage]);
+    });
+
+    test(`${stage}: the blanket "*" wildcard is ignored`, () => {
+      const meta: FactoryMeta = { models: { "*": override } };
+      expect(resolveModel(stage, meta)).toBe(config.models[stage]);
+    });
+
+    test(`${stage}: the legacy scalar model field is ignored`, () => {
+      const meta: FactoryMeta = { model: override };
+      expect(resolveModel(stage, meta)).toBe(config.models[stage]);
+    });
+
+    test(`${stage}: even a stage-specific entry that layers with "*" and legacy model is still ignored`, () => {
+      const meta: FactoryMeta = { model: override, models: { "*": override, [stage]: override } };
+      expect(resolveModel(stage, meta)).toBe(config.models[stage]);
+    });
+  }
+
+  test("an untrusted models: line naming a gate stage parses (isKnownModel only guards the VALUE) but resolveModel still never honors it", () => {
+    const desc = `<!-- factory\nmodels: securityReviewer=${ROSTER_MODEL_2}\n-->`;
+    const meta = parseFactoryMeta(desc);
+    // The parser itself has no vendor concept, so a roster-valid override for a
+    // gate stage IS stored in meta.models — resolveModel is the sole enforcement
+    // point, so this test would pass for the wrong reason if that changed.
+    expect(meta.models?.securityReviewer).toBe(ROSTER_MODEL_2);
+    expect(resolveModel("securityReviewer", meta)).toBe(config.models.securityReviewer);
+  });
+
+  test("non-gate stages are unaffected by the gate-stage pin (implementer still honors overrides)", () => {
+    const meta: FactoryMeta = { models: { implementer: ROSTER_MODEL_2 } };
+    expect(resolveModel("implementer", meta)).toBe(ROSTER_MODEL_2);
+  });
+});
+
 describe("models: block parsing (execution-profiles)", () => {
   test("parses a compact 'stage=model stage2=model2' line into a map", () => {
     const desc = `<!-- factory\nmodels: *=${ROSTER_MODEL} reviewerClaude=${ROSTER_MODEL_2}\n-->`;
