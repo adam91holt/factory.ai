@@ -6,7 +6,7 @@ import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diff
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { isDraining } from "./control.ts";
-import { parseFactoryMeta } from "./meta.ts";
+import { parseFactoryMeta, resolveModel } from "./meta.ts";
 import { checkFreshness } from "./precondition.ts";
 import { getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision } from "./db.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
@@ -229,11 +229,16 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     await markNeedsHuman(issue, `ticket is missing required sections: ${missing.join(", ")} (see factory docs/ticket-contract.md)`, repoFromTicket(issue.description) ?? undefined);
     return;
   }
-  // Per-ticket model override from the factory metadata block (e.g. an epic
-  // pins model: claude-fable-5 and the decomposer copies it to each child).
-  const ovr = parseFactoryMeta(issue.description).model;
-  const implModel = ovr || config.models.implementer;
-  const fixModel = ovr || config.models.fixer;
+  // Per-ticket / per-stage model routing from the factory metadata block (e.g.
+  // an epic pins model: claude-fable-5, or a per-stage models: map, and the
+  // decomposer copies it to each child). resolveModel is the single precedence
+  // chain (stage-specific > "*" > legacy `model` > config default) every stage
+  // in this pipeline now goes through — previously ONLY implementer/fixer had
+  // any override, so one rate-limited provider with the whole roster on one
+  // model could take the entire factory down.
+  const meta = parseFactoryMeta(issue.description);
+  const implModel = resolveModel("implementer", meta);
+  const fixModel = resolveModel("fixer", meta);
   const repo = repoFromTicket(issue.description);
   if (!repo) {
     await markNeedsHuman(issue, `could not parse a single org/name from the "## Repo" section — never guessing (ROUTE failure contract)`);
@@ -346,14 +351,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const parallelReviewBudget = budget.remainingUsd / 2;
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: resolveModel("reviewerClaude", meta), cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: resolveModel("reviewerCodex", meta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
       reviewCodex = await runStage("reviewer-fallback", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("reviewerClaude", meta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
@@ -397,7 +402,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       // the empty review to act on; it falls straight through to designReviewOutstanding.
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       let design = await runStage("design-reviewer", designReviewPrompt(),
-        { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("designReviewer", meta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
       for (let round = 1; round < maxTasteRounds && parseTasteVerdict(design) === "fail" && !budget.expired; round++) {
@@ -410,7 +415,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
         if (budget.expired) break;
         design = await runStage(`design-reviewer-${round + 1}`, designReviewPrompt(),
-          { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: resolveModel("designReviewer", meta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(design);
         await postStageComment(issue, design);
       }
@@ -455,7 +460,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const tester = await runStage("tester",
         renderPrompt("tester", { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`),
-        { model: config.models.tester, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("tester", meta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(tester);
       await postStageComment(issue, tester);
       verificationReport = tester.text.slice(0, 2000);
@@ -483,7 +488,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const security = await runStage("security-reviewer",
         renderPrompt("security-reviewer", { spec, diff: clampedSecDiff },
           `You are a security reviewer in an automated pipeline. You get ONLY the ticket and the diff — assume nothing about author intent. Hunt ONLY for vulnerabilities THIS diff introduces: injection (SQL/command/prompt), secret or credential leakage, auth/authz bypass, path traversal, SSRF, unsafe deserialization, and privilege escalation. For each real issue: the exact scenario, the impact, the responsible hunk. No praise; if nothing after genuine effort, say so. End with exactly one line — "SECURITY: pass" or "SECURITY: fail".\n\n${spec}\n\n<diff>\n${clampedSecDiff}\n</diff>`),
-        { model: config.models.securityReviewer, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("securityReviewer", meta), cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(security);
       await postStageComment(issue, security);
       securityVerdict = security.error ? null : parseSecurityVerdict(security.text);

@@ -5,7 +5,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
-import { withFactoryMeta } from "./meta.ts";
+import { parseFactoryMeta, withFactoryMeta, resolveModel } from "./meta.ts";
 import { liftPreconditions } from "./precondition.ts";
 import { renderPrompt } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
@@ -84,6 +84,10 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
   const detail = await linear.getIssueDetail(epic.identifier);
   if (!childrenAllTerminal(detail)) return;
   const repo = repoFromTicket(epic.description) ?? "";
+  // Per-epic model routing (execution-profiles): an epic's `model`/`models:`
+  // meta can route the steward stage itself, same precedence as every other
+  // stage now uses.
+  const epicMeta = parseFactoryMeta(epic.description);
   bus.emit({ type: "run_started", issueKey: epic.identifier, title: `[steward] ${epic.title}`, repo, dryRun: config.dryRun });
 
   const childReports = detail.children.map((c) =>
@@ -112,7 +116,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         "",
         untrusted(`CHILDREN STATUS + PRS:\n${childReports}`),
       ].join("\n")),
-    { model: config.models.steward, cwd: scratch,
+    { model: resolveModel("steward", epicMeta), cwd: scratch,
       // Read-only gh: the steward investigates PRs (view/diff/checks/list) but
       // cannot mutate — merge/close/comment/push verbs are simply not granted,
       // so "the human merges" holds by construction, not by prompt discipline.

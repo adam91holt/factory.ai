@@ -4,7 +4,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
-import { parseFactoryMeta, withFactoryMeta } from "./meta.ts";
+import { parseFactoryMeta, withFactoryMeta, resolveModel } from "./meta.ts";
 import { renderPrompt } from "./catalog.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
@@ -147,7 +147,7 @@ export function findUndeclaredGlueTouches(children: ChildSpec[]): string[] {
  * strictly-lower ordinals, so acyclicity is preserved. */
 export async function createChildren(
   children: ChildSpec[],
-  base: { repo: string; model?: string },
+  base: { repo: string; model?: string; models?: Record<string, string> },
   create: (child: ChildSpec, stampedDescription: string) => Promise<string>,
 ): Promise<string[]> {
   const created: string[] = [];
@@ -166,6 +166,11 @@ export async function createChildren(
     const stamped = withFactoryMeta(child.description, {
       repo: base.repo, type: "task",
       ...(base.model ? { model: base.model } : {}),
+      // Propagate the epic's WHOLE per-stage models map to every child so a
+      // per-epic roster (e.g. reviewers on a different provider than the
+      // implementer) reaches the pipeline for each child too, not just the
+      // legacy single-`model` override.
+      ...(base.models && Object.keys(base.models).length > 0 ? { models: base.models } : {}),
       ...(dependsIds.length ? { depends_on: dependsIds } : {}),
       ...(child.touches.length ? { touches: child.touches } : {}),
     });
@@ -200,6 +205,10 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
   const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
   const onEvent = forwardStage(issue.identifier);
   const stages: StageResult[] = [];
+  // Per-epic model routing (execution-profiles): an epic's `model`/`models:`
+  // meta overrides which model the scout/decomposer run on, resolved through
+  // the same precedence every pipeline stage now uses.
+  const epicMeta = parseFactoryMeta(issue.description);
 
   const finish = (outcome: "planned" | "parked", reason: string): void => {
     // Redact at the emit seam like loop.ts / groundskeepers.ts (§2.2) — error
@@ -216,7 +225,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     const scout = await runStage("scout",
       renderPrompt("scout", { spec },
         `You are the research scout in a software factory's planning stage. Investigate everything needed to break the epic below into parallel implementation tickets: read the repo in the current directory (structure, stack, conventions, reference/ material if present), and use WebSearch/WebFetch for anything external the epic depends on. Return a dense research brief: what exists, what must be built, data sources/APIs with concrete endpoints or file paths, risks, and a suggested split into independent work areas.\n\n${spec}`),
-      { model: config.models.scout, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("scout", epicMeta), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
     await postStageComment(issue, scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
@@ -237,7 +246,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
           "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
         ].join("\n")),
-      { model: config.models.planner, cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("planner", epicMeta), cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
     await postStageComment(issue, decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
@@ -254,10 +263,10 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
       return;
     }
     // Stamp every child with the atomic factory metadata block: the exact repo,
-    // type:task, and the epic's model (per-epic override propagates to children).
-    // This is why children can never fail repo-parse or the epic-race again.
-    const epicModel = parseFactoryMeta(issue.description).model;
-    const created = await createChildren(children, { repo, model: epicModel },
+    // type:task, and the epic's model/models (per-epic override propagates to
+    // children). This is why children can never fail repo-parse or the epic-race
+    // again.
+    const created = await createChildren(children, { repo, model: epicMeta.model, models: epicMeta.models },
       (child, stamped) => linear.createSubIssue(issue, child.title, stamped));
 
     await linear.postComment(issue, [

@@ -1,11 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, type FactoryMeta } from "../src/meta.ts";
+import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, resolveModel, type FactoryMeta } from "../src/meta.ts";
 import { config } from "../src/config.ts";
 
 // A model guaranteed to be in the configured roster — parseFactoryMeta's allowlist
 // (a security feature) drops any model not in config.models, so tests must not
 // hardcode a specific id that a roster change (e.g. all-gpt-5.6-sol) would unlist.
 const ROSTER_MODEL = Object.values(config.models)[0]!;
+// A SECOND, distinct roster model — needed to prove precedence (stage-specific
+// picks a DIFFERENT model than "*"/legacy/default, not just "picks a model").
+// Falls back to ROSTER_MODEL itself if the roster only has one unique value
+// (e.g. an all-one-model deployment), which degrades the precedence tests to a
+// no-op comparison but never a false failure.
+const ROSTER_VALUES = Object.values(config.models) as string[];
+const ROSTER_MODEL_2 = ROSTER_VALUES.find((m) => m !== ROSTER_MODEL) ?? ROSTER_MODEL;
 
 describe("depends_on / touches round-trip", () => {
   test("render→parse preserves both array keys", () => {
@@ -193,5 +200,148 @@ describe("start-anchored guarantee still holds for the new keys", () => {
   test("touches only honored from a start-anchored block", () => {
     const desc = "intro\n<!-- factory\ntouches: src/x.ts\n-->";
     expect(parseFactoryMeta(desc).touches).toBeUndefined();
+  });
+});
+
+// execution-profiles: per-stage model resolution — resolveModel's precedence
+// chain, and the models: map's parse/render round-trip + allowlist enforcement.
+describe("resolveModel precedence (execution-profiles)", () => {
+  test("stage-specific meta.models entry wins over everything", () => {
+    const meta: FactoryMeta = { model: ROSTER_MODEL_2, models: { "*": ROSTER_MODEL_2, implementer: ROSTER_MODEL } };
+    expect(resolveModel("implementer", meta)).toBe(ROSTER_MODEL);
+  });
+
+  test("wildcard \"*\" wins over the legacy scalar model field", () => {
+    const meta: FactoryMeta = { model: ROSTER_MODEL_2, models: { "*": ROSTER_MODEL } };
+    expect(resolveModel("implementer", meta)).toBe(ROSTER_MODEL);
+  });
+
+  test("legacy scalar model field wins when no models map entry applies", () => {
+    const meta: FactoryMeta = { model: ROSTER_MODEL, models: { reviewerClaude: ROSTER_MODEL_2 } };
+    expect(resolveModel("implementer", meta)).toBe(ROSTER_MODEL);
+  });
+
+  test("falls back to config.models[stage] when meta carries nothing", () => {
+    expect(resolveModel("implementer", {})).toBe(config.models.implementer);
+    expect(resolveModel("steward", {})).toBe(config.models.steward);
+  });
+
+  test("a models entry for an UNRELATED stage does not leak into this stage's resolution", () => {
+    const meta: FactoryMeta = { models: { reviewerClaude: ROSTER_MODEL_2 } };
+    expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
+  });
+});
+
+describe("models: block parsing (execution-profiles)", () => {
+  test("parses a compact 'stage=model stage2=model2' line into a map", () => {
+    const desc = `<!-- factory\nmodels: *=${ROSTER_MODEL} reviewerClaude=${ROSTER_MODEL_2}\n-->`;
+    expect(parseFactoryMeta(desc).models).toEqual({ "*": ROSTER_MODEL, reviewerClaude: ROSTER_MODEL_2 });
+  });
+
+  test("an unknown/injected model value is DROPPED — the stage keeps no entry, not a forced arbitrary model", () => {
+    const desc = `<!-- factory\nmodels: implementer=totally-bogus-injected-model reviewerClaude=${ROSTER_MODEL_2}\n-->`;
+    const meta = parseFactoryMeta(desc);
+    // Only the known entry survives; the bogus one is dropped, not silently kept.
+    expect(meta.models).toEqual({ reviewerClaude: ROSTER_MODEL_2 });
+    // And resolving the stage whose entry was dropped falls through to config default —
+    // an injected value can never force an unlisted model.
+    expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
+  });
+
+  test("a models: line with EVERY entry unknown yields undefined (not an empty object)", () => {
+    const desc = "<!-- factory\nmodels: implementer=nope-1 fixer=nope-2\n-->";
+    expect(parseFactoryMeta(desc).models).toBeUndefined();
+  });
+
+  test("a malformed token (no '=', or empty stage/model side) is dropped without throwing", () => {
+    const desc = `<!-- factory\nmodels: garbage =${ROSTER_MODEL} reviewerClaude=${ROSTER_MODEL_2}\n-->`;
+    expect(parseFactoryMeta(desc).models).toEqual({ reviewerClaude: ROSTER_MODEL_2 });
+  });
+
+  test("an invalid stage-key shape is dropped even when the model value is valid", () => {
+    const desc = `<!-- factory\nmodels: 123bad=${ROSTER_MODEL} reviewerClaude=${ROSTER_MODEL_2}\n-->`;
+    expect(parseFactoryMeta(desc).models).toEqual({ reviewerClaude: ROSTER_MODEL_2 });
+  });
+
+  test("more than 32 whitespace-separated tokens are capped like the other array keys", () => {
+    const many = Array.from({ length: 40 }, (_, i) => `stage${i}=${ROSTER_MODEL}`).join(" ");
+    const parsed = parseFactoryMeta(`<!-- factory\nmodels: ${many}\n-->`);
+    expect(Object.keys(parsed.models ?? {})).toHaveLength(32);
+  });
+});
+
+describe("models: round-trips through render→parse", () => {
+  test("a models map survives render→parse unchanged", () => {
+    const meta: FactoryMeta = { repo: "acme/w", type: "task", models: { "*": ROSTER_MODEL, reviewerClaude: ROSTER_MODEL_2 } };
+    const rendered = renderFactoryMeta(meta);
+    expect(rendered).toContain(`models: `);
+    const parsed = parseFactoryMeta(`${rendered}\n\nbody`);
+    expect(parsed.models).toEqual({ "*": ROSTER_MODEL, reviewerClaude: ROSTER_MODEL_2 });
+  });
+
+  test("renders as ONE 'models:' line, sorted by stage key for determinism", () => {
+    const rendered = renderFactoryMeta({ models: { reviewerClaude: ROSTER_MODEL_2, "*": ROSTER_MODEL } });
+    // "*" sorts before letters (ASCII 0x2A < 'a'), so the wildcard comes first.
+    expect(rendered).toBe(`<!-- factory\nmodels: *=${ROSTER_MODEL} reviewerClaude=${ROSTER_MODEL_2}\n-->`);
+  });
+
+  test("models round-trips alongside every other key", () => {
+    const meta: FactoryMeta = {
+      repo: "acme/w", type: "task", model: ROSTER_MODEL, models: { implementer: ROSTER_MODEL_2 },
+      merge: "shadow", depends_on: ["FAC-1"], touches: ["src/a.ts"], preconditions: ["pr-open acme/w#4"],
+    };
+    const parsed = parseFactoryMeta(`${renderFactoryMeta(meta)}\n\nbody`);
+    expect(parsed).toMatchObject(meta);
+  });
+
+  test("withFactoryMeta stamps a models map at offset 0", () => {
+    const stamped = withFactoryMeta("## Goal\ndo it", { repo: "acme/w", type: "task", models: { implementer: ROSTER_MODEL } });
+    expect(parseFactoryMeta(stamped).models).toEqual({ implementer: ROSTER_MODEL });
+  });
+});
+
+describe("back-compat: no models key renders byte-identical to today", () => {
+  test("a meta object with NO models field omits the models: line entirely", () => {
+    const meta: FactoryMeta = { repo: "acme/widgets", type: "task", model: ROSTER_MODEL };
+    expect(renderFactoryMeta(meta)).toBe(`<!-- factory\nrepo: acme/widgets\ntype: task\nmodel: ${ROSTER_MODEL}\n-->`);
+    expect(renderFactoryMeta(meta)).not.toContain("models:");
+  });
+
+  test("an explicitly empty models map also omits the line (like empty arrays)", () => {
+    const meta: FactoryMeta = { repo: "acme/w", type: "task", models: {} };
+    expect(renderFactoryMeta(meta)).toBe("<!-- factory\nrepo: acme/w\ntype: task\n-->");
+  });
+
+  test("a description with no factory block at all still resolves to config defaults everywhere", () => {
+    const meta = parseFactoryMeta("plain ticket, no meta block");
+    expect(meta.models).toBeUndefined();
+    expect(meta.model).toBeUndefined();
+    expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
+    expect(resolveModel("planner", meta)).toBe(config.models.planner);
+  });
+});
+
+describe("injection safety: an untrusted description cannot force an unlisted model", () => {
+  test("a models: line buried in prose (not start-anchored) is ignored entirely", () => {
+    const desc = `Some prose.\n\n<!-- factory\nmodels: implementer=${ROSTER_MODEL}\n-->\n\nmore`;
+    expect(parseFactoryMeta(desc).models).toBeUndefined();
+  });
+
+  test("an attacker-controlled stage key that happens to name a real stage but an unlisted model never reaches resolveModel", () => {
+    const desc = "<!-- factory\nmodels: implementer=claude-attacker-proxy-route\n-->";
+    const meta = parseFactoryMeta(desc);
+    expect(meta.models).toBeUndefined();
+    expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
+  });
+
+  test("an unrecognized (made-up) stage key stores harmlessly — no stage call site ever asks for it", () => {
+    // The stage-key shape check passes (it's a plain identifier) and the model
+    // value is a real roster model, so it IS stored — but resolveModel only ever
+    // looks up the concrete stage names the pipeline passes (implementer,
+    // reviewerClaude, ...), so a key like "totallyMadeUpStage" is simply inert.
+    const desc = `<!-- factory\nmodels: totallyMadeUpStage=${ROSTER_MODEL}\n-->`;
+    const meta = parseFactoryMeta(desc);
+    expect(meta.models).toEqual({ totallyMadeUpStage: ROSTER_MODEL });
+    expect(resolveModel("implementer", meta)).toBe(config.models.implementer);
   });
 });

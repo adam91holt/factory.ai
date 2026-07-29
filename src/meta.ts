@@ -17,6 +17,20 @@ export interface FactoryMeta {
   // ticket into repo-creation or the intake interview.
   type?: "epic" | "task" | "idea" | "bootstrap";
   model?: string;                      // per-ticket implementer/fixer model override
+  // Per-STAGE model overrides (execution-profiles). Keys are stage names
+  // (matching config.models's keys — implementer, reviewerClaude, reviewerCodex,
+  // fixer, scout, planner, steward, designReviewer, tester, securityReviewer,
+  // distiller) plus the wildcard "*" for a blanket override. Parsed from a
+  // compact "stage=model stage2=model2" line. Each VALUE is validated against
+  // the exact same isKnownModel allowlist as the legacy `model` field below —
+  // an unknown/injected model id is dropped and the stage falls back through
+  // resolveModel's chain, never forcing an arbitrary model or a specific proxy
+  // route. The STAGE NAME is free text at parse time (only capped in count/
+  // length): an unrecognized key is simply never read by resolveModel, so it
+  // costs nothing and grants nothing — the allowlist protection is entirely on
+  // the model VALUE, exactly like `model`. Default undefined so a description
+  // with no `models:` line renders a byte-identical block to today.
+  models?: Record<string, string>;
   // per-ticket merge policy. UNREAD today (auto-merge is gated solely on
   // config.autoMergeRepos). If ever wired in, a description-sourced value may
   // only WITHHOLD auto-merge, never GRANT it — untrusted text must not confer
@@ -50,6 +64,11 @@ const MAX_ENTRY_LENGTH = 200;
 // doesn't match is dropped from depends_on — an injected or malformed id must
 // never become a phantom dependency that blocks a child forever.
 const IDENTIFIER = /^[A-Z][A-Z0-9]*-\d+$/;
+// A `models:` stage key: the wildcard "*" or a plain camelCase-ish identifier
+// (matches config.models's key shape). Anything else is dropped — the value
+// is what actually carries risk (validated against isKnownModel below), but a
+// malformed key is still rejected rather than silently stored.
+const STAGE_KEY = /^(\*|[A-Za-z][A-Za-z0-9]*)$/;
 
 // Authoritative read is START-ANCHORED: only a factory block at the very start
 // of the description is honored. A block buried in prose, a quoted example, or
@@ -88,6 +107,24 @@ export function parseFactoryMeta(description: string): FactoryMeta {
     if (key === "repo" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) meta.repo = value;
     else if (key === "type" && (value === "epic" || value === "task" || value === "idea" || value === "bootstrap")) meta.type = value;
     else if (key === "model" && value && isKnownModel(value)) meta.model = value;
+    else if (key === "models") {
+      // Compact "stage=model stage2=model2" syntax, whitespace-separated.
+      // Token-count capped like the other array keys; each token independently
+      // validated (malformed shape / unknown stage key / unlisted model id are
+      // each dropped with a log line rather than throwing or silently keeping
+      // the whole line).
+      const map: Record<string, string> = {};
+      for (const tok of value.split(/\s+/).filter(Boolean).slice(0, MAX_ARRAY_ENTRIES)) {
+        const eq = tok.indexOf("=");
+        if (eq <= 0 || eq === tok.length - 1) { console.warn(`[meta] dropping malformed models entry "${tok}" (expected stage=model)`); continue; }
+        const stageKey = tok.slice(0, eq);
+        const modelVal = tok.slice(eq + 1);
+        if (!STAGE_KEY.test(stageKey)) { console.warn(`[meta] dropping models entry with invalid stage key "${stageKey}"`); continue; }
+        if (!isKnownModel(modelVal)) { console.warn(`[meta] dropping models entry for "${stageKey}": unknown model "${modelVal}"`); continue; }
+        map[stageKey] = modelVal;
+      }
+      if (Object.keys(map).length > 0) meta.models = map;
+    }
     else if (key === "merge" && (value === "auto" || value === "shadow" || value === "review")) meta.merge = value;
     else if (key === "depends_on") {
       // Split, trim, drop empties, keep only well-formed identifiers, cap count.
@@ -146,15 +183,39 @@ export function resolveTicketRoute(
  * serialize as a comma-space list ("depends_on: FAC-1, FAC-2"). */
 export function renderFactoryMeta(meta: FactoryMeta): string {
   // preconditions serialize as ONE `precondition: <dsl>` line PER entry (not a
-  // comma-joined list like depends_on/touches), so handle them separately from
-  // the generic scalar/array loop.
+  // comma-joined list like depends_on/touches), and `models` serializes as a
+  // single "stage=model stage2=model2" line (sorted by stage key for a
+  // deterministic, diff-stable render) — both handled separately from the
+  // generic scalar/array loop below.
   const lines = Object.entries(meta)
-    .filter(([k]) => k !== "preconditions")
+    .filter(([k]) => k !== "preconditions" && k !== "models")
     .filter(([, v]) => (Array.isArray(v) ? v.length > 0 : v !== undefined && v !== ""))
     .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+  if (meta.models && Object.keys(meta.models).length > 0) {
+    const pairs = Object.entries(meta.models).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`);
+    lines.push(`models: ${pairs.join(" ")}`);
+  }
   for (const pre of meta.preconditions ?? []) lines.push(`precondition: ${pre}`);
   if (lines.length === 0) return "";
   return `<!-- factory\n${lines.join("\n")}\n-->`;
+}
+
+/** Per-stage model resolution (execution-profiles): stage-specific meta
+ * override > wildcard "*" meta override > the legacy scalar `model` field
+ * (equivalent to models["*"], kept working for back-compat) > the operator's
+ * config.models default for that stage. Pure — no I/O — so every stage call
+ * site gets a one-line lookup instead of the old ad-hoc `ovr || config.models.x`
+ * that only implementer/fixer ever had; every other stage (reviewers, scout,
+ * planner, steward, tester, security/design reviewers) always ran the global
+ * config default, so one provider's 429 could take the whole roster down.
+ * `stage` is constrained to config.models's own keys, so the fallback branch
+ * is always a real, operator-configured model id — this function performs NO
+ * validation itself; every value it can possibly return already passed
+ * isKnownModel at parse time (meta.models / meta.model) or was set directly
+ * by the operator (config.models). An unrecognized key in meta.models (one
+ * that doesn't match any `stage` ever passed here) is simply never read. */
+export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta): string {
+  return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? config.models[stage];
 }
 
 /** Prepend/replace the block in a description (idempotent). */
