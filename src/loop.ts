@@ -541,7 +541,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // browser signals, diff size. issue.description is NOT an input, so untrusted
     // ticket text can never grant merge authority. The effective tier is the
     // repo's EARNED tier capped by config/self-repo (factory.ai → human always).
-    const tier = effectiveMergeTier(repo, getLadderState(repo));
+    // Auto-merge default (operator AUTO_MERGE_DEFAULT) flips the DEFAULT tier to
+    // "auto" for non-self repos; a task still only merges if decideMerge.wouldMerge
+    // (all SAFETY conditions) holds. A ticket/epic may WITHHOLD via merge:review or
+    // merge:shadow (force human) — but merge:"auto" from the untrusted description is
+    // IGNORED here (only the operator flag can grant; withhold-only invariant).
+    const metaMerge = parseFactoryMeta(issue.description).merge;
+    const humanReview = metaMerge === "review" || metaMerge === "shadow";
+    const tier = effectiveMergeTier(repo, getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview });
     const ev = buildMergeEvidence({ summary, guarded, needsHuman, security: securityVerdict, browser, diffLines });
     const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff });
     // Gap-1 interaction: a child that declares dependencies must NOT auto-merge

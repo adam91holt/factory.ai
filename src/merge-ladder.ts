@@ -141,11 +141,16 @@ function ceilingFor(repo: string): MergeTier {
 /** Resolve the tier actually in force: hard rules > DB-earned > config ceiling.
  * self-repo and un-enrolled repos are human-merge; otherwise the earned tier
  * (defaulting to shadow before any row exists) capped by the ceiling. */
-export function effectiveMergeTier(repo: string, earned: LadderState | null): MergeTier {
-  if (isSelfRepo(repo)) return "human";
-  if (!isEnrolled(repo)) return "human";
-  const earnedTier: MergeTier = earned?.tier ?? "shadow";
-  return minTier(earnedTier, ceilingFor(repo));
+export function effectiveMergeTier(
+  repo: string,
+  earned: LadderState | null,
+  opts?: { autoDefault?: boolean; humanReview?: boolean },
+): MergeTier {
+  if (isSelfRepo(repo)) return "human";              // self-repo ALWAYS human (backstop, cannot be overridden)
+  if (opts?.humanReview) return "human";             // epic opted INTO human review (merge:review — withhold-only)
+  if (isEnrolled(repo)) return minTier(earned?.tier ?? "shadow", ceilingFor(repo)); // explicit ladder enrollment wins
+  if (opts?.autoDefault) return "auto";              // auto-merge-by-default (operator AUTO_MERGE_DEFAULT flag)
+  return "human";                                    // default: human-merge (unchanged when the flag is off)
 }
 
 /** The seed a repo starts at before it has a persisted row: enrolled repos begin

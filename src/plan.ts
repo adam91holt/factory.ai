@@ -147,7 +147,7 @@ export function findUndeclaredGlueTouches(children: ChildSpec[]): string[] {
  * strictly-lower ordinals, so acyclicity is preserved. */
 export async function createChildren(
   children: ChildSpec[],
-  base: { repo: string; model?: string; models?: Record<string, string>; effort?: Record<string, string> | string },
+  base: { repo: string; model?: string; models?: Record<string, string>; effort?: Record<string, string> | string; merge?: "auto" | "shadow" | "review" },
   create: (child: ChildSpec, stampedDescription: string) => Promise<string>,
 ): Promise<string[]> {
   const created: string[] = [];
@@ -175,6 +175,10 @@ export async function createChildren(
       // a per-epic effort override (single default or per-stage map) reaches
       // every child's pipeline run, not just this planning stage's own.
       ...(base.effort && (typeof base.effort === "string" ? base.effort !== "" : Object.keys(base.effort).length > 0) ? { effort: base.effort } : {}),
+      // Propagate the epic's merge policy so a per-epic human-review opt-in
+      // (merge:review) reaches every child — the loop reads the CHILD's meta for
+      // the auto-merge decision, so without this an epic's opt-out would not stick.
+      ...(base.merge ? { merge: base.merge } : {}),
       ...(dependsIds.length ? { depends_on: dependsIds } : {}),
       ...(child.touches.length ? { touches: child.touches } : {}),
     });
@@ -270,7 +274,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // type:task, and the epic's model/models (per-epic override propagates to
     // children). This is why children can never fail repo-parse or the epic-race
     // again.
-    const created = await createChildren(children, { repo, model: epicMeta.model, models: epicMeta.models, effort: epicMeta.effort },
+    const created = await createChildren(children, { repo, model: epicMeta.model, models: epicMeta.models, effort: epicMeta.effort, merge: epicMeta.merge },
       (child, stamped) => linear.createSubIssue(issue, child.title, stamped));
 
     await linear.postComment(issue, [
