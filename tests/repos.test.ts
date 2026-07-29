@@ -138,7 +138,7 @@ describe("isAdditiveTestExtension — pure add-vs-weaken diff classifier (test-a
     expect(isAdditiveTestExtension(diff)).toBe(true);
   });
 
-  test("+15/-3 assertions as the state shape grows → extension, not guarded", () => {
+  test("+15/-3 assertions — any removed pre-existing assertion line stays guarded, even with a large net add (no tolerance)", () => {
     const added = Array.from({ length: 15 }, (_, i) => `+  expect(state.field${i}).toBe(${i});`);
     const removed = Array.from({ length: 3 }, (_, i) => `-  expect(state.old${i}).toBe(${i});`);
     const diff = [
@@ -150,7 +150,11 @@ describe("isAdditiveTestExtension — pure add-vs-weaken diff classifier (test-a
       ...added,
       " });",
     ].join("\n");
-    expect(isAdditiveTestExtension(diff)).toBe(true);
+    // A purely-additive extension never removes an existing assertion line —
+    // a rewritten/removed line is exactly the diff shape a value-edit or
+    // matcher-loosening weakening produces, so there is no net-count
+    // tolerance: any assertionsRemoved > 0 keeps the file guarded.
+    expect(isAdditiveTestExtension(diff)).toBe(false);
   });
 
   test("removing 2 of 3 assertions with nothing added → WEAKENED, guarded", () => {
@@ -208,6 +212,76 @@ describe("isAdditiveTestExtension — pure add-vs-weaken diff classifier (test-a
 
   test("empty diff → not an extension, stays guarded", () => {
     expect(isAdditiveTestExtension("")).toBe(false);
+  });
+
+  // --- Adversarial: count-preserving weakenings the OLD net-count classifier
+  // misclassified as additive (see FIX for test-add-vs-weaken). Every one of
+  // these is a rewritten `-`/`+` pair, not a pure addition, so the strict
+  // "zero removed assertion/block lines" rule below must reject all of them.
+
+  test("value-edit: expect(order.total).toBe(42) rewritten to expect(order.total).toBe(order.total) → tautology-by-value-edit, WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' it("computes the total", () => {',
+      "-  expect(order.total).toBe(42);",
+      "+  expect(order.total).toBe(order.total);",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("matcher-loosening: toBe(42) rewritten to toBeDefined() → WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' it("computes the total", () => {',
+      "-  expect(order.total).toBe(42);",
+      "+  expect(order.total).toBeDefined();",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test(".not inversion: expect(fn).toThrow() rewritten to expect(fn).not.toThrow() → WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' it("rejects bad input", () => {',
+      "-  expect(fn).toThrow();",
+      "+  expect(fn).not.toThrow();",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("block-swap: a real it()-block replaced by a vacuous one (counts preserved) → WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' describe("foo", () => {',
+      '-  it("does the real check", () => { expect(criticalSecurityCheck()).toBe(true); });',
+      '+  it("does the real check", () => { expect(true).toBeTruthy(); });',
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("net-zero critical-assertion-for-fluff swap: expect(criticalSecurityCheck()).toBe(true) rewritten to expect(2+2).toBe(4) → WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' it("enforces the security check", () => {',
+      "-  expect(criticalSecurityCheck()).toBe(true);",
+      "+  expect(2+2).toBe(4);",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
   });
 });
 
@@ -375,6 +449,23 @@ describe("guardedPathsTouched — MODIFIED test file add-vs-weaken (test-add-vs-
       writeFileSync(join(ws.dir, "tests", "existing.test.ts"), 'it("checks x", () => {\n  expect(true).toBe(true);\n});\n');
       git(ws.dir, ["add", "-A"]);
       git(ws.dir, ["commit", "-m", "gut the assertion"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("value-edit weakening (expect(order.total).toBe(42) -> expect(order.total).toBe(order.total)) STAYS guarded end-to-end", () => {
+    const { ws, root } = makeWorkspaceWithTestBody(
+      'it("computes the total", () => {\n  expect(order.total).toBe(42);\n});\n',
+    );
+    try {
+      writeFileSync(
+        join(ws.dir, "tests", "existing.test.ts"),
+        'it("computes the total", () => {\n  expect(order.total).toBe(order.total);\n});\n',
+      );
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "neuter the assertion via value edit"]);
       expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
     } finally {
       rmSync(root, { recursive: true, force: true });

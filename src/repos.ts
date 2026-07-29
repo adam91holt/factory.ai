@@ -225,11 +225,6 @@ const ASSERTION_RE = /\b(?:expect|assert)\s*(?:\.\w+)?\s*\(/g;
 // Known no-op / tautological assertion shapes — the "gut a real assertion into
 // a rubber stamp" pattern (e.g. `expect(x).toBe(y)` → `expect(true).toBe(true)`).
 const TRIVIAL_ASSERTION_RE = /expect\(\s*true\s*\)\.(?:toBe\(\s*true\s*\)|toBeTruthy\(\))|expect\(\s*1\s*\)\.toBe\(\s*1\s*\)|assert\(\s*true\s*\)|assert\.ok\(\s*true\s*\)/g;
-// Small allowance for 1:1 refactors (e.g. two assertions merged into one
-// equivalent check) that net-lose a single assertion without weakening
-// coverage. Anything beyond this is treated as a real reduction.
-const ASSERTION_TOLERANCE = 1;
-
 function countMatches(re: RegExp, text: string): number {
   return (text.match(re) ?? []).length;
 }
@@ -248,34 +243,49 @@ function splitDiffLines(diffText: string): { added: string; removed: string } {
   return { added: added.join("\n"), removed: removed.join("\n") };
 }
 
-/** Pure classifier: does a MODIFIED test file's diff read as a net-additive
+/** Pure classifier: does a MODIFIED test file's diff read as a PURELY-ADDITIVE
  * EXTENSION (safe to exempt from the guard) rather than a WEAKENING (stays
  * guarded)? Extracted so the add-vs-weaken policy is unit-testable without
  * shelling out to git (same rationale as classifyPaths/parseNameStatus).
  *
- * NOT an extension (guarded) when any of:
- *   - a whole it()/test()/describe() block was removed (removed > added count);
- *   - a real assertion was gutted into a trivial/no-op one (e.g.
- *     `expect(x).toBe(y)` → `expect(true).toBe(true)`);
- *   - assertions are net-negative beyond ASSERTION_TOLERANCE;
+ * A unified diff renders ANY rewritten line — a value edit, a loosened
+ * matcher, an added `.not`, a swapped-out it()-block body — as a removed `-`
+ * line paired with an added `+` line. A syntactic counter that only looks at
+ * net counts (e.g. "assertions added minus removed <= tolerance") is
+ * defeated by exactly that rewrite shape: `expect(order.total).toBe(42)` →
+ * `expect(order.total).toBe(order.total)` nets to zero and reads as
+ * "additive". So this classifier does not permit ANY existing
+ * assertion/block line to be removed or rewritten at all — only a diff that
+ * strictly ADDS new assertions/blocks without touching a single pre-existing
+ * one is exempted. That closes value-edit, matcher-loosening, `.not`
+ * inversion, block-swap, and net-zero critical-assertion-for-fluff
+ * vectors in one rule: a genuine extension only adds lines.
+ *
+ * NOT an extension (stays guarded) when any of:
+ *   - any pre-existing it()/test()/describe() block line was removed/rewritten
+ *     (blocksRemoved > 0);
+ *   - any pre-existing assertion line was removed/rewritten
+ *     (assertionsRemoved > 0), regardless of how many were added back —
+ *     there is no tolerance for a 1:1 "removed one, added one" edit;
+ *   - a trivial/tautological assertion was introduced (e.g.
+ *     `expect(true).toBe(true)`), even if nothing else was removed;
  *   - the diff adds no assertions/blocks at all (comment/formatting-only
  *     changes are ambiguous, not evidence of an extension).
- * Conservative by construction: every branch that isn't a clear additive
- * signal returns false (stays guarded). */
+ * Conservative by construction: every branch that isn't a clear
+ * strictly-additive signal returns false (stays guarded). */
 export function isAdditiveTestExtension(diffText: string): boolean {
   const { added, removed } = splitDiffLines(diffText);
 
   const blocksAdded = countMatches(BLOCK_OPENER_RE, added);
   const blocksRemoved = countMatches(BLOCK_OPENER_RE, removed);
-  if (blocksRemoved > blocksAdded) return false; // a whole test block was removed
+  if (blocksRemoved > 0) return false; // any existing test block removed or rewritten
 
   const trivialAdded = countMatches(TRIVIAL_ASSERTION_RE, added);
-  const trivialRemoved = countMatches(TRIVIAL_ASSERTION_RE, removed);
-  if (trivialAdded > trivialRemoved) return false; // a real assertion was gutted into a no-op
+  if (trivialAdded > 0) return false; // a tautological/no-op assertion was introduced
 
   const assertionsAdded = countMatches(ASSERTION_RE, added);
   const assertionsRemoved = countMatches(ASSERTION_RE, removed);
-  if (assertionsRemoved - assertionsAdded > ASSERTION_TOLERANCE) return false; // net-negative beyond tolerance
+  if (assertionsRemoved > 0) return false; // any existing assertion removed or rewritten — no tolerance
 
   if (assertionsAdded === 0 && blocksAdded === 0) return false; // nothing added — ambiguous, not evidence of extension
 
