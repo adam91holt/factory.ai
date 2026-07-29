@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, classifyStatusPaths, ghRepoCreateArgs, guardedPathsTouched, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+import { classifyPaths, classifyStatusPaths, ghRepoCreateArgs, guardedPathsTouched, isAdditiveTestExtension, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
 
 describe("classifyPaths — guarded-path detection", () => {
   test("guards factory governance directories at root and nested", () => {
@@ -123,6 +123,94 @@ describe("classifyStatusPaths — added-vs-modified guarded-path policy (#1)", (
   });
 });
 
+describe("isAdditiveTestExtension — pure add-vs-weaken diff classifier (test-add-vs-weaken)", () => {
+  test("pure-additive modification (only + lines with new assertions) → extension, not guarded", () => {
+    const diff = [
+      "diff --git a/tests/foo.test.ts b/tests/foo.test.ts",
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,4 @@",
+      ' describe("foo", () => {',
+      '   it("does a", () => { expect(x).toBe(y); });',
+      '+  it("does b", () => { expect(p).toBe(q); });',
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(true);
+  });
+
+  test("+15/-3 assertions as the state shape grows → extension, not guarded", () => {
+    const added = Array.from({ length: 15 }, (_, i) => `+  expect(state.field${i}).toBe(${i});`);
+    const removed = Array.from({ length: 3 }, (_, i) => `-  expect(state.old${i}).toBe(${i});`);
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,5 +1,17 @@",
+      ' it("tracks state", () => {',
+      ...removed,
+      ...added,
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(true);
+  });
+
+  test("removing 2 of 3 assertions with nothing added → WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,5 +1,3 @@",
+      ' it("checks stuff", () => {',
+      "-  expect(a).toBe(1);",
+      "-  expect(b).toBe(2);",
+      "   expect(c).toBe(3);",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("deleting a whole it() block → WEAKENED, guarded (even though the block's own assertion count is small)", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,7 +1,4 @@",
+      ' describe("foo", () => {',
+      '-  it("does a", () => {',
+      "-    expect(x).toBe(y);",
+      "-  });",
+      '   it("does b", () => { expect(p).toBe(q); });',
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("replacing expect(x).toBe(y) with expect(true).toBe(true) → assertion-gutting, WEAKENED, guarded", () => {
+    const diff = [
+      "--- a/tests/foo.test.ts",
+      "+++ b/tests/foo.test.ts",
+      "@@ -1,3 +1,3 @@",
+      ' it("checks x", () => {',
+      "-  expect(x).toBe(y);",
+      "+  expect(true).toBe(true);",
+      " });",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("comment/formatting-only change (nothing assertion-shaped added) → ambiguous, stays guarded (conservative default)", () => {
+    const diff = [
+      "--- a/tests/existing.test.ts",
+      "+++ b/tests/existing.test.ts",
+      "@@ -1 +1 @@",
+      "-// pre-existing test",
+      "+// modified pre-existing test",
+    ].join("\n");
+    expect(isAdditiveTestExtension(diff)).toBe(false);
+  });
+
+  test("empty diff → not an extension, stays guarded", () => {
+    expect(isAdditiveTestExtension("")).toBe(false);
+  });
+});
+
 // Real git integration: guardedPathsTouched shells out to `git diff --name-status`
 // against ws.baseRef, so these prove the added-vs-modified policy end-to-end
 // through an actual worktree, not just the pure classifier above.
@@ -191,6 +279,131 @@ describe("guardedPathsTouched — real git worktree (#1: added tests don't halt 
       git(ws.dir, ["add", "-A"]);
       git(ws.dir, ["commit", "-m", "feature + test"]);
       expect(guardedPathsTouched(ws)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// Real git integration for the add-vs-weaken diff classifier: guardedPathsTouched
+// diffs a MODIFIED test-only file against ws.baseRef and exempts it only when
+// isAdditiveTestExtension reads the change as additive. These prove the policy
+// end-to-end through an actual worktree, not just the pure classifier above.
+describe("guardedPathsTouched — MODIFIED test file add-vs-weaken (test-add-vs-weaken)", () => {
+  const git = (cwd: string, args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8" });
+
+  function makeWorkspaceWithTestBody(initialBody: string): { ws: Workspace; root: string } {
+    const root = mkdtempSync(join(tmpdir(), "factory-guarded-diffcls-"));
+    const originDir = join(root, "origin.git");
+    const workDir = join(root, "work");
+    git(root, ["init", "--bare", "-b", "main", originDir]);
+    git(root, ["clone", originDir, workDir]);
+    git(workDir, ["config", "user.email", "t@t.t"]);
+    git(workDir, ["config", "user.name", "t"]);
+    mkdirSync(join(workDir, "tests"), { recursive: true });
+    writeFileSync(join(workDir, "tests", "existing.test.ts"), initialBody);
+    git(workDir, ["add", "-A"]);
+    git(workDir, ["commit", "-m", "init"]);
+    git(workDir, ["push", "origin", "main"]);
+    git(workDir, ["checkout", "-b", "feature"]);
+    const ws: Workspace = { repo: "acme/kiwi", dir: workDir, branch: "feature", baseRef: "refs/remotes/origin/main" };
+    return { ws, root };
+  }
+
+  test("extending a pre-existing test with net-additive assertions is NOT guarded", () => {
+    const { ws, root } = makeWorkspaceWithTestBody(
+      'describe("foo", () => {\n  it("does a", () => { expect(x).toBe(y); });\n});\n',
+    );
+    try {
+      writeFileSync(
+        join(ws.dir, "tests", "existing.test.ts"),
+        'describe("foo", () => {\n'
+          + '  it("does a", () => { expect(x).toBe(y); });\n'
+          + '  it("does b", () => { expect(p).toBe(q); });\n'
+          + '  it("does c", () => { expect(r).toBe(s); });\n'
+          + "});\n",
+      );
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "extend existing test"]);
+      expect(guardedPathsTouched(ws)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removing 2 of 3 assertions from a pre-existing test STAYS guarded", () => {
+    const { ws, root } = makeWorkspaceWithTestBody(
+      'it("checks stuff", () => {\n'
+        + "  expect(a).toBe(1);\n"
+        + "  expect(b).toBe(2);\n"
+        + "  expect(c).toBe(3);\n"
+        + "});\n",
+    );
+    try {
+      writeFileSync(join(ws.dir, "tests", "existing.test.ts"), 'it("checks stuff", () => {\n  expect(c).toBe(3);\n});\n');
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "weaken existing test"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("deleting a whole it() block from a pre-existing test STAYS guarded", () => {
+    const { ws, root } = makeWorkspaceWithTestBody(
+      'describe("foo", () => {\n'
+        + '  it("does a", () => { expect(x).toBe(y); });\n'
+        + '  it("does b", () => { expect(p).toBe(q); });\n'
+        + "});\n",
+    );
+    try {
+      writeFileSync(
+        join(ws.dir, "tests", "existing.test.ts"),
+        'describe("foo", () => {\n  it("does b", () => { expect(p).toBe(q); });\n});\n',
+      );
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "delete a test block"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("gutting a real assertion into a no-op (expect(x).toBe(y) -> expect(true).toBe(true)) STAYS guarded", () => {
+    const { ws, root } = makeWorkspaceWithTestBody('it("checks x", () => {\n  expect(x).toBe(y);\n});\n');
+    try {
+      writeFileSync(join(ws.dir, "tests", "existing.test.ts"), 'it("checks x", () => {\n  expect(true).toBe(true);\n});\n');
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "gut the assertion"]);
+      expect(guardedPathsTouched(ws)).toEqual(["tests/existing.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-test guarded path (agents/) modified with additive-looking content STILL stays guarded — the diff classifier only exempts test-only paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "factory-guarded-diffcls-nontest-"));
+    try {
+      const originDir = join(root, "origin.git");
+      const workDir = join(root, "work");
+      git(root, ["init", "--bare", "-b", "main", originDir]);
+      git(root, ["clone", originDir, workDir]);
+      git(workDir, ["config", "user.email", "t@t.t"]);
+      git(workDir, ["config", "user.name", "t"]);
+      mkdirSync(join(workDir, "agents"), { recursive: true });
+      writeFileSync(join(workDir, "agents", "fixer.md"), "# fixer\n");
+      git(workDir, ["add", "-A"]);
+      git(workDir, ["commit", "-m", "init"]);
+      git(workDir, ["push", "origin", "main"]);
+      git(workDir, ["checkout", "-b", "feature"]);
+      const ws: Workspace = { repo: "acme/kiwi", dir: workDir, branch: "feature", baseRef: "refs/remotes/origin/main" };
+
+      // Content that would read as a pure-additive extension if it were a test
+      // file — proves the exemption never applies outside test-only paths.
+      writeFileSync(join(workDir, "agents", "fixer.md"), "# fixer\n\nit(\"looks like a test\", () => { expect(1).toBe(1); });\n");
+      git(ws.dir, ["add", "-A"]);
+      git(ws.dir, ["commit", "-m", "modify agents card"]);
+      expect(guardedPathsTouched(ws)).toEqual(["agents/fixer.md"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
