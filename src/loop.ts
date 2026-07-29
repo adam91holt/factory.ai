@@ -6,11 +6,11 @@ import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diff
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { isDraining } from "./control.ts";
-import { parseFactoryMeta } from "./meta.ts";
+import { parseFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
 import { checkFreshness } from "./precondition.ts";
 import { getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision } from "./db.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
-import { renderPrompt } from "./catalog.ts";
+import { renderPrompt, cardEffort } from "./catalog.ts";
 import { buildReport, type ReportInput } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./events.ts";
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
@@ -229,11 +229,22 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     await markNeedsHuman(issue, `ticket is missing required sections: ${missing.join(", ")} (see factory docs/ticket-contract.md)`, repoFromTicket(issue.description) ?? undefined);
     return;
   }
-  // Per-ticket model override from the factory metadata block (e.g. an epic
-  // pins model: claude-fable-5 and the decomposer copies it to each child).
-  const ovr = parseFactoryMeta(issue.description).model;
-  const implModel = ovr || config.models.implementer;
-  const fixModel = ovr || config.models.fixer;
+  // Per-ticket / per-stage model routing from the factory metadata block (e.g.
+  // an epic pins model: claude-fable-5, or a per-stage models: map, and the
+  // decomposer copies it to each child). resolveModel is the single precedence
+  // chain (stage-specific > "*" > legacy `model` > config default) every stage
+  // in this pipeline now goes through — previously ONLY implementer/fixer had
+  // any override, so one rate-limited provider with the whole roster on one
+  // model could take the entire factory down.
+  const meta = parseFactoryMeta(issue.description);
+  const implModel = resolveModel("implementer", meta);
+  const fixModel = resolveModel("fixer", meta);
+  // Effort counterpart (execution-profiles): same meta object, same
+  // resolveEffort precedence (meta per-stage > meta default > card > config
+  // default). fixEffort is reused across every fixer-family stage below
+  // (fixer, design-fixer, verify-repair) exactly like fixModel already is.
+  const implEffort = resolveEffort("implementer", meta, cardEffort("implementer"));
+  const fixEffort = resolveEffort("fixer", meta, cardEffort("fixer"));
   const repo = repoFromTicket(issue.description);
   if (!repo) {
     await markNeedsHuman(issue, `could not parse a single org/name from the "## Repo" section — never guessing (ROUTE failure contract)`);
@@ -304,7 +315,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const lessonsBlock = buildLessonsBlock(lessonsForRepo(repo).map((r) => r.lesson));
     const implPrompt = lessonsBlock + renderPrompt("implementer", { repo, spec },
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${spec}`);
-    const implOpts = { model: implModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+    const implOpts = { model: implModel, effort: implEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsImplementer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "implementer", id) };
     // Resume an interrupted implementer: a lingering session row means the prior
     // run was cut off mid-build (process killed) — pick up its actual conversation
@@ -346,14 +357,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const parallelReviewBudget = budget.remainingUsd / 2;
     const [reviewClaude, reviewCodexTry] = await Promise.all([
       runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
-        { model: config.models.reviewerClaude, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: resolveModel("reviewerClaude", meta), effort: resolveEffort("reviewerClaude", meta, cardEffort("reviewer-spec")), cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerCodex, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: resolveModel("reviewerCodex", meta), effort: resolveEffort("reviewerCodex", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
       reviewCodex = await runStage("reviewer-fallback", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: config.models.reviewerClaude, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("reviewerClaude", meta), effort: resolveEffort("reviewerClaude", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
@@ -365,7 +376,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const fixer = await runStage("fixer",
       renderPrompt("fixer", { spec, reviews: untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`) },
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewClaude.text}\n\nREVIEW 2:\n${reviewCodex.text}`)}`),
-      { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+      { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
     stages.push(fixer);
     await postStageComment(issue, fixer);
     if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`, ws); return; }
@@ -396,21 +407,22 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       // (parseTasteVerdict) means no verdict was produced, so there is nothing in
       // the empty review to act on; it falls straight through to designReviewOutstanding.
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
+      const designReviewerEffort = resolveEffort("designReviewer", meta, cardEffort("design-reviewer"));
       let design = await runStage("design-reviewer", designReviewPrompt(),
-        { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
       for (let round = 1; round < maxTasteRounds && parseTasteVerdict(design) === "fail" && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${design.text}`)}`,
-          { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
         commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
         try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
         if (budget.expired) break;
         design = await runStage(`design-reviewer-${round + 1}`, designReviewPrompt(),
-          { model: config.models.designReviewer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(design);
         await postStageComment(issue, design);
       }
@@ -430,7 +442,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
-        { model: fixModel, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Edit", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
     await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
@@ -455,7 +467,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const tester = await runStage("tester",
         renderPrompt("tester", { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`),
-        { model: config.models.tester, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("tester", meta), effort: resolveEffort("tester", meta, cardEffort("tester")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", ...WRITER_BASH], maxTurns: config.caps.turnsFixer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(tester);
       await postStageComment(issue, tester);
       verificationReport = tester.text.slice(0, 2000);
@@ -483,7 +495,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const security = await runStage("security-reviewer",
         renderPrompt("security-reviewer", { spec, diff: clampedSecDiff },
           `You are a security reviewer in an automated pipeline. You get ONLY the ticket and the diff — assume nothing about author intent. Hunt ONLY for vulnerabilities THIS diff introduces: injection (SQL/command/prompt), secret or credential leakage, auth/authz bypass, path traversal, SSRF, unsafe deserialization, and privilege escalation. For each real issue: the exact scenario, the impact, the responsible hunk. No praise; if nothing after genuine effort, say so. End with exactly one line — "SECURITY: pass" or "SECURITY: fail".\n\n${spec}\n\n<diff>\n${clampedSecDiff}\n</diff>`),
-        { model: config.models.securityReviewer, cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("securityReviewer", meta), effort: resolveEffort("securityReviewer", meta, cardEffort("security-reviewer")), cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(security);
       await postStageComment(issue, security);
       securityVerdict = security.error ? null : parseSecurityVerdict(security.text);

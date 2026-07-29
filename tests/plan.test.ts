@@ -165,6 +165,100 @@ describe("createChildren — ordinal→identifier resolution", () => {
   });
 });
 
+// execution-profiles: the epic's WHOLE per-stage models map propagates to every
+// child alongside (not instead of) the legacy single `model` override.
+describe("createChildren — propagates the epic's per-stage models map (execution-profiles)", () => {
+  const ROSTER_VALUES = Object.values(config.models) as string[];
+  const ROSTER_MODEL_2 = ROSTER_VALUES.find((m) => m !== ROSTER_MODEL) ?? ROSTER_MODEL;
+
+  test("every child is stamped with the epic's models map", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: [] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: [] },
+    ];
+    const stamped = new Map<string, string>();
+    await createChildren(
+      children,
+      { repo: "acme/w", models: { "*": ROSTER_MODEL, reviewerClaude: ROSTER_MODEL_2 } },
+      async (child, body) => { stamped.set(child.title, body); return `FAC-${child.title}`; },
+    );
+    for (const title of ["A", "B"]) {
+      expect(parseFactoryMeta(stamped.get(title)!).models).toEqual({ "*": ROSTER_MODEL, reviewerClaude: ROSTER_MODEL_2 });
+    }
+  });
+
+  test("models and the legacy model field propagate TOGETHER when both are set", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(
+      children,
+      { repo: "acme/w", model: ROSTER_MODEL, models: { fixer: ROSTER_MODEL_2 } },
+      async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; },
+    );
+    const meta = parseFactoryMeta(body);
+    expect(meta.model).toBe(ROSTER_MODEL);
+    expect(meta.models).toEqual({ fixer: ROSTER_MODEL_2 });
+  });
+
+  test("an absent/empty models map on the epic omits the models: key on children entirely (back-compat)", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(children, { repo: "acme/w", models: {} }, async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; });
+    expect(parseFactoryMeta(body).models).toBeUndefined();
+    expect(body).not.toContain("models:");
+  });
+});
+
+// execution-profiles: the epic's effort (single default or per-stage map)
+// propagates to every child alongside models, mirroring the block above.
+describe("createChildren — propagates the epic's effort (execution-profiles)", () => {
+  test("a scalar effort default is stamped onto every child", async () => {
+    const children: ChildSpec[] = [
+      { title: "A", description: "body A", ordinal: 1, dependsOn: [], touches: [] },
+      { title: "B", description: "body B", ordinal: 2, dependsOn: [], touches: [] },
+    ];
+    const stamped = new Map<string, string>();
+    await createChildren(children, { repo: "acme/w", effort: "high" },
+      async (child, body) => { stamped.set(child.title, body); return `FAC-${child.title}`; });
+    for (const title of ["A", "B"]) {
+      expect(parseFactoryMeta(stamped.get(title)!).effort).toBe("high");
+    }
+  });
+
+  test("a per-stage effort map is stamped onto every child", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(children, { repo: "acme/w", effort: { fixer: "low", implementer: "high" } },
+      async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; });
+    expect(parseFactoryMeta(body).effort).toEqual({ fixer: "low", implementer: "high" });
+  });
+
+  test("effort and models propagate TOGETHER when both are set", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(children, { repo: "acme/w", models: { fixer: ROSTER_MODEL }, effort: "low" },
+      async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; });
+    const meta = parseFactoryMeta(body);
+    expect(meta.models).toEqual({ fixer: ROSTER_MODEL });
+    expect(meta.effort).toBe("low");
+  });
+
+  test("an absent/empty effort on the epic omits the effort: key on children entirely (back-compat)", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(children, { repo: "acme/w", effort: {} }, async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; });
+    expect(parseFactoryMeta(body).effort).toBeUndefined();
+    expect(body).not.toContain("effort:");
+  });
+
+  test("no effort field at all (undefined) omits the effort: key too", async () => {
+    let body = "";
+    const children: ChildSpec[] = [{ title: "Only", description: "body", ordinal: 1, dependsOn: [], touches: [] }];
+    await createChildren(children, { repo: "acme/w" }, async (_c, stampedBody) => { body = stampedBody; return "FAC-1"; });
+    expect(parseFactoryMeta(body).effort).toBeUndefined();
+  });
+});
+
 describe("createChildren — Gap 1 merge-race: implicit overlap edges", () => {
   async function stampAll(children: ChildSpec[]): Promise<Map<string, string>> {
     const stamped = new Map<string, string>();
