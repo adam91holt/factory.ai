@@ -7,6 +7,7 @@ import type {
   RunView,
 } from "./events";
 import { applyEvent, emptyMission, type FeedItem } from "./store";
+import { classifyOutcome, type OutcomeClass } from "./history";
 
 // ---------------------------------------------------------------------------
 // reconstructRun — fold a run's full durable event stream (GET /run-events)
@@ -67,6 +68,12 @@ export interface Bootstrap {
 
 export interface Reconstruction {
   run: RunView | null;
+  /** Routed-vs-escalated ledger class of the terminal outcome (see history.ts
+   *  classifyOutcome) — derived from the run_finished event's outcome+reason,
+   *  so replayed history classifies identically to the history table. null
+   *  until a run_finished is seen (active run) or when the outcome needed no
+   *  human at all (merged / planned / …). */
+  outcomeClass: OutcomeClass | null;
   feed: FeedItem[];
   gateRounds: GateRound[];
   /** keyed by stage label; last occurrence wins for repeated labels. */
@@ -86,6 +93,7 @@ export function reconstructRun(events: FactoryEvent[]): Reconstruction {
   const mergeDecisions: MergeDecision[] = [];
   const deploys: DeployEvent[] = [];
   let bootstrap: Bootstrap | null = null;
+  let outcomeClass: OutcomeClass | null = null;
 
   for (const e of events) {
     // Fold into the mission mirror via the shared reducer (unknown event types
@@ -136,6 +144,11 @@ export function reconstructRun(events: FactoryEvent[]): Reconstruction {
       case "bootstrap_finished":
         bootstrap = { repo: e.repo, ok: e.ok, reason: e.reason, at: e.at };
         break;
+      case "run_finished":
+        // Classify from the terminal event itself (not the folded RunView) so
+        // the derivation input is exactly what the durable RunRecord carries.
+        outcomeClass = classifyOutcome(e.outcome, e.reason);
+        break;
     }
   }
 
@@ -145,6 +158,7 @@ export function reconstructRun(events: FactoryEvent[]): Reconstruction {
   const runs = Object.values(mission.runs);
   return {
     run: runs[0] ?? null,
+    outcomeClass,
     feed: cappedFeed,
     gateRounds,
     usageByStage,

@@ -526,6 +526,10 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // merge a large diff with the gate silently skipped.
     const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
     const securityWarrantedButAbsent = securityReviewOutstanding(diffLines, securityVerdict);
+    // NOTE: these phrasings (and park()'s reasons) are classification markers
+    // for the dashboard's routed-vs-escalated ledger (ui/src/lib/history.ts
+    // classifyOutcome). Rewording one is safe but degrades that run's class to
+    // ESCALATED until the marker list learns the new phrasing.
     const holdReasons: string[] = [];
     if (guardedStop) holdReasons.push(`guarded paths touched: ${guarded.join(", ")}`);
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
