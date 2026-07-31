@@ -1,38 +1,69 @@
+import { useMemo } from "react";
 import { Link } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, GitPullRequest } from "lucide-react";
 import { useFactory } from "../lib/store";
-import { secs } from "../lib/format";
+import { fetchRunEvents } from "../lib/api";
+import { dateTime, secs } from "../lib/format";
+import { reconstructRun } from "../lib/reconstruct";
 import { useNow } from "../lib/useNow";
 import { OutcomeBadge } from "../components/OutcomeBadge";
 import { CostMeter } from "../components/runs/CostMeter";
 import { StageTimeline } from "../components/runs/StageTimeline";
+import { StageDetail } from "../components/runs/StageDetail";
 import { ToolFeed } from "../components/runs/ToolFeed";
 import { FindingsPanel } from "../components/runs/FindingsPanel";
 import { GatePanel } from "../components/runs/GatePanel";
+import { GateRounds } from "../components/runs/GateRounds";
+import { MergeDecisionPanel } from "../components/runs/MergeDecisionPanel";
+import { DeployPanel } from "../components/runs/DeployPanel";
 import { TicketPanel } from "../components/runs/TicketPanel";
 import { Card, CardHeader, CardTitle } from "../components/ui/card";
 import { Badge } from "../components/ui/badge";
+import { Tooltip } from "../components/ui/tooltip";
 
 export function RunDetailPage({ issueKey }: { issueKey: string }) {
-  const run = useFactory((s) => s.mission.runs[issueKey]);
+  const liveRun = useFactory((s) => s.mission.runs[issueKey]);
   const now = useNow(1000);
 
+  // Always pull the durable event stream: it carries the write-only merge /
+  // deploy / bootstrap events and per-stage token usage the live MissionState
+  // drops, and it lets us reconstruct runs from earlier sessions (not in the
+  // in-process store) with the exact same reducer.
+  const { data: events, isPending: eventsPending } = useQuery({
+    queryKey: ["run-events", issueKey],
+    queryFn: () => fetchRunEvents(issueKey),
+    staleTime: 60_000,
+  });
+  const recon = useMemo(() => (events ? reconstructRun(events) : null), [events]);
+
+  // Prefer the live store while a run is active this session (SSE keeps its
+  // timeline + feed current); otherwise render from the reconstructed history.
+  const useLive = !!liveRun && liveRun.status === "active";
+  const run = useLive ? liveRun : (recon?.run ?? liveRun ?? null);
+
   if (!run) {
+    if (eventsPending) {
+      return (
+        <div className="mx-auto max-w-2xl pt-8 text-center font-mono text-[11px] text-fg-faint">
+          loading {issueKey}…
+        </div>
+      );
+    }
     return (
       <div className="mx-auto flex max-w-2xl flex-col gap-4 pt-8">
         <div className="text-center">
-        <div className="font-mono text-sm text-fg-dim">{issueKey}</div>
-        <p className="mt-2 font-mono text-[11px] text-fg-faint">
-          no run for this issue in the current daemon session — completed runs from earlier
-          sessions live in{" "}
-          <Link to="/history" className="text-live underline underline-offset-2">History</Link>.
-        </p>
-        <Link
-          to="/runs"
-          className="mt-4 inline-flex items-center gap-1.5 font-mono text-[11px] text-fg-dim hover:text-fg"
-        >
-          <ArrowLeft className="size-3" /> all runs
-        </Link>
+          <div className="font-mono text-sm text-fg-dim">{issueKey}</div>
+          <p className="mt-2 font-mono text-[11px] text-fg-faint">
+            no events recorded for this issue — completed runs live in{" "}
+            <Link to="/history" className="text-live underline underline-offset-2">History</Link>.
+          </p>
+          <Link
+            to="/runs"
+            className="mt-4 inline-flex items-center gap-1.5 font-mono text-[11px] text-fg-dim hover:text-fg"
+          >
+            <ArrowLeft className="size-3" /> all runs
+          </Link>
         </div>
         <TicketPanel issueKey={issueKey} />
       </div>
@@ -42,6 +73,13 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
   const degraded = run.stages.some((s) => s.degraded);
   const active = run.status === "active";
   const elapsed = ((run.finishedAt ?? now) - run.startedAt) / 1000;
+  const models = [...new Set(run.stages.map((s) => s.model).filter(Boolean))];
+
+  const gateRounds = recon?.gateRounds ?? [];
+  const usageByStage = recon?.usageByStage ?? {};
+  const mergeDecisions = recon?.mergeDecisions ?? [];
+  const deploys = recon?.deploys ?? [];
+  const bootstrap = recon?.bootstrap ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -58,9 +96,17 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
             {run.dryRun && <Badge variant="codex">DRY RUN</Badge>}
           </div>
           <div className="mt-1 truncate pl-6 text-[13px] text-fg-dim">{run.title}</div>
-          <div className="mt-1 flex items-center gap-3 pl-6 font-mono text-[11px] text-fg-faint">
-            <span>{run.repo}</span>
-            <span>{secs(elapsed)}</span>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 pl-6 font-mono text-[11px] text-fg-faint">
+            {run.repo && <span className="text-fg-dim">{run.repo}</span>}
+            <Tooltip content={dateTime(run.startedAt)}>
+              <span>{secs(elapsed)} wall</span>
+            </Tooltip>
+            {run.finishedAt !== null && (
+              <Tooltip content={dateTime(run.finishedAt)}>
+                <span>finished {dateTime(run.finishedAt)}</span>
+              </Tooltip>
+            )}
+            {models.length > 0 && <span>{models.join(" · ")}</span>}
             {run.reason && <span className="truncate text-parked">{run.reason}</span>}
             {run.prUrl && (
               <a
@@ -79,7 +125,7 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
       </div>
 
       {/* body */}
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,7fr)_minmax(0,5fr)] gap-3">
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,7fr)_minmax(0,5fr)] gap-3 overflow-y-auto">
         <div className="flex min-h-0 flex-col gap-3">
           <Card>
             <CardHeader className="pb-2">
@@ -89,14 +135,22 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
               <StageTimeline run={run} />
             </div>
           </Card>
-          <Card className="flex min-h-0 flex-1 flex-col">
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle>Stage ledger — tokens & tools</CardTitle>
+            </CardHeader>
+            <div className="px-3.5 pb-3.5">
+              <StageDetail run={run} usageByStage={usageByStage} />
+            </div>
+          </Card>
+          <Card className="flex min-h-64 flex-1 flex-col">
             <CardHeader className="pb-1.5">
               <CardTitle>Agent activity</CardTitle>
             </CardHeader>
-            <ToolFeed issueKey={run.issueKey} />
+            <ToolFeed issueKey={run.issueKey} items={useLive ? undefined : recon?.feed} />
           </Card>
         </div>
-        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
+        <div className="flex min-h-0 flex-col gap-3">
           <Card>
             <CardHeader className="pb-1.5">
               <CardTitle>Review findings</CardTitle>
@@ -105,11 +159,38 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
           </Card>
           <Card>
             <CardHeader className="pb-1.5">
-              <CardTitle>Gates</CardTitle>
+              <CardTitle>Gates {gateRounds.length > 1 && <span className="text-fg-faint">· {gateRounds.length} rounds</span>}</CardTitle>
             </CardHeader>
-            <GatePanel run={run} />
-          <TicketPanel issueKey={run.issueKey} />
+            {gateRounds.length > 0 ? <GateRounds rounds={gateRounds} /> : <GatePanel run={run} />}
           </Card>
+          {mergeDecisions.length > 0 && (
+            <Card>
+              <CardHeader className="pb-1.5">
+                <CardTitle>Merge decision</CardTitle>
+              </CardHeader>
+              <MergeDecisionPanel decisions={mergeDecisions} />
+            </Card>
+          )}
+          {deploys.length > 0 && (
+            <Card>
+              <CardHeader className="pb-1.5">
+                <CardTitle>Deploy</CardTitle>
+              </CardHeader>
+              <DeployPanel deploys={deploys} />
+            </Card>
+          )}
+          {bootstrap && (
+            <Card>
+              <CardHeader className="pb-1.5">
+                <CardTitle>Bootstrap</CardTitle>
+              </CardHeader>
+              <div className="flex items-center gap-2 p-3.5 pt-2">
+                <Badge variant={bootstrap.ok ? "ok" : "err"}>{bootstrap.ok ? "OK" : "FAILED"}</Badge>
+                <span className="font-mono text-[11px] text-fg-dim">{bootstrap.reason}</span>
+              </div>
+            </Card>
+          )}
+          <TicketPanel issueKey={run.issueKey} />
         </div>
       </div>
     </div>

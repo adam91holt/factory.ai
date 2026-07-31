@@ -272,6 +272,38 @@ export function replayFixtures(ingest: (e: FactoryEvent) => void, onLive: () => 
 
 // ---- /runs history rows -----------------------------------------------------
 
+/** Heuristic model per stage label — mirrors the real pipeline's assignment so
+ *  mock history/detail views show believable models + token usage. */
+function modelForLabel(label: string): string {
+  if (label === "reviewer-codex") return "gpt-5.6-sol";
+  if (label === "reviewer-fallback") return "sonnet";
+  if (label.startsWith("reviewer")) return "opus";
+  return "sonnet";
+}
+
+/** repo + title per mock issue — the enrichment the real daemon now persists. */
+const RUN_META: Record<string, { repo: string; title: string }> = {
+  "FAC-17": { repo: "rapido/portal", title: "Add CSV export to the admin transactions table" },
+  "FAC-16": { repo: "rapido/api", title: "Batch webhook deliveries behind a durable queue" },
+  "FAC-15": { repo: "rapido/api", title: "Refactor billing period rollover for leap seconds" },
+  "FAC-14": { repo: "rapido/api", title: "Rotate API gateway signing keys from CI" },
+  "FAC-13": { repo: "rapido/portal", title: "Client portal: render factory report YAML inline" },
+  "FAC-11": { repo: "rapido/api", title: "Add /healthz readiness endpoint to the API" },
+  "FAC-9": { repo: "adam91holt/factory", title: "Cover ui/ in the root typecheck gate" },
+};
+
+function enrichRecord(rec: RunRecord): RunRecord {
+  const meta = RUN_META[rec.issueKey];
+  const totalWall = rec.stages.reduce((s, x) => s + x.wallSeconds, 0) || 60;
+  const models = [...new Set(rec.stages.map((s) => modelForLabel(s.label)))];
+  return {
+    ...rec,
+    ...(meta ? { repo: meta.repo, title: meta.title } : {}),
+    startedAt: rec.finishedAt - totalWall * 1000 - 4000,
+    models,
+  };
+}
+
 export function mockRunRecords(): RunRecord[] {
   const now = Date.now();
   const rows: RunRecord[] = [
@@ -350,7 +382,76 @@ export function mockRunRecords(): RunRecord[] {
       ],
     },
   ];
-  return rows;
+  return rows.map(enrichRecord);
+}
+
+/** Synthesize a full event stream for one mock history run so the drill-down
+ *  (timeline, stage ledger, gates, merge decision, deploy) renders in ?mock=1
+ *  without a daemon — the same shape GET /run-events returns live. */
+export function mockRunEvents(issueKey: string): FactoryEvent[] {
+  const rec = mockRunRecords().find((r) => r.issueKey === issueKey);
+  if (!rec) return [];
+  const totalWall = rec.stages.reduce((s, x) => s + x.wallSeconds, 0) || 60;
+  const started = rec.startedAt ?? rec.finishedAt - totalWall * 1000;
+  const events: FactoryEvent[] = [];
+  let seq = 0;
+  const push = (body: FactoryEventBody, at: number): void => {
+    events.push({ ...body, seq: ++seq, at } as FactoryEvent);
+  };
+
+  push({ type: "run_started", issueKey, title: rec.title ?? issueKey, repo: rec.repo ?? "", dryRun: false }, started);
+  let cursor = started + 1500;
+  for (const st of rec.stages) {
+    const model = modelForLabel(st.label);
+    const viaProxy = st.label === "reviewer-codex";
+    const stageStart = cursor;
+    push({ type: "run_stage_started", issueKey, stage: st.label, model, viaProxy }, stageStart);
+    if (st.turns > 2) {
+      push({ type: "run_tool_use", issueKey, stage: st.label, tool: "Read", detail: "src/index.ts" }, stageStart + st.wallSeconds * 300);
+      push({ type: "run_tool_use", issueKey, stage: st.label, tool: "Bash", detail: "bun test" }, stageStart + st.wallSeconds * 650);
+    }
+    const stageEnd = stageStart + st.wallSeconds * 1000;
+    push({
+      type: "run_stage_finished", issueKey, stage: st.label, costUsd: st.costUsd, turns: st.turns,
+      wallSeconds: st.wallSeconds, resultText: `${st.label} completed.`,
+      ...(st.degraded ? { degraded: true } : {}),
+      modelUsage: {
+        [model]: {
+          in: st.turns * 8200, out: st.turns * 940,
+          cacheRead: st.turns * 61000, cacheWrite: st.turns * 4200, costUsd: st.costUsd,
+        },
+      },
+    }, stageEnd);
+    cursor = stageEnd;
+  }
+
+  const green = rec.outcome === "pr_open" || rec.outcome === "merged";
+  push({ type: "run_gates", issueKey, round: 0, green, strength: rec.gateStrength, gates: [
+    { name: "typecheck", baselinePassed: true, passed: true, outputTail: "" },
+    { name: "test", baselinePassed: true, passed: green, outputTail: green ? "" : "FAIL src/… > case\nexpected 200, received 429\n 1 fail · 41 pass" },
+    { name: "lint", baselinePassed: true, passed: true, outputTail: "" },
+  ] }, rec.finishedAt - 2400);
+  if (green) {
+    push({
+      type: "merge_decision", issueKey, repo: rec.repo ?? "",
+      tier: rec.outcome === "merged" ? "auto" : "human",
+      wouldMerge: true, acted: rec.outcome === "merged", strength: rec.gateStrength,
+      browser: "not-required", security: "pass", cleanStreak: 3,
+      reasons: rec.outcome === "merged"
+        ? ["gates green with real strength", "clean streak ≥ 3 — auto tier reached"]
+        : ["repo requires human review before merge"],
+    }, rec.finishedAt - 1800);
+  }
+  if (rec.outcome === "merged") {
+    push({ type: "deploy_finished", repo: rec.repo ?? "", sha: "a1b2c3d4e5f60718", ok: true, stage: "smoke", reverted: false, detail: "deploy succeeded; smoke suite green (12 checks)" }, rec.finishedAt - 900);
+  }
+  push({
+    type: "run_finished", issueKey, outcome: rec.outcome,
+    ...(rec.reason ? { reason: rec.reason } : {}),
+    prUrl: rec.prUrl, costUsd: rec.costUsd, stages: rec.stages,
+    gateStrength: rec.gateStrength, guardedPaths: rec.guardedPaths, dryRun: false,
+  }, rec.finishedAt);
+  return events;
 }
 
 // ---- /lessons — what the factory has learned (and can be told to forget) ----

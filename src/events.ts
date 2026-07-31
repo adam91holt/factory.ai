@@ -202,6 +202,14 @@ export interface RunRecord {
   gateStrength: GateStrength;
   guardedPaths: string[];
   finishedAt: number;      // epoch ms
+  // Additive history-view enrichment (optional — rows written before this
+  // existed simply lack them and the UI degrades gracefully). Populated at
+  // write time from the just-folded MissionState run, which already carries
+  // repo/title/startedAt and the per-stage models.
+  repo?: string;
+  title?: string;
+  startedAt?: number;      // epoch ms — run wall clock = finishedAt - startedAt
+  models?: string[];       // distinct models across the run's stages
 }
 
 // ============================================================================

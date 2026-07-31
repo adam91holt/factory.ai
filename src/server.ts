@@ -392,12 +392,25 @@ export function startDashboard(): {
     // Dry-run rehearsals never enter durable history — factory-history.jsonl
     // records real deliveries only (dry outcomes are "pr_open" with no PR).
     if (e.type === "run_finished" && !e.dryRun) {
+      // mission was folded above, so mission.runs[issueKey] is this finished
+      // run — carrying repo/title/startedAt and the per-stage models the bare
+      // run_finished body omits. Enrich the durable record with them so the
+      // history view has repo, timing and models without re-reading the event
+      // log per row. All additive/optional — missing fields degrade gracefully.
+      const rv = mission.runs[e.issueKey];
+      const models = rv
+        ? [...new Set(rv.stages.map((s) => s.model).filter((m): m is string => !!m))]
+        : [];
       const record: RunRecord = {
         issueKey: e.issueKey, outcome: e.outcome,
         ...(e.reason !== undefined ? { reason: e.reason } : {}),
         prUrl: e.prUrl, costUsd: e.costUsd, stages: e.stages,
         gateStrength: e.gateStrength, guardedPaths: e.guardedPaths,
         finishedAt: e.at,
+        ...(rv?.repo ? { repo: rv.repo } : {}),
+        ...(rv?.title ? { title: rv.title } : {}),
+        ...(rv ? { startedAt: rv.startedAt } : {}),
+        ...(models.length ? { models } : {}),
       };
       try {
         appendFileSync(historyPath, `${JSON.stringify(record)}\n`);
