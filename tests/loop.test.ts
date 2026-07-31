@@ -131,13 +131,31 @@ describe("mapBrowserEvidence", () => {
   });
 });
 
-describe("parseSecurityVerdict", () => {
+// Fail-closed verdict parsing: the prompt mandates exactly one explicit verdict
+// line, so the parser REQUIRES one. The old `fail-token ? fail : pass` let a
+// truncated review, one that drifted off-script, or one steered by injected diff
+// content into never saying "fail" count as an implicit PASS. An unrecognizable
+// verdict routes nowhere — it folds into the null-verdict path (needsHuman via
+// securityReviewOutstanding), never defaults to pass.
+describe("parseSecurityVerdict (fail-closed)", () => {
   test("maps an explicit SECURITY: fail to fail (folds into holdReasons/needsHuman)", () => {
     expect(parseSecurityVerdict("found an injection\nSECURITY: fail")).toBe("fail");
   });
-  test("anything else is pass (a missing verdict must not silently block)", () => {
+  test("maps an explicit SECURITY: pass to pass", () => {
     expect(parseSecurityVerdict("no issues found\nSECURITY: pass")).toBe("pass");
-    expect(parseSecurityVerdict("no line at all")).toBe("pass");
+    expect(parseSecurityVerdict("security: PASS")).toBe("pass"); // case-insensitive, matching the old regex
+  });
+  test("fail wins when both tokens appear — a steered review never upgrades itself", () => {
+    expect(parseSecurityVerdict("SECURITY: pass\n...on reflection, actually\nSECURITY: fail")).toBe("fail");
+    expect(parseSecurityVerdict("SECURITY: fail\nSECURITY: pass")).toBe("fail");
+  });
+  test("NO explicit verdict token is 'error', never an implicit pass", () => {
+    expect(parseSecurityVerdict("no line at all")).toBe("error");
+    expect(parseSecurityVerdict("")).toBe("error"); // truncated/empty review
+    expect(parseSecurityVerdict("SECURITY: probably fine")).toBe("error"); // off-script verdict
+  });
+  test("token match requires a word boundary — 'passable'/'failing' prose is not a verdict", () => {
+    expect(parseSecurityVerdict("SECURITY: passable but odd")).toBe("error");
   });
 });
 
@@ -198,8 +216,13 @@ describe("parseTasteVerdict (B22)", () => {
     expect(parseTasteVerdict({ text: "looks distinctive\nTASTE: pass" })).toBe("pass");
   });
 
-  test("no error and no explicit fail line defaults to 'pass' (mirrors parseSecurityVerdict)", () => {
-    expect(parseTasteVerdict({ text: "no verdict line at all" })).toBe("pass");
+  test("no error and NO explicit verdict token is 'error' (mirrors parseSecurityVerdict) — a verdict-less review never passes by omission", () => {
+    expect(parseTasteVerdict({ text: "no verdict line at all" })).toBe("error");
+    expect(parseTasteVerdict({ text: "" })).toBe("error"); // truncated/empty review
+  });
+
+  test("fail wins when both tokens appear — a steered review never upgrades itself", () => {
+    expect(parseTasteVerdict({ text: "TASTE: pass\n...wait, the score never springs\nTASTE: fail" })).toBe("fail");
   });
 
   test("'error' folds into needsHuman just like a genuine 'fail' would", () => {
