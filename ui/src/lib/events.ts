@@ -165,6 +165,12 @@ export interface MissionState {
 export interface RunRecord {
   issueKey: string;
   outcome: RunOutcome;
+  // `reason` is not just display text: the dashboard's routed-vs-escalated
+  // outcomes ledger (ui/src/lib/history.ts classifyOutcome) DERIVES its
+  // classification from these recorded strings — zero new event state, so rows
+  // written before the ledger existed classify too. That makes the hold/park
+  // phrasings in loop.ts a soft contract: reword one and its runs fall back to
+  // ESCALATED (fail-noisy, never fail-quiet) until the marker lists catch up.
   reason?: string;
   prUrl: string | null;
   costUsd: number;

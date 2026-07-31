@@ -3,13 +3,17 @@ import { useQuery } from "@tanstack/react-query";
 import type { RunOutcome } from "../lib/events";
 import { fetchRuns } from "../lib/api";
 import { usd } from "../lib/format";
-import { distinctRepos, summarizeRuns } from "../lib/history";
+import { classifyOutcome, distinctRepos, summarizeRuns, type OutcomeClass } from "../lib/history";
 import { HistoryTable } from "../components/history/HistoryTable";
 import { OutcomeBadge } from "../components/OutcomeBadge";
+import { OutcomeClassBadge } from "../components/OutcomeClassBadge";
 import { Skeleton } from "../components/ui/skeleton";
 import { cn } from "../lib/utils";
 
-type Filter = "all" | RunOutcome;
+// The filter facet spans two dimensions: raw outcomes (what happened) and the
+// routed/escalated ledger class (whether the handoff was by design or genuine
+// friction). "routed"/"escalated" filter across outcomes via classifyOutcome.
+type Filter = "all" | RunOutcome | OutcomeClass;
 
 const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: "all", label: "all" },
@@ -18,10 +22,16 @@ const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: "parked", label: "parked" },
   { key: "needs_human", label: "needs human" },
   { key: "aborted", label: "aborted" },
+  { key: "routed", label: "routed" },
+  { key: "escalated", label: "escalated" },
 ];
 
-/** Compact outcome tally shown in the summary strip. */
-const SUMMARY_OUTCOMES: RunOutcome[] = ["merged", "pr_open", "parked", "needs_human"];
+/** True when a record matches the selected facet, whichever dimension it is. */
+function matchesFilter(outcome: RunOutcome, reason: string | undefined, f: Filter): boolean {
+  if (f === "all") return true;
+  if (f === "routed" || f === "escalated") return classifyOutcome(outcome, reason) === f;
+  return outcome === f;
+}
 
 export function HistoryPage() {
   const [outcome, setOutcome] = useState<Filter>("all");
@@ -36,7 +46,7 @@ export function HistoryPage() {
   const repos = useMemo(() => distinctRepos(all), [all]);
   const summary = useMemo(() => summarizeRuns(all), [all]);
   const records = all.filter(
-    (r) => (outcome === "all" || r.outcome === outcome) && (repo === "all" || r.repo === repo),
+    (r) => matchesFilter(r.outcome, r.reason, outcome) && (repo === "all" || r.repo === repo),
   );
 
   return (
@@ -80,13 +90,24 @@ export function HistoryPage() {
           <span className="text-fg-dim">
             <span className="text-fg">{summary.total}</span> runs
           </span>
+          {/* Outcomes ledger: merged (autonomous) plus the routed/escalated
+              split of every human handoff. ROUTED subsumes pr_open (a human
+              merging the PR is the human-tier design) and by-design holds;
+              ESCALATED is genuine friction — so a separate pr_open/parked/
+              needs_human tally would double-count and is deliberately gone. */}
           <span className="flex items-center gap-2">
-            {SUMMARY_OUTCOMES.map((o) => (
-              <span key={o} className="flex items-center gap-1">
-                <OutcomeBadge status={o} />
-                <span className="text-fg-dim">{summary.byOutcome[o] ?? 0}</span>
-              </span>
-            ))}
+            <span className="flex items-center gap-1">
+              <OutcomeBadge status="merged" />
+              <span className="text-fg-dim">{summary.byOutcome.merged ?? 0}</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <OutcomeClassBadge cls="routed" />
+              <span className="text-fg-dim">{summary.routed}</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <OutcomeClassBadge cls="escalated" />
+              <span className="text-fg-dim">{summary.escalated}</span>
+            </span>
           </span>
           <span className="ml-auto flex items-center gap-x-5">
             <span className="text-fg-faint">
