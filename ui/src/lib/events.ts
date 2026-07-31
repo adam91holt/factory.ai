@@ -35,6 +35,11 @@ export interface GateMeta {
   baselinePassed: boolean;
   passed: boolean | null;     // null = no-gate (fails on clean baseline)
   outputTail: string;         // last ≤400 chars of failure output, redacted; "" on pass
+  // Test-count ratchet evidence ("tests: 631 -> 640"): parsed passing-test
+  // counts, null = unknown / not a test gate. Optional so events persisted
+  // before the ratchet existed replay unchanged.
+  baselineTestCount?: number | null;
+  testCount?: number | null;
 }
 
 // B16: "merged" = the merge ladder didn't just open the PR — mergePr actually

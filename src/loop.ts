@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
-import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
+import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence, testCountRatchet } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { isDraining } from "./control.ts";
 import { parseFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
@@ -438,7 +438,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     bus.emit({ type: "run_gates", issueKey: issue.identifier, round: 0,
       green: summary.green, strength: summary.strength,
       gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
-        outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
+        outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "",
+        baselineTestCount: g.baselineTestCount, testCount: g.testCount })) });
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
@@ -451,9 +452,23 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       bus.emit({ type: "run_gates", issueKey: issue.identifier, round: i + 1,
         green: summary.green, strength: summary.strength,
         gates: results.map((g) => ({ name: g.name, baselinePassed: g.baselinePassed, passed: g.passed,
-          outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "" })) });
+          outputTail: g.passed === false ? redactSecrets(g.output).clean.slice(-400) : "",
+          baselineTestCount: g.baselineTestCount, testCount: g.testCount })) });
     }
     if (!summary.green) { await park(issue, repo, stages, budget.expired ? budget.expiredReason : `gates still failing after ${config.caps.verifierIterations} repair rounds`, ws); return; }
+
+    // ---- test-count ratchet (withhold-only, verify.ts testCountRatchet): the
+    // gates are green, but did FEWER tests pass than on the pristine baseline?
+    // That is runtime evidence of a gutted/skipped suite the diff classifier
+    // (isAdditiveTestExtension) may have missed. "decreased" folds into
+    // needsHuman below — it blocks auto-merge and routes to a human, it never
+    // auto-fails the run (renames/consolidations legitimately lower the count).
+    // "unknown" (a count unparseable on either side) must NOT block — the diff
+    // classifier still guards — but is logged and surfaced so it stays visible.
+    // "skipped" (no test gate ran: strength none, or red-baseline no-gate) is
+    // already covered by the existing baseline-park/no-gate logic.
+    const ratchet = testCountRatchet(results);
+    if (ratchet.verdict === "unknown") console.log(`[${issue.identifier}] test-count ratchet: count unparseable on one side (${ratchet.evidence}) — not blocking, diff classifier still guards`);
 
     // ---- tester (after gates): executes the ticket's ## Verifications and drives
     // the app in a browser. Gap 2 makes this REQUIRED, not just ticket-opt-in:
@@ -531,6 +546,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (tasteFindings) holdReasons.push("design taste gate failed (see design review)");
     if (designReviewOutstanding) holdReasons.push("design review did not complete on a UI-touching diff — cannot auto-merge unreviewed");
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
+    // Test-count ratchet (withhold-only): a confirmed drop in passing tests vs
+    // the pristine baseline blocks auto-merge — a human adjudicates whether it
+    // is a legitimate rename/consolidation or a gutted suite. UNKNOWN counts
+    // never reach here (logged above instead) — an unparseable summary must
+    // not block, but must also never count as a pass.
+    if (ratchet.verdict === "decreased") holdReasons.push(`passing test count DECREASED vs baseline (${ratchet.evidence}) — possible gutted/skipped tests; human must adjudicate`);
     if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
     if (securityWarrantedButAbsent) holdReasons.push(`security review did not complete on a ${diffLines}-line diff (${budget.expired ? budget.expiredReason : "stage error"}) — cannot auto-merge unreviewed`);
     const needsHuman = holdReasons.length > 0;
@@ -590,6 +611,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       reviewFindingsSummary: fixer.text.slice(0, 1500),
       ...(tasteFindings ? { designReview: tasteFindings } : {}),
       ...(verificationReport ? { verification: verificationReport } : {}),
+      ...(ratchet.verdict !== "skipped" ? { testRatchet: { verdict: ratchet.verdict, evidence: ratchet.evidence } } : {}),
     });
 
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
