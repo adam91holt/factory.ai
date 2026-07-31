@@ -1,11 +1,14 @@
 # The Software Factory
 
 Linear-driven agent pipeline: **ticket → claim → worktree → implementer → framing-stripped
-adversarial review (Claude + Codex) → fixer → baselined verify → PR → human merge**.
+adversarial review (Claude + Codex) → fixer → baselined verify → PR**. Humans set
+direction and merge — until a repo *earns* auto-merge through the evidence-gated
+merge ladder.
 
-Built per `../FACTORY-PLAN.md` (v0.2, post-adversarial-review). Scope v1: the **FAC**
-Linear team only; future teams are a `FACTORY_TEAM_KEYS` config change (ADR-0002:
-never co-runs with the ProjectManagement triage-agent).
+Tickets route by kind: **task** → pipeline, **epic** → planner (decompose into a
+DAG of child tickets, steward closes out), **idea** → intake authoring (rough idea
+becomes a contract-conforming ticket), **bootstrap** → new-project scaffolding.
+Planning docs live in `docs/planning/` (`level-4-roadmap.md`, `autonomy.md`).
 
 ## Stack
 
@@ -15,8 +18,8 @@ never co-runs with the ProjectManagement triage-agent).
   (`gpt-5.6-sol`); try/catch fallback to a Claude reviewer with a `degraded` tag.
 - **Linear GraphQL** — polling, no webhooks. Personal API key stays in the daemon;
   workers get a scrubbed env and never see it.
-- **git worktrees** under `~/FactoryWork` (never `~/RapidoCoding`), branches
-  `factory/<issue-key>`, PRs via `gh`.
+- **git worktrees** under `~/FactoryWork`, branches `factory/<issue-key>`, PRs via `gh`.
+- **SQLite** (`factory.db`) — durable event log, telemetry, lessons store.
 
 ## Run
 
@@ -29,36 +32,56 @@ bun run factory:once   # one live tick
 bun run factory        # watch mode (60s serial ticks)
 ```
 
+Mission control (live runs, telemetry, lessons, agent catalog) is served on
+`127.0.0.1:$DASHBOARD_PORT` in watch mode; `bun run ui:dev` for UI development.
+
 ## How an issue flows
 
-1. Create a FAC issue in **Todo** following `docs/ticket-contract.md`
+1. Create an issue in **Todo** following `docs/ticket-contract.md`
    (Goal / Why / Outcomes / Repo / Verifications). Missing sections → "needs human"
    comment, never a guess.
 2. The daemon claims it (label `Factory-Executing` + state **In Progress**, verified
    by re-read; re-checked before every mutating step).
 3. Pipeline runs in a fresh worktree; gates are **baselined** on the untouched repo
    first — a gate that fails on clean `origin/main` is classified no-gate rather than
-   burning repair iterations.
+   burning repair iterations. UI changes get an adversarial design-review taste gate.
 4. PR opens, factory report lands as a `🤖 Factory report` comment (human prose +
    YAML meta — this is the telemetry store), issue moves to **In Review**.
-5. **You merge.** The factory never merges (ADR-0001). Caps/failures park the issue
-   back to Todo with the worktree kept and the report saying exactly where it stopped.
+5. **Merge**: human by default (ADR-0001). The merge ladder
+   (`src/merge-ladder.ts`) lets a repo earn `human → shadow → auto-low-risk → auto`
+   on verification evidence only — ticket text can never confer merge authority.
+   Caps/failures park the issue back to Todo with the worktree kept and the report
+   saying exactly where it stopped.
+
+## The self-improvement loops
+
+- **Lessons** (`src/lessons.ts`): every park / needs-human / taste-fail is distilled
+  at the moment it happens into a one-line "when X, do Y" lesson and injected into
+  future runs on the same repo (hard-capped, treated as untrusted data).
+- **Groundskeepers** (`groundskeepers/`): scheduled read-only work *generators* that
+  review a project's repo, board, and telemetry, then file 0..N contract-conforming
+  tickets — including `factory.md`, the factory maintaining the factory. Ship
+  double-gated OFF (global env gate AND per-card flag).
+- **Post-merge watch** (`src/postmerge.ts`): deploy → smoke-test → auto-revert on
+  failure, commands only from human-reviewed registry cards. Ships double-gated OFF.
+- **Reconcile + spend cap**: board drift self-heals each tick; a trailing-24h
+  factory-wide USD cap enters drain mode (finish in-flight, claim nothing new).
 
 ## Guardrails wired in
 
-Scrubbed worker env (no Linear key, no Mongo string) · untrusted-input delimiters
-around all ticket text · secret-regex scan on every outbound comment/PR body ·
-guarded-path detection (tests/CI/`CLAUDE.md`/`.claude/`/skills → flagged in the
-report for categorical human review) · `dontAsk` + explicit tool allowlists ·
-turns/wall-clock/iteration caps with `maxBudgetUsd` as backstop · single-instance
-lease + claim re-verification.
+Scrubbed worker env (no Linear key, no connection strings) · untrusted-input
+delimiters around all ticket text · secret-regex scan on every outbound
+comment/PR body · guarded-path detection (tests/CI/`CLAUDE.md`/`.claude/`/skills →
+flagged for categorical human review) · `dontAsk` + explicit tool allowlists ·
+turns/wall-clock/iteration caps with per-issue and per-day USD backstops ·
+single-instance lease + claim re-verification · kill switch + drain mode.
 
-## Not yet built (deliberately — see plan §8 backlog + verdict)
+## Not yet built (deliberately)
 
-Machine GitHub identity + per-repo PATs (uses your `gh` login until then — plan §6.1
-guardrail 1 is the FIRST backlog item before any unattended operation), sandbox
-settings for write roles, heartbeat/TTL watcher, post-merge watch, Routines
-scheduler, Channels CI watcher, intake authoring agent, campaign mode (Milestone B).
+Machine GitHub identity + per-repo PATs (uses your `gh` login until then — the
+first backlog item before any unattended operation), sandbox settings for write
+roles, heartbeat/TTL watcher, CI-watcher channel. The live roadmap is
+`docs/planning/autonomy.md`.
 
 ## ADRs
 
