@@ -49,6 +49,13 @@ const ROUTED_MARKERS = [
  *  name reasons that can share a holdReason with a routed marker, plus the
  *  common terminal causes we want robust against future reason-joining. */
 const ESCALATED_MARKERS = [
+  // repos.ts guardedPathsTouched could not compute the diff (git failure) and
+  // returned the DIFF_FAILED sentinel; loop.ts records it inside the guarded
+  // hold ("guarded paths touched: <diff-failed>"). That is an errored stage
+  // wearing the routed marker's clothing — friction, not a by-design C17 stop —
+  // so it must be listed HERE (escalated wins over routed) or it would misfile.
+  "<diff-failed>",
+  "auto-merge failed",                 // mergePr ran and failed (loop.ts B16 path)
   "security review returned a fail",   // security FAIL verdict
   "security review did not complete",  // warranted-but-absent security pass
   "design taste gate failed",
@@ -80,8 +87,11 @@ export function classifyOutcome(outcome: RunOutcome, reason?: string): OutcomeCl
       return null;
     // "A human merges the PR" IS the design of the human/shadow tiers and the
     // merge:review / self-repo caps — routed by definition, not by default.
-    // The reason scan future-proofs against an escalation cause (e.g. a failed
-    // auto-merge) ever being recorded on a pr_open row; today reason is unset.
+    // The reason scan catches the exception: a run the daemon TRIED and FAILED
+    // to auto-merge (loop.ts records "auto-merge failed: …" on that pr_open
+    // row) is friction, not the human-merge tier working. Rows written before
+    // that reason existed carry no reason and stay routed here; the run-detail
+    // reconstruction (reconstruct.ts) recovers them from merge_decision events.
     case "pr_open":
       return escalatedMarker ? "escalated" : "routed";
     // Intake posted clarifying questions and requeued for the human's answer —

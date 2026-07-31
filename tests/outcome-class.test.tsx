@@ -11,6 +11,9 @@ import { mockRunRecords } from "../ui/src/lib/fixtures.ts";
 // the tighten-only default. A regression here means the dashboard would either
 // bury genuine friction under "routed" (the failure mode the ledger exists to
 // prevent) or silently misfile by-design handoffs.
+//
+// NOTE: like every test that imports ui/src, this file needs BOTH installs:
+// `bun install && (cd ui && bun install)` — root alone leaves react unresolved.
 
 describe("classifyOutcome — routed: by-design human handoffs", () => {
   test("guarded-paths hold (C17) is routed", () => {
@@ -55,6 +58,18 @@ describe("classifyOutcome — escalated: genuine friction", () => {
 
   test("aborted (external move) is always escalated", () => {
     expect(classifyOutcome("aborted", "moved externally during review")).toBe("escalated");
+  });
+
+  // guardedPathsTouched returns the <diff-failed> sentinel when git itself
+  // fails (repos.ts) and loop.ts folds it into the guarded hold phrasing — an
+  // errored stage wearing the routed marker's clothing. Escalated markers are
+  // checked first, so the sentinel must win over "guarded paths touched".
+  test("DIFF_FAILED sentinel inside the guarded hold escalates — errored stage, not a C17 stop", () => {
+    expect(classifyOutcome("needs_human", "guarded paths touched: <diff-failed>")).toBe("escalated");
+  });
+
+  test("a failed auto-merge attempt on pr_open escalates — the system tried and failed", () => {
+    expect(classifyOutcome("pr_open", "auto-merge failed: pull request is not mergeable (conflicts)")).toBe("escalated");
   });
 });
 
@@ -138,5 +153,29 @@ describe("reconstructRun — outcomeClass on the drill-down", () => {
       { type: "run_started", issueKey: "FAC-Y", title: "t", repo: "r/y", dryRun: false, seq: 1, at: 1000 },
     ];
     expect(reconstructRun(active).outcomeClass).toBeNull();
+  });
+
+  // pr_open + an ACTED merge_decision = the daemon tried to auto-merge and
+  // mergePr failed (loop.ts B16 merges BEFORE run_finished, so success would
+  // have produced "merged"). Old rows carry no "auto-merge failed" reason, but
+  // the durable stream still proves the attempt — the reconstruction must
+  // escalate it. An unacted (shadow/human-tier) decision must NOT: that is the
+  // by-design human-merge path.
+  const prOpen = (acted: boolean): FactoryEvent[] => [
+    { type: "run_started", issueKey: "FAC-Y", title: "t", repo: "r/y", dryRun: false, seq: 1, at: 1000 },
+    { type: "run_finished", issueKey: "FAC-Y", outcome: "pr_open", prUrl: "https://github.com/r/y/pull/1",
+      costUsd: 0, stages: [], gateStrength: "real", guardedPaths: [], dryRun: false, seq: 2, at: 2000 },
+    // merge_decision is emitted AFTER run_finished (loop.ts) — same order here.
+    { type: "merge_decision", issueKey: "FAC-Y", repo: "r/y", tier: "auto", wouldMerge: true,
+      acted, strength: "real", browser: "not-required", security: "pass", cleanStreak: 3,
+      reasons: [], seq: 3, at: 3000 },
+  ];
+
+  test("pr_open with an acted merge_decision (failed auto-merge) escalates", () => {
+    expect(reconstructRun(prOpen(true)).outcomeClass).toBe("escalated");
+  });
+
+  test("pr_open with an unacted merge_decision (shadow/human tier) stays routed", () => {
+    expect(reconstructRun(prOpen(false)).outcomeClass).toBe("routed");
   });
 });

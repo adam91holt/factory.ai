@@ -585,11 +585,22 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       merged = mergePr(repo, prUrl);
     }
     const outcome: RunOutcome = merged?.ok ? "merged" : needsHuman ? "needs_human" : "pr_open";
+    // A merge the daemon ATTEMPTED and mergePr failed (branch protection,
+    // conflict, gh error) must not read as the by-design human-merge tier: the
+    // pr_open row records WHY, and "auto-merge failed" is an escalated marker
+    // in the dashboard ledger (ui/src/lib/history.ts). Redacted before it
+    // leaves the process — gh error output can echo remote URLs/tokens.
+    // needsHuman still wins if both somehow hold (decideMerge should never act
+    // on a held run, but the hold is the stronger fact to surface).
+    const mergeFailedReason = merged && !merged.ok
+      ? `auto-merge failed: ${redactSecrets(merged.out).clean.slice(0, 300)}`
+      : undefined;
+    const runReason = needsHuman ? holdReason : mergeFailedReason;
 
     const report = buildReport({
       issueKey: issue.identifier, prUrl,
       outcome,
-      reason: needsHuman ? holdReason : undefined,
+      reason: runReason,
       stages, gates: results, gateStrength: summary.strength, guardedPaths: guarded,
       reviewFindingsSummary: fixer.text.slice(0, 1500),
       ...(tasteFindings ? { designReview: tasteFindings } : {}),
@@ -598,7 +609,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
 
     bus.emit({ type: "run_finished", issueKey: issue.identifier,
       outcome,
-      ...(needsHuman ? { reason: holdReason.slice(0, 500) } : {}),
+      ...(runReason ? { reason: runReason.slice(0, 500) } : {}),
       prUrl, costUsd: stages.reduce((s, x) => s + x.costUsd, 0),
       stages: stages.map(toStageMeta), gateStrength: summary.strength, guardedPaths: guarded,
       dryRun: config.dryRun, securityVerdict, browser });
