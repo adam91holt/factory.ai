@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, DIFF_FAILED, type Workspace } from "./repos.ts";
+import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, headSha, fetchBase, commitsBehindBase, mergeBaseIntoBranch, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { isDraining } from "./control.ts";
@@ -505,6 +505,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // itself degrades (PR opens), never parks, on an absent verdict.
     let finalDiff = "";
     try { finalDiff = diffAgainstBase(ws); } catch { finalDiff = ""; }
+    // merge-integrity: record the EXACT commit this evidence describes. Commits
+    // stop at the last verify-repair round (the tester/security stages never
+    // commit), so HEAD here is the head the green gates ran against — the SHA
+    // the eventual merge is pinned to via --match-head-commit. null (git
+    // failure) later refuses the auto-merge rather than merging unpinned.
+    const gatedHeadSha = headSha(ws);
     const diffLines = countDiffLines(finalDiff);
     let securityVerdict: "pass" | "fail" | null = null;
     if (diffLines >= SECURITY_REVIEW_MIN_DIFF_LINES && !budget.expired) {
@@ -556,8 +562,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (testerFail) holdReasons.push("verification agent returned an explicit FAIL verdict");
     if (securityVerdict === "fail") holdReasons.push("security review returned a FAIL verdict");
     if (securityWarrantedButAbsent) holdReasons.push(`security review did not complete on a ${diffLines}-line diff (${budget.expired ? budget.expiredReason : "stage error or no parseable verdict line"}) — cannot auto-merge unreviewed`);
-    const needsHuman = holdReasons.length > 0;
-    const holdReason = holdReasons.join("; ");
+    // let (not const): the merge-integrity pre-flight and a --match-head-commit
+    // refusal below can only ever ADD hold reasons (fold to needs-human) — the
+    // tighten-only direction; nothing ever clears one.
+    let needsHuman = holdReasons.length > 0;
+    let holdReason = holdReasons.join("; ");
 
     // ---- evidence-gated merge decision (Gap 2). Built from VERIFICATION
     // EVIDENCE only — gate summary, guarded paths, needsHuman folds, security and
@@ -599,9 +608,50 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // made the "≤1 human intervention" milestone unmeasurable. The
     // Linear-visible comment sequence further down is unchanged: the merge
     // result is only ANNOUNCED to the ticket later, in its usual place.
-    let merged: { ok: boolean; out: string } | null = null;
-    if (!config.dryRun && decision.act && prUrl) {
-      merged = mergePr(repo, prUrl);
+    // merge-integrity pre-flight (only when the ladder would actually act):
+    // (a) STALE-MAIN RE-GATE — the invariant is "a PR is never merged except
+    // against the exact main its checks last passed on". Two siblings can both
+    // go green against the same old main; the first merges; the second still
+    // merges "cleanly" but was never tested against the first's changes. If the
+    // branch is behind current origin/<default>, main is merged INTO it, the
+    // verify gate re-runs against the combined head, and only then does the
+    // merge proceed — pinned to the NEW head. A conflict, red re-gate, or any
+    // git ambiguity folds into needsHuman (never merges a behind-main branch
+    // un-re-gated). (b) HEAD PINNING — the merge below passes
+    // --match-head-commit with the SHA the gates ran against, so GitHub
+    // atomically refuses if anything pushed to the branch in the gap. Policy
+    // purity is preserved: decideMerge (merge-ladder.ts) stays evidence-pure;
+    // this is action-site I/O, factored into preMergeIntegrity (bottom of this
+    // file) with injectable deps so the decision sequence is unit-testable.
+    const integrity = !config.dryRun && decision.act && prUrl
+      ? preMergeIntegrity(ws, gatedHeadSha, {
+          fetchBase, commitsBehindBase, mergeBaseIntoBranch,
+          regate: () => gateSummary(verify(ws, gates, baselines)),
+          push: pushBranch, headSha,
+        })
+      : null;
+    if (integrity && !integrity.ok) {
+      holdReasons.push(`merge-integrity: ${integrity.hold}`);
+      needsHuman = true;
+      holdReason = holdReasons.join("; ");
+    }
+    // The recorded decision must reflect what actually happened: an integrity
+    // hold means the ladder did NOT act, even though the evidence said it could.
+    const finalDecision: MergeDecision = integrity && !integrity.ok
+      ? { ...decision, act: false, reasons: [...decision.reasons, `merge-integrity: ${integrity.hold}`] }
+      : decision;
+
+    let merged: { ok: boolean; out: string; headMoved: boolean } | null = null;
+    if (!config.dryRun && finalDecision.act && prUrl && integrity?.ok) {
+      merged = mergePr(repo, prUrl, integrity.pinnedHeadSha);
+      if (!merged.ok && merged.headMoved) {
+        // GitHub refused the pin: the branch moved between gate time and merge
+        // (steward follow-up, sibling task, human push). The new head's code
+        // was NEVER gated — do not retry against it; a human must re-review.
+        holdReasons.push("merge-integrity: branch moved since gates passed (--match-head-commit refused the merge) — the new head was never gated; human must re-review");
+        needsHuman = true;
+        holdReason = holdReasons.join("; ");
+      }
     }
     const outcome: RunOutcome = merged?.ok ? "merged" : needsHuman ? "needs_human" : "pr_open";
 
@@ -644,13 +694,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (!config.dryRun) {
       // ALWAYS record the shadow decision (audit + earning) — a dirty run resets
       // the clean streak, so this must run even on the needs_human path.
-      const state = recordShadowDecision(repo, issue.identifier, decision, ev);
+      const state = recordShadowDecision(repo, issue.identifier, finalDecision, ev);
       bus.emit({ type: "merge_decision", issueKey: issue.identifier, repo, tier,
-        wouldMerge: decision.wouldMerge, acted: decision.act, strength: ev.strength,
-        browser, security: securityVerdict, cleanStreak: state.cleanStreak, reasons: decision.reasons });
+        wouldMerge: finalDecision.wouldMerge, acted: finalDecision.act, strength: ev.strength,
+        browser, security: securityVerdict, cleanStreak: state.cleanStreak, reasons: finalDecision.reasons });
       if (needsHuman) {
         await linear.addLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => {});
-      } else if (decision.act && prUrl && merged) {
+      } else if (finalDecision.act && prUrl && merged) {
         // The repo EARNED an auto-merge tier and every gate was strong+clean —
         // the merge itself already ran (above, before run_finished); this just
         // announces the already-known outcome to the ticket.
@@ -668,7 +718,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         // Shadow tier: the repo is still EARNING — surface the would-merge note so
         // the owner can watch the streak build toward auto-low-risk.
         if (tier === "shadow" && prUrl) {
-          await post(issue, `${linear.SENTINEL}\n\n**Shadow merge decision** — would-merge=${decision.wouldMerge}${decision.reasons.length ? ` (${decision.reasons.join("; ")})` : ""}. This repo is EARNING auto-merge: clean streak ${state.cleanStreak}/${config.mergeLadder.promoteAfter}. A human merges ${prUrl}.`).catch(() => {});
+          await post(issue, `${linear.SENTINEL}\n\n**Shadow merge decision** — would-merge=${finalDecision.wouldMerge}${finalDecision.reasons.length ? ` (${finalDecision.reasons.join("; ")})` : ""}. This repo is EARNING auto-merge: clean streak ${state.cleanStreak}/${config.mergeLadder.promoteAfter}. A human merges ${prUrl}.`).catch(() => {});
         }
       }
       await linear.release(issue);
@@ -788,4 +838,81 @@ async function park(issue: linear.Issue, repo: string, stages: StageResult[], re
   await captureLesson({ repo, stage: stages.at(-1)?.label ?? "pipeline",
     issueKey: issue.identifier, outcome: "parked", reason,
     ...(failed.length > 0 ? { stageErrors: failed.map((s) => `${s.label}: ${s.error}`) } : {}) });
+}
+
+// ---------------------------------------------------------------------------
+// Merge-integrity pre-flight (stream: merge-integrity). Runs ONLY when the
+// merge ladder decided to ACT — it is the last check between "evidence says
+// merge" and the irreversible `gh pr merge`. It enforces the invariant "a PR
+// is never merged except against the exact main its checks last passed on,
+// at the exact head its checks ran against":
+//
+//   1. no gated SHA recorded → refuse (an unpinned merge could land code the
+//      gates never saw);
+//   2. refresh origin and measure how far HEAD is behind the default branch —
+//      sibling PRs merge while a run is in flight, and two branches that each
+//      went green against the same OLD main are not thereby green against
+//      each other;
+//   3. if behind: merge main INTO the branch, re-run the verify gate against
+//      the combined head, push, and pin the merge to the NEW head;
+//   4. any failure anywhere (fetch, unknown behind-count, merge conflict, red
+//      re-gate, push failure, unreadable head) returns a hold — the caller
+//      folds it into needsHuman. There is NO path from a failure to a merge.
+//
+// Deps are injectable (postmerge.ts's DeployDeps pattern) so the decision
+// sequence is unit-testable without git/gh; production wires the real
+// repos.ts/verify.ts machinery at the call site. Policy purity is preserved:
+// decideMerge (merge-ladder.ts) never learns about freshness — this is
+// action-site I/O sequencing, not merge policy.
+
+export interface MergeIntegrityDeps {
+  fetchBase: (ws: Workspace) => { ok: boolean; out: string };
+  commitsBehindBase: (ws: Workspace) => number | null;
+  mergeBaseIntoBranch: (ws: Workspace) => { ok: boolean; out: string };
+  /** Re-run the verify gate (verify.ts verify+gateSummary against the SAME
+   * gates/baselines the run used) — the combined head must be as green as the
+   * original head was. */
+  regate: () => { green: boolean; failures: { name: string }[] };
+  push: (ws: Workspace) => void;
+  headSha: (ws: Workspace) => string | null;
+}
+
+export type MergeIntegrityResult =
+  | { ok: true; pinnedHeadSha: string }
+  | { ok: false; hold: string };
+
+export function preMergeIntegrity(ws: Workspace, gatedHeadSha: string | null, deps: MergeIntegrityDeps): MergeIntegrityResult {
+  if (!gatedHeadSha) {
+    return { ok: false, hold: "could not record the head SHA the gates ran against (git rev-parse failed) — refusing an unpinned auto-merge" };
+  }
+  const fresh = deps.fetchBase(ws);
+  if (!fresh.ok) {
+    return { ok: false, hold: `could not refresh ${ws.baseRef} before merging (${fresh.out.slice(0, 200)}) — cannot prove the branch was gated against current main` };
+  }
+  const behind = deps.commitsBehindBase(ws);
+  if (behind === null) {
+    return { ok: false, hold: `could not determine whether the branch is behind ${ws.baseRef} — refusing to merge blind` };
+  }
+  if (behind === 0) return { ok: true, pinnedHeadSha: gatedHeadSha };
+
+  // Behind current main: the gates passed against an OLDER base. Update and
+  // re-gate — never merge a behind-main branch on its stale green.
+  const upd = deps.mergeBaseIntoBranch(ws);
+  if (!upd.ok) {
+    return { ok: false, hold: `branch is ${behind} commit(s) behind ${ws.baseRef} and updating it conflicted — a human must resolve (${upd.out.slice(0, 200)})` };
+  }
+  const regate = deps.regate();
+  if (!regate.green) {
+    return { ok: false, hold: `branch was ${behind} commit(s) behind ${ws.baseRef}; after updating, gates FAILED against the combined head (${regate.failures.map((f) => f.name).join(", ") || "unknown gate"}) — the changes that landed on main break this branch` };
+  }
+  try {
+    deps.push(ws); // the PR head must BE the SHA we pin the merge to
+  } catch (e) {
+    return { ok: false, hold: `re-gated the updated branch green but could not push it (${(e instanceof Error ? e.message : String(e)).slice(0, 200)}) — not merging a head GitHub cannot see` };
+  }
+  const sha = deps.headSha(ws);
+  if (!sha) {
+    return { ok: false, hold: "could not record the re-gated head SHA after updating with main — refusing an unpinned auto-merge" };
+  }
+  return { ok: true, pinnedHeadSha: sha };
 }
