@@ -24,7 +24,17 @@ import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 const REQUIRED_SECTIONS = ["## Goal", "## Outcomes", "## Repo", "## Verifications"];
 
 // Interim Bash scoping for write-capable roles (C19; full OS sandbox is backlog).
-const WRITER_BASH = ["Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git rm:*)", "Bash(ls:*)", "Bash(cat:*)"];
+// Deliberately NO git push and NO gh of any kind: the daemon performs every
+// remote mutation itself (repos.ts pushBranch / createPr), so workers need zero
+// network-write capability. agents.ts's forbiddenToolViolations guard rejects
+// any future grant that breaks this; tests/tool-allowlist.test.ts pins the
+// shape (hence the exports).
+export const WRITER_BASH = ["Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git rm:*)", "Bash(ls:*)", "Bash(cat:*)"];
+
+// Read-only review surface (repo reviewer, reviewer-fallback, design reviewer):
+// inspect the worktree and its git history, mutate nothing. One shared const so
+// the review stages cannot drift apart tool-wise; exported for the shape test.
+export const REVIEWER_TOOLS = ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"];
 
 export function missingSections(issue: linear.Issue): string[] {
   return REQUIRED_SECTIONS.filter((s) => !issue.description.includes(s));
@@ -375,12 +385,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       runStage("reviewer-claude", lessonsBlock + renderPrompt("reviewer-spec", { spec, diff: clampedDiff }, reviewPrompt("spec compliance and correctness — walk every ticket requirement")),
         { model: resolveModel("reviewerClaude", meta), effort: resolveEffort("reviewerClaude", meta, cardEffort("reviewer-spec")), cwd: reviewerScratch, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
       runStage("reviewer-repo", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: resolveModel("reviewerCodex", meta), effort: resolveEffort("reviewerCodex", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
+        { model: resolveModel("reviewerCodex", meta), effort: resolveEffort("reviewerCodex", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: REVIEWER_TOOLS, maxTurns: config.caps.turnsReviewer, budgetUsd: parallelReviewBudget, deadlineMs: budget.deadlineMs, onEvent }),
     ]);
     let reviewCodex = reviewCodexTry;
     if (reviewCodex.error || !reviewCodex.text.trim()) {
       reviewCodex = await runStage("reviewer-fallback", lessonsBlock + renderPrompt("reviewer-repo", { spec, diff: clampedDiff }, reviewPrompt(repoLens)),
-        { model: resolveModel("reviewerClaude", meta), effort: resolveEffort("reviewerClaude", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("reviewerClaude", meta), effort: resolveEffort("reviewerClaude", meta, cardEffort("reviewer-repo")), cwd: ws.dir, allowedTools: REVIEWER_TOOLS, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       reviewCodex.degraded = true;
     }
     stages.push(reviewClaude, reviewCodex);
@@ -425,7 +435,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const maxTasteRounds = Math.max(1, config.caps.tasteRounds);
       const designReviewerEffort = resolveEffort("designReviewer", meta, cardEffort("design-reviewer"));
       let design = await runStage("design-reviewer", designReviewPrompt(),
-        { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: REVIEWER_TOOLS, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(design);
       await postStageComment(issue, design);
       for (let round = 1; round < maxTasteRounds && parseTasteVerdict(design) === "fail" && !budget.expired; round++) {
@@ -438,7 +448,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         try { designDiff = diffAgainstBase(ws); } catch { /* keep prior diff */ }
         if (budget.expired) break;
         design = await runStage(`design-reviewer-${round + 1}`, designReviewPrompt(),
-          { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)", "Bash(git show:*)"], maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: resolveModel("designReviewer", meta), effort: designReviewerEffort, cwd: ws.dir, allowedTools: REVIEWER_TOOLS, maxTurns: config.caps.turnsReviewer, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(design);
         await postStageComment(issue, design);
       }

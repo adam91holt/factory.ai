@@ -44,6 +44,15 @@ function ghPr(repo: string, branch: string): string {
   }
 }
 
+// Read-only gh: the steward investigates PRs (view/diff/checks/list/status)
+// but cannot mutate — merge/close/comment/push verbs are simply not granted,
+// so "the human merges" holds by construction, not by prompt discipline.
+// Every gh entry here must stay within agents.ts's READONLY_GH_PREFIXES or
+// runStage refuses to run the stage at all; tests/tool-allowlist.test.ts pins
+// the shape (hence the export). Write is scratch-dir output (summary.md,
+// tickets/) — the daemon, not the steward, executes anything written there.
+export const STEWARD_TOOLS = ["Write", "Read", "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr checks:*)", "Bash(gh pr list:*)", "Bash(gh pr status:*)"];
+
 export function childrenAllTerminal(detail: Awaited<ReturnType<typeof linear.getIssueDetail>>): boolean {
   if (detail.children.length === 0) return false;
   return detail.children.every((c) => {
@@ -117,10 +126,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         untrusted(`CHILDREN STATUS + PRS:\n${childReports}`),
       ].join("\n")),
     { model: resolveModel("steward", epicMeta), effort: resolveEffort("steward", epicMeta, cardEffort("steward")), cwd: scratch,
-      // Read-only gh: the steward investigates PRs (view/diff/checks/list) but
-      // cannot mutate — merge/close/comment/push verbs are simply not granted,
-      // so "the human merges" holds by construction, not by prompt discipline.
-      allowedTools: ["Write", "Read", "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr checks:*)", "Bash(gh pr list:*)", "Bash(gh pr status:*)"],
+      allowedTools: STEWARD_TOOLS,
       maxTurns: config.caps.turnsFixer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline,
       onEvent: (e) => {
         if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey: epic.identifier, stage: e.stage, model: e.model, viaProxy: e.viaProxy });

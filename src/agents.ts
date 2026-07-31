@@ -82,6 +82,90 @@ const DENY_ORCHESTRATION = [
 ];
 
 // ---------------------------------------------------------------------------
+// Tool-allowlist audit (tighten-only, 2026-07 hardening): "remove any tool
+// whose matcher cannot pin the target". Workers never push or touch gh — the
+// DAEMON does every remote mutation itself (repos.ts: pushBranch, gh pr
+// create), so a worker allowlist granting push/gh-write is always a config
+// bug, never a need. This guard makes that structural: runStage rejects the
+// stage BEFORE the SDK ever spawns, so a future edit to any call site (or a
+// new call site) cannot silently grant an unpinnable matcher. Enforced here —
+// the single choke point every stage passes through — rather than at the
+// scattered call sites, for the same reason DENY_ORCHESTRATION lives here.
+// ---------------------------------------------------------------------------
+
+// The ONLY git-push forms a stage may ever be granted, and only as EXACT
+// (wildcard-free) matchers: no `:*` suffix means the SDK matches the literal
+// command, so neither `--force` nor an explicit refspec like `HEAD:main` can
+// ride along. Nothing grants these today (the daemon pushes); they exist so a
+// future stage that genuinely must push can do so without loosening this guard.
+const PINNED_GIT_PUSH = new Set(["git push -u origin HEAD", "git push origin HEAD"]);
+
+// Read-only gh investigation verbs — the steward's whole gh surface. Prefix
+// match (a flag after the verb is fine); everything else gh — merge, api,
+// issue/label mutation, repo admin — is denied. "The human merges" holds by
+// construction only while this list stays read-only.
+const READONLY_GH_PREFIXES = ["gh pr view", "gh pr diff", "gh pr checks", "gh pr list", "gh pr status"];
+
+// Git subcommands no worker may hold even pinned: remote/config can rewrite
+// `origin` in the very worktree the daemon later pushes from (redirecting the
+// factory's push to an attacker-chosen remote); fetch/pull is arbitrary
+// remote fetch, which no stage needs (the daemon prepares worktrees).
+const FORBIDDEN_GIT_SUBCOMMANDS = ["remote", "config", "fetch", "pull", "push"];
+
+// Shell-escape runners that would let a pinned Bash matcher launch an
+// unpinned command underneath it. (bun/bunx/npm/npx/node stay allowed for
+// writers — running the repo's own toolchain is the job; confining what THAT
+// can do is the OS-sandbox backlog item C19, not an allowlist concern.)
+const SHELL_RUNNERS = ["sh", "bash", "zsh", "dash", "ksh", "env", "xargs", "eval", "exec", "command"];
+
+/** Pure audit of a stage tool allowlist. Returns one human-readable violation
+ *  per offending entry (empty array = clean). Exported for the shape tests in
+ *  tests/tool-allowlist.test.ts, which pin the PRODUCTION allowlists
+ *  (loop.ts/steward.ts) against this same predicate. */
+export function forbiddenToolViolations(tools: string[]): string[] {
+  const violations: string[] = [];
+  for (const tool of tools) {
+    const base = tool.replace(/\(.*$/, "");
+    // Listing a hard-denied orchestration tool in an allowlist is a confused
+    // config even though disallowedTools would win — flag it loudly.
+    if (DENY_ORCHESTRATION.includes(base)) {
+      violations.push(`${tool}: orchestration tool is hard-denied for workers`);
+      continue;
+    }
+    if (base !== "Bash") continue; // non-Bash tools are confined by the SDK per-tool
+    const inner = tool.match(/^Bash\((.+)\)$/)?.[1];
+    if (inner === undefined || inner === "*" || inner === ":*") {
+      violations.push(`${tool}: unpinned Bash (no command matcher)`);
+      continue;
+    }
+    const wildcard = inner.endsWith(":*");
+    const cmd = (wildcard ? inner.slice(0, -2) : inner).trim().replace(/\s+/g, " ");
+    const word0 = cmd.split(" ")[0] ?? "";
+    if (SHELL_RUNNERS.includes(word0)) {
+      violations.push(`${tool}: shell runner defeats command pinning`);
+    } else if (word0 === "git") {
+      const sub = cmd.split(" ")[1] ?? "";
+      if (sub === "" ) {
+        violations.push(`${tool}: unpinned git (any subcommand, incl. push --force)`);
+      } else if (sub === "push") {
+        // Exact pinned forms only — a wildcard push matcher also matches
+        // `git push --force` / `git push origin HEAD:main`.
+        if (wildcard || !PINNED_GIT_PUSH.has(cmd)) {
+          violations.push(`${tool}: git push must be one of the exact pinned forms [${[...PINNED_GIT_PUSH].join(" | ")}]`);
+        }
+      } else if (FORBIDDEN_GIT_SUBCOMMANDS.includes(sub)) {
+        violations.push(`${tool}: git ${sub} is daemon-only (remote/config rewrite or arbitrary remote fetch)`);
+      }
+    } else if (word0 === "gh") {
+      if (!READONLY_GH_PREFIXES.some((p) => cmd === p || cmd.startsWith(`${p} `))) {
+        violations.push(`${tool}: gh beyond the read-only investigation verbs (${READONLY_GH_PREFIXES.join(", ")}) is daemon/human-only`);
+      }
+    }
+  }
+  return violations;
+}
+
+// ---------------------------------------------------------------------------
 // Kill switch (B6, prerequisite-0 in docs/planning/autonomy.md "Build order"
 // item 0). Every in-flight stage registers its AbortController here for the
 // duration of the SDK call; POST /stop (server.ts, via control.ts) walks this
@@ -163,6 +247,18 @@ const defaultDeps: StageDeps = {
 
 export async function runStage(label: string, prompt: string, opts: StageOptions, deps: StageDeps = defaultDeps): Promise<StageResult> {
   const t0 = Date.now();
+  // Allowlist audit BEFORE any SDK spawn or spend: an unpinnable tool grant is
+  // a deterministic config error, so it fails the stage immediately (cost 0)
+  // rather than arming a worker with it. Deliberately not a transient error —
+  // isTransientStageError won't match, so no retry/failover burns budget on a
+  // config bug — and the caller handles it like any stage error: park /
+  // needs-human, never auto-advance (tighten-only: ambiguity routes to a human).
+  const toolViolations = forbiddenToolViolations(opts.allowedTools ?? []);
+  if (toolViolations.length > 0) {
+    const error = `forbidden tool grant: ${toolViolations.join("; ")}`;
+    opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: 0, turns: 0, wallSeconds: 0, resultText: "", error });
+    return { label, text: "", costUsd: 0, turns: 0, wallSeconds: 0, error };
+  }
   const primaryModel = opts.model;
   // B-model-failover adversarial review: every runOneAttempt() below — the
   // initial try, each retry, and a fallback run — spends real money, but
