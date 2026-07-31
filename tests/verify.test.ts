@@ -6,7 +6,7 @@ import { detectGates, gateSummary, isE2eGate, hasUiSurface, requiresBrowserEvide
 import type { Workspace } from "../src/repos.ts";
 
 const gate = (name: string, passed: boolean | null, baselinePassed = passed !== null): GateResult =>
-  ({ name, baselinePassed, passed, output: passed === false ? "boom" : "" });
+  ({ name, baselinePassed, passed, output: passed === false ? "boom" : "", baselineTestCount: null, testCount: null });
 
 describe("gateSummary", () => {
   test("no gates at all → green with strength none", () => {
