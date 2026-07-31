@@ -10,12 +10,31 @@ function gateBadge(passed: boolean | null) {
   return <Badge variant="outline" title="fails on the clean baseline — not counted">NO-GATE</Badge>;
 }
 
+/** Test-count ratchet evidence: "tests 631 → 640". Only rendered when a count
+ *  exists on either side; a confirmed decrease is the withhold signal, so it
+ *  reads as an error; an unknown side renders "?" (visible, non-blocking). */
+function testCounts(gate: GateMeta) {
+  const b = gate.baselineTestCount ?? null;
+  const t = gate.testCount ?? null;
+  if (b === null && t === null) return null;
+  const decreased = b !== null && t !== null && t < b;
+  return (
+    <span
+      className={cn("font-mono text-[9.5px]", decreased ? "text-err" : "text-fg-faint")}
+      title={decreased ? "passing test count decreased vs baseline — auto-merge withheld" : "passing tests: baseline → post-change"}
+    >
+      tests {b ?? "?"} → {t ?? "?"}
+    </span>
+  );
+}
+
 function Gate({ gate }: { gate: GateMeta }) {
   return (
     <div className="rounded-lg border border-line bg-bg0 px-2.5 py-1.5">
       <div className="flex items-center gap-2">
         <span className="font-mono text-xs text-fg">{gate.name}</span>
         {!gate.baselinePassed && <span className="font-mono text-[9.5px] text-fg-faint">baseline red</span>}
+        {testCounts(gate)}
         <span className="ml-auto">{gateBadge(gate.passed)}</span>
       </div>
       {gate.outputTail !== "" && (

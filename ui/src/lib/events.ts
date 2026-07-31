@@ -35,6 +35,11 @@ export interface GateMeta {
   baselinePassed: boolean;
   passed: boolean | null;     // null = no-gate (fails on clean baseline)
   outputTail: string;         // last ≤400 chars of failure output, redacted; "" on pass
+  // Test-count ratchet evidence ("tests: 631 -> 640"): parsed passing-test
+  // counts, null = unknown / not a test gate. Optional so events persisted
+  // before the ratchet existed replay unchanged.
+  baselineTestCount?: number | null;
+  testCount?: number | null;
 }
 
 // B16: "merged" = the merge ladder didn't just open the PR — mergePr actually
@@ -160,6 +165,12 @@ export interface MissionState {
 export interface RunRecord {
   issueKey: string;
   outcome: RunOutcome;
+  // `reason` is not just display text: the dashboard's routed-vs-escalated
+  // outcomes ledger (ui/src/lib/history.ts classifyOutcome) DERIVES its
+  // classification from these recorded strings — zero new event state, so rows
+  // written before the ledger existed classify too. That makes the hold/park
+  // phrasings in loop.ts a soft contract: reword one and its runs fall back to
+  // ESCALATED (fail-noisy, never fail-quiet) until the marker lists catch up.
   reason?: string;
   prUrl: string | null;
   costUsd: number;

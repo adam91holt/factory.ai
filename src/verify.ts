@@ -23,6 +23,12 @@ export interface GateResult {
   baselinePassed: boolean;
   passed: boolean | null; // null = not run (no-gate)
   output: string;
+  // Test-count ratchet (withhold-only, see testCountRatchet below): passing-test
+  // counts parsed from the runner's own summary output, null = UNKNOWN
+  // (unparseable output, non-test gate, or gate skipped). Baseline count comes
+  // from the pristine pre-change run, testCount from the post-change run.
+  baselineTestCount: number | null;
+  testCount: number | null;
 }
 
 // Gap-2: browser/e2e scripts are gates too — a passing e2e gate is what lifts a
@@ -35,6 +41,51 @@ const CANDIDATES = ["typecheck", "check", "build", "lint", "test", "test:ci", "t
  * `test:e2e-utils` or `pretest:e2e` are NOT e2e gates. */
 export function isE2eGate(name: string): boolean {
   return /^(e2e|test:e2e|test:browser|playwright)$/.test(name);
+}
+
+/** A gate that runs tests at all (unit OR e2e) — the union gateSummary uses for
+ * strength. Only these gates participate in the test-count ratchet; parsing a
+ * "pass count" out of typecheck/build/lint output would be noise. */
+export function isTestGate(name: string): boolean {
+  return name.startsWith("test") || isE2eGate(name);
+}
+
+// Test-count ratchet parsing. One pattern per runner family, matched against
+// ANSI-stripped output. Tried in order of SPECIFICITY — the explicit labelled
+// summary lines first, the bare "N pass" forms last — and only the first
+// pattern that matches anywhere is used (a run never mixes runner formats, but
+// a bare-form pattern could false-match inside another runner's verbose
+// output). All matches of the winning pattern are SUMMED: a monorepo/workspace
+// script that runs several suites prints one summary per suite, and both the
+// baseline and post-change runs are parsed identically so the comparison stays
+// apples-to-apples. Anything unmatched is UNKNOWN (null) — never 0, because
+// "we could not read the count" must not masquerade as "no tests passed" (or,
+// worse, let a gutted suite look like a no-op against a 0 baseline).
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const PASS_COUNT_PATTERNS: RegExp[] = [
+  // jest: "Tests:       1 failed, 629 passed, 631 total"
+  // vitest: "  Tests  631 passed (631)" / "Tests  1 failed | 630 passed (631)"
+  // ("Test Suites:" does not match — the anchor requires the plural "Tests".)
+  /^\s*Tests:?\s.*?(\d+) passed\b/gm,
+  // node --test / tap: "# pass 631"
+  /^# pass (\d+)\b/gm,
+  // bun: " 631 pass" (own line) · mocha: "  631 passing (2s)" ·
+  // playwright: "  631 passed (1.2m)"
+  /^\s*(\d+) pass(?:ing|ed)?\s*(?:\(|$)/gm,
+];
+
+/** Parse the PASSING-test count out of a test runner's output; null = UNKNOWN.
+ * Tolerant across runner formats (bun, jest, vitest, mocha, playwright,
+ * node --test); an unparseable output is UNKNOWN, never a count — the ratchet
+ * treats UNKNOWN as "cannot compare" (logged, non-blocking), never as a pass
+ * with an invented number. */
+export function parsePassingTestCount(output: string): number | null {
+  const clean = output.replace(ANSI_RE, "");
+  for (const pattern of PASS_COUNT_PATTERNS) {
+    const matches = [...clean.matchAll(pattern)];
+    if (matches.length > 0) return matches.reduce((sum, m) => sum + Number(m[1]), 0);
+  }
+  return null;
 }
 
 function npmScripts(dir: string): Record<string, string> {
@@ -111,27 +162,79 @@ export function detectGates(ws: Workspace): string[] {
   return CANDIDATES.filter((c) => scripts[c] && !/exit 1|no test specified/.test(scripts[c] ?? ""));
 }
 
+/** Baseline verdict per gate, plus the passing-test count parsed from the
+ * baseline run's output (test gates only; null = UNKNOWN/not-a-test-gate).
+ * The count is only recorded off a PASSING baseline — a red baseline makes the
+ * gate no-gate (verify skips it) so its count could never be compared anyway,
+ * and recording one would invite comparing against a half-run suite. */
+export interface BaselineRun { ok: boolean; testCount: number | null }
+
 /** Run on the pristine worktree BEFORE the implementer touches anything. #12a:
  * a gate run that errored/timed out (not a clean non-zero exit) is retried
  * once via runWithRetryOnError before its baselinePassed verdict is recorded —
  * a transient hiccup here used to be indistinguishable from a genuinely red
  * baseline, classing the gate no-gate (FAC-34/B11). */
-export function baseline(ws: Workspace, gates: string[]): Map<string, boolean> {
+export function baseline(ws: Workspace, gates: string[]): Map<string, BaselineRun> {
   const pm = packageManager(ws.dir);
-  const result = new Map<string, boolean>();
-  for (const gate of gates) result.set(gate, runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.runner, gate])).ok);
+  const result = new Map<string, BaselineRun>();
+  for (const gate of gates) {
+    const r = runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.runner, gate]));
+    result.set(gate, { ok: r.ok, testCount: r.ok && isTestGate(gate) ? parsePassingTestCount(r.out) : null });
+  }
   return result;
 }
 
 /** After changes: a gate counts only if its baseline passed. */
-export function verify(ws: Workspace, gates: string[], baselines: Map<string, boolean>): GateResult[] {
+export function verify(ws: Workspace, gates: string[], baselines: Map<string, BaselineRun>): GateResult[] {
   const pm = packageManager(ws.dir);
   return gates.map((gate) => {
-    const baselinePassed = baselines.get(gate) ?? false;
-    if (!baselinePassed) return { name: gate, baselinePassed, passed: null, output: "skipped: fails on clean baseline (no-gate)" };
+    const base = baselines.get(gate);
+    const baselinePassed = base?.ok ?? false;
+    if (!baselinePassed) return { name: gate, baselinePassed, passed: null, output: "skipped: fails on clean baseline (no-gate)", baselineTestCount: null, testCount: null };
     const r = run(ws.dir, pm.name, [...pm.runner, gate]);
-    return { name: gate, baselinePassed, passed: r.ok, output: r.ok ? "" : r.out };
+    return { name: gate, baselinePassed, passed: r.ok, output: r.ok ? "" : r.out,
+      baselineTestCount: base?.testCount ?? null,
+      testCount: isTestGate(gate) ? parsePassingTestCount(r.out) : null };
   });
+}
+
+// ---- Test-count ratchet (withhold-only) -----------------------------------
+// Complements repos.ts isAdditiveTestExtension: the diff classifier reads the
+// CHANGE (were test lines removed?), the ratchet reads the RUNTIME OUTCOME
+// (did fewer tests actually pass?). A gutted suite the classifier misses —
+// e.g. `.skip` sprinkled on, a helper edited so half the file stops
+// registering, a loop-generated table shrunk — still shows up here as a
+// falling pass count. Principle: automate the TIGHTENING, gate the LOOSENING —
+// an increase flows freely, a decrease requires a human act. So a decrease
+// folds into needsHuman (blocks auto-merge, PR still opens for a human) and
+// NEVER auto-fails/parks the run: renames and consolidations can legitimately
+// lower the count and only a human can tell those apart from gutting.
+
+export interface TestCountRatchet {
+  // "decreased" → fold into needsHuman. "unknown" → NEVER blocks (a count was
+  // unparseable on either side — log it so it is visible, the diff classifier
+  // still guards). "skipped" → no test gate actually ran (strength none, or
+  // every test gate was no-gated by a red baseline — existing baseline logic
+  // already handled those). "ok" → count held or grew.
+  verdict: "ok" | "decreased" | "unknown" | "skipped";
+  evidence: string; // "tests: 631 -> 640" style, "" when skipped
+}
+
+/** Pure fold over the final GateResults. Only test gates that actually RAN
+ * (baseline green → passed !== null) participate. A decrease on ANY such gate
+ * wins over unknowns elsewhere — one confirmed drop is enough evidence to
+ * route to a human, tighten-only. */
+export function testCountRatchet(results: GateResult[]): TestCountRatchet {
+  const ran = results.filter((r) => isTestGate(r.name) && r.passed !== null);
+  if (ran.length === 0) return { verdict: "skipped", evidence: "" };
+  const fmt = (n: number | null) => (n === null ? "?" : String(n));
+  const parts = ran.map((r) => `${ran.length > 1 ? `${r.name} ` : ""}${fmt(r.baselineTestCount)} -> ${fmt(r.testCount)}`);
+  const evidence = `tests: ${parts.join(", ")}`;
+  const decreased = ran.some((r) => r.baselineTestCount !== null && r.testCount !== null && r.testCount < r.baselineTestCount);
+  if (decreased) return { verdict: "decreased", evidence };
+  const unknown = ran.some((r) => r.baselineTestCount === null || r.testCount === null);
+  if (unknown) return { verdict: "unknown", evidence };
+  return { verdict: "ok", evidence };
 }
 
 export function gateSummary(results: GateResult[]): { green: boolean; strength: "none" | "weak" | "real" | "strong"; failures: GateResult[]; hasE2eGate: boolean } {

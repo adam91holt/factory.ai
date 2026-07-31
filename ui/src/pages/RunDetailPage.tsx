@@ -6,8 +6,10 @@ import { useFactory } from "../lib/store";
 import { fetchRunEvents } from "../lib/api";
 import { dateTime, secs } from "../lib/format";
 import { reconstructRun } from "../lib/reconstruct";
+import { classifyOutcome } from "../lib/history";
 import { useNow } from "../lib/useNow";
 import { OutcomeBadge } from "../components/OutcomeBadge";
+import { OutcomeClassBadge } from "../components/OutcomeClassBadge";
 import { CostMeter } from "../components/runs/CostMeter";
 import { StageTimeline } from "../components/runs/StageTimeline";
 import { StageDetail } from "../components/runs/StageDetail";
@@ -72,6 +74,13 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
 
   const degraded = run.stages.some((s) => s.degraded);
   const active = run.status === "active";
+  // Routed-vs-escalated ledger class: prefer the reconstruction (derived from
+  // the durable run_finished event) and fall back to classifying the live
+  // store's terminal status — a run that just finished this session renders
+  // its class before the run-events query lands.
+  const outcomeClass = run.status === "active"
+    ? null
+    : (recon?.outcomeClass ?? classifyOutcome(run.status, run.reason));
   const elapsed = ((run.finishedAt ?? now) - run.startedAt) / 1000;
   const models = [...new Set(run.stages.map((s) => s.model).filter(Boolean))];
 
@@ -92,6 +101,19 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
             </Link>
             <span className="font-mono text-base font-medium text-fg">{run.issueKey}</span>
             <OutcomeBadge status={run.status} />
+            {outcomeClass && (
+              <Tooltip
+                content={
+                  run.reason
+                    ? `${outcomeClass}: ${run.reason}`
+                    : outcomeClass === "routed"
+                      ? "by-design human handoff — the system worked as intended"
+                      : "escalated — no recorded reason, classified as friction by default"
+                }
+              >
+                <span><OutcomeClassBadge cls={outcomeClass} /></span>
+              </Tooltip>
+            )}
             {degraded && <Badge variant="parked">DEGRADED</Badge>}
             {run.dryRun && <Badge variant="codex">DRY RUN</Badge>}
           </div>

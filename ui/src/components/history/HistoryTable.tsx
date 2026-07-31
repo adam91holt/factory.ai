@@ -2,7 +2,9 @@ import { GitPullRequest } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RunRecord, StageMeta } from "../../lib/events";
 import { dateTime, relTime, secs, usd } from "../../lib/format";
+import { classifyOutcome } from "../../lib/history";
 import { OutcomeBadge } from "../OutcomeBadge";
+import { OutcomeClassBadge } from "../OutcomeClassBadge";
 import { Tooltip } from "../ui/tooltip";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
 import { cn } from "../../lib/utils";
@@ -98,6 +100,11 @@ export function HistoryTable({ records }: { records: RunRecord[] }) {
           const turns = r.stages.reduce((s, x) => s + x.turns, 0);
           const degraded = r.stages.some((s) => s.degraded);
           const dur = duration(r);
+          // Ledger chip only on the outcomes the old view lumped together
+          // (needs_human / parked / aborted / …): that is where routed-vs-
+          // escalated carries signal. pr_open's routedness is definitional
+          // (human-merge tier), so stamping every PR row would be noise.
+          const cls = r.outcome === "pr_open" ? null : classifyOutcome(r.outcome, r.reason);
           return (
             <TableRow
               key={`${r.issueKey}-${r.finishedAt}`}
@@ -122,6 +129,11 @@ export function HistoryTable({ records }: { records: RunRecord[] }) {
               <TableCell>
                 <span className="flex items-center gap-1">
                   <OutcomeBadge status={r.outcome} />
+                  {cls && (
+                    <Tooltip content={r.reason ?? "no recorded reason — escalated by default"}>
+                      <span><OutcomeClassBadge cls={cls} /></span>
+                    </Tooltip>
+                  )}
                   {degraded && (
                     <span className="size-1.5 rounded-full bg-parked" title="degraded — fallback reviewer" />
                   )}

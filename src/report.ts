@@ -20,6 +20,11 @@ export interface ReportInput {
   reviewFindingsSummary?: string;
   designReview?: string;   // taste-gate findings when TASTE: fail persisted
   verification?: string;   // tester verification report, when it ran
+  // Test-count ratchet (verify.ts): baseline-vs-post passing-test counts, when
+  // a test gate ran. Rendered so "tests: 631 -> 640" evidence is queryable in
+  // the report and a DECREASED/unknown verdict is visible even when it did not
+  // park anything (withhold-only / non-blocking respectively).
+  testRatchet?: { verdict: "ok" | "decreased" | "unknown"; evidence: string };
   // #12b (FAC-34): set when park pushed the worktree's committed work
   // best-effort so a human can salvage it instead of it being silently lost.
   parkedBranchUrl?: string;
@@ -70,6 +75,12 @@ export function buildReport(input: ReportInput): string {
   const gateLines = input.gates.map((g) =>
     `- ${g.name}: ${g.passed === null ? "no-gate (fails on baseline)" : g.passed ? "pass" : "FAIL"}`);
   if (gateLines.length > 0) lines.push("**Gates:**", ...gateLines, "");
+  if (input.testRatchet) {
+    const note = input.testRatchet.verdict === "decreased" ? " — ⚠️ DECREASED vs baseline (human adjudication; auto-merge withheld)"
+      : input.testRatchet.verdict === "unknown" ? " — count unparseable on one side (not blocking; diff classifier still guards)"
+      : "";
+    lines.push(`**Test count:** ${input.testRatchet.evidence}${note}`, "");
+  }
 
   lines.push("```yaml");
   lines.push("meta:");
@@ -77,6 +88,10 @@ export function buildReport(input: ReportInput): string {
   lines.push(`  reason: ${JSON.stringify(input.reason ?? null)}`);
   lines.push(`  pr: ${input.prUrl ?? "null"}`);
   lines.push(`  gate_strength: ${input.gateStrength}`);
+  if (input.testRatchet) {
+    lines.push(`  test_ratchet: ${input.testRatchet.verdict}`);
+    lines.push(`  test_counts: ${JSON.stringify(input.testRatchet.evidence)}`);
+  }
   lines.push(`  guarded_paths: ${input.guardedPaths.length}`);
   lines.push(`  parked_branch: ${JSON.stringify(input.parkedBranchUrl ?? null)}`);
   lines.push(`  degraded: ${degraded}`);

@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, classifyStatusPaths, ghRepoCreateArgs, guardedPathsTouched, isAdditiveTestExtension, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+import { classifyPaths, classifyStatusPaths, commitsBehindBase, fetchBase, ghRepoCreateArgs, guardedPathsTouched, headSha, isAdditiveTestExtension, mergeBaseIntoBranch, mergePrArgs, mergeRefusedBecauseHeadMoved, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
 
 describe("classifyPaths — guarded-path detection", () => {
   test("guards factory governance directories at root and nested", () => {
@@ -610,5 +610,139 @@ describe("redactRevertWhy — scrubs secrets from the revert PR body (outbound s
     const body = redactRevertWhy(why);
     expect(body).not.toContain(token);
     expect(body).not.toContain("B".repeat(30));
+  });
+});
+
+// --- merge-integrity primitives (stream: merge-integrity) --------------------
+// (1) MATCH-HEAD-COMMIT: the merge argv is pinned-by-construction — no code
+// path can produce an unpinned `gh pr merge`, so the factory can never merge
+// code its gates did not run against (GitHub refuses atomically if the branch
+// moved). (2) The refusal classifier routes a moved branch to a human instead
+// of a blind retry.
+describe("mergePrArgs — pinned-by-construction (--match-head-commit always present)", () => {
+  test("argv pins the merge to the gated SHA", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const args = mergePrArgs("acme/kiwi", "https://github.com/acme/kiwi/pull/1", sha);
+    const i = args.indexOf("--match-head-commit");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe(sha);
+    expect(args.slice(0, 3)).toEqual(["pr", "merge", "https://github.com/acme/kiwi/pull/1"]);
+  });
+
+  test("a malformed/absent SHA throws — an unpinned merge argv is unrepresentable", () => {
+    expect(() => mergePrArgs("acme/kiwi", "url", "")).toThrow(/unpinned/);
+    expect(() => mergePrArgs("acme/kiwi", "url", "not-a-sha")).toThrow(/unpinned/);
+    expect(() => mergePrArgs("acme/kiwi", "url", "HEAD")).toThrow(/unpinned/);
+    // an injection attempt is rejected on shape alone
+    expect(() => mergePrArgs("acme/kiwi", "url", "abc123 --admin")).toThrow(/unpinned/);
+  });
+});
+
+describe("mergeRefusedBecauseHeadMoved — GitHub's pin-refusal classifier", () => {
+  test("matches GitHub's head-moved refusal (plain and GraphQL-wrapped)", () => {
+    expect(mergeRefusedBecauseHeadMoved("X Head branch was modified. Review and try the merge again. (HTTP 422)")).toBe(true);
+    expect(mergeRefusedBecauseHeadMoved("GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)")).toBe(true);
+    expect(mergeRefusedBecauseHeadMoved("head branch has been modified")).toBe(true);
+    expect(mergeRefusedBecauseHeadMoved("expected head sha did not match current head ref")).toBe(true);
+    expect(mergeRefusedBecauseHeadMoved("--match-head-commit mismatch")).toBe(true);
+  });
+
+  test("does NOT match unrelated merge failures (those keep the existing human-review fallback)", () => {
+    expect(mergeRefusedBecauseHeadMoved("Pull request is not mergeable: branch protection rules not satisfied")).toBe(false);
+    expect(mergeRefusedBecauseHeadMoved("connect: network is unreachable")).toBe(false);
+    expect(mergeRefusedBecauseHeadMoved("")).toBe(false);
+  });
+});
+
+// Real git integration for the stale-main primitives: a sibling clone advances
+// origin's main under the feature branch's feet, exactly the two-green-siblings
+// race the stale-main re-gate closes.
+describe("merge-integrity git primitives — headSha / fetchBase / commitsBehindBase / mergeBaseIntoBranch", () => {
+  const git = (cwd: string, args: string[]) => spawnSync("git", args, { cwd, encoding: "utf8" });
+
+  function makeRace(conflicting: boolean): { ws: Workspace; root: string } {
+    const root = mkdtempSync(join(tmpdir(), "factory-merge-integrity-"));
+    const originDir = join(root, "origin.git");
+    const workDir = join(root, "work");
+    const sibDir = join(root, "sibling");
+    git(root, ["init", "--bare", "-b", "main", originDir]);
+    git(root, ["clone", originDir, workDir]);
+    for (const d of [workDir]) { git(d, ["config", "user.email", "t@t.t"]); git(d, ["config", "user.name", "t"]); }
+    writeFileSync(join(workDir, "shared.txt"), "line-a\n");
+    git(workDir, ["add", "-A"]);
+    git(workDir, ["commit", "-m", "init"]);
+    git(workDir, ["push", "origin", "main"]);
+    // feature branch commits its own change (conflicting or not with the sibling's)
+    git(workDir, ["checkout", "-b", "feature"]);
+    if (conflicting) writeFileSync(join(workDir, "shared.txt"), "feature-version\n");
+    else writeFileSync(join(workDir, "feature.txt"), "feature\n");
+    git(workDir, ["add", "-A"]);
+    git(workDir, ["commit", "-m", "feature work"]);
+    // a SIBLING merges to main while the feature run is in flight
+    git(root, ["clone", originDir, sibDir]);
+    git(sibDir, ["config", "user.email", "s@s.s"]);
+    git(sibDir, ["config", "user.name", "s"]);
+    if (conflicting) writeFileSync(join(sibDir, "shared.txt"), "sibling-version\n");
+    else writeFileSync(join(sibDir, "sibling.txt"), "sibling\n");
+    git(sibDir, ["add", "-A"]);
+    git(sibDir, ["commit", "-m", "sibling landed on main"]);
+    git(sibDir, ["push", "origin", "main"]);
+    const ws: Workspace = { repo: "acme/kiwi", dir: workDir, branch: "feature", baseRef: "refs/remotes/origin/main" };
+    return { ws, root };
+  }
+
+  test("headSha returns the worktree's exact HEAD; null shape never a garbage string", () => {
+    const { ws, root } = makeRace(false);
+    try {
+      const sha = headSha(ws);
+      expect(sha).toBe(git(ws.dir, ["rev-parse", "HEAD"]).stdout.trim());
+      expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("behind-main is INVISIBLE without fetchBase and visible after it — why the pre-flight must refresh origin", () => {
+    const { ws, root } = makeRace(false);
+    try {
+      // stale remote-tracking ref: the sibling's merge hasn't been fetched yet,
+      // so the branch LOOKS current — merging on this answer is the exact bug.
+      expect(commitsBehindBase(ws)).toBe(0);
+      expect(fetchBase(ws).ok).toBe(true);
+      expect(commitsBehindBase(ws)).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("mergeBaseIntoBranch (clean): updates the branch, behind drops to 0, HEAD advances to a new pinnable SHA", () => {
+    const { ws, root } = makeRace(false);
+    try {
+      fetchBase(ws);
+      const before = headSha(ws);
+      const upd = mergeBaseIntoBranch(ws);
+      expect(upd.ok).toBe(true);
+      expect(commitsBehindBase(ws)).toBe(0);
+      const after = headSha(ws);
+      expect(after).toMatch(/^[0-9a-f]{40}$/);
+      expect(after).not.toBe(before); // the merge commit is what gets re-gated and pinned
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("mergeBaseIntoBranch (conflict): ok:false and the worktree is left CLEAN (merge aborted, HEAD unmoved)", () => {
+    const { ws, root } = makeRace(true);
+    try {
+      fetchBase(ws);
+      const before = headSha(ws);
+      const upd = mergeBaseIntoBranch(ws);
+      expect(upd.ok).toBe(false);
+      expect(headSha(ws)).toBe(before);
+      expect(git(ws.dir, ["status", "--porcelain"]).stdout.trim()).toBe(""); // no half-merge poisoning later git calls
+      expect(existsSync(join(ws.dir, ".git", "MERGE_HEAD"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
