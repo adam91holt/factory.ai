@@ -352,10 +352,95 @@ export function pushBranch(ws: Workspace): void {
   if (!r.ok) throw new Error(`push failed: ${r.out.slice(0, 400)}`);
 }
 
-export function mergePr(repo: string, prUrl: string): { ok: boolean; out: string } {
-  const r = spawnSync("gh", ["pr", "merge", prUrl, "--repo", repo, "--squash", "--delete-branch"],
-    { encoding: "utf8", timeout: 60_000 });
-  return { ok: r.status === 0, out: ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300) };
+// --- merge-integrity primitives ---------------------------------------------
+// Two invariants the auto-merge action site (loop.ts preMergeIntegrity) builds
+// from these: (a) a PR is only ever merged AT the exact commit its gates ran
+// against (--match-head-commit pins the merge; GitHub refuses atomically if the
+// branch moved), and (b) a PR is never merged while BEHIND origin's default
+// branch — its gates passed against an older main, so a sibling merge could
+// land untested-against. All helpers return null / ok:false on any git failure
+// so the caller resolves toward the human path, never toward merging blind.
+
+/** The worktree's current HEAD SHA — recorded at gate time so the eventual
+ * merge can be pinned to the exact commit the gates actually ran against.
+ * null on any git failure (the caller must refuse an unpinned auto-merge). */
+export function headSha(ws: Workspace): string | null {
+  const r = gitRetry(ws.dir, ["rev-parse", "HEAD"]);
+  const sha = r.stdout.trim();
+  return r.ok && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+}
+
+/** Refresh origin's refs so "behind" is judged against the REAL current main,
+ * not the snapshot buildWorkspace fetched when the run started (sibling PRs
+ * merge while a run is in flight). Runs in the worktree — worktrees share the
+ * bare repo's config, so the tracking-ref refspec (C1) applies here too. */
+export function fetchBase(ws: Workspace): { ok: boolean; out: string } {
+  const r = git(ws.dir, ["fetch", "origin", "--prune"], SLOW);
+  return { ok: r.ok, out: r.out.slice(0, 400) };
+}
+
+/** How many commits origin's default branch has that HEAD does not — i.e. how
+ * far BEHIND current main this branch is. 0 = up to date (gates ran against
+ * the main it would merge into). null on any git failure — the caller must
+ * treat "can't tell" as "not proven current" and route to a human. */
+export function commitsBehindBase(ws: Workspace): number | null {
+  const r = gitRetry(ws.dir, ["rev-list", "--count", `HEAD..${ws.baseRef}`]);
+  if (!r.ok) return null;
+  const n = parseInt(r.stdout.trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** Merge origin's default branch INTO the run's branch so the gates can be
+ * re-run against the combined result. On conflict: abort so the worktree is
+ * left clean (a human resolves via the PR; a half-merged worktree would poison
+ * every later git call), and return ok:false — the caller must NEVER merge a
+ * behind-main branch whose update failed. */
+export function mergeBaseIntoBranch(ws: Workspace): { ok: boolean; out: string } {
+  const m = git(ws.dir, ["merge", "--no-edit", ws.baseRef]);
+  if (!m.ok) git(ws.dir, ["merge", "--abort"]); // best-effort; leaves worktree usable
+  return { ok: m.ok, out: m.out.slice(0, 400) };
+}
+
+/** Build the `gh pr merge` argv. PINNED-BY-CONSTRUCTION (same pattern as
+ * ghRepoCreateArgs): --match-head-commit is always present and the SHA is
+ * validated, so no code path can produce an UNPINNED merge argv — merging
+ * whatever the branch happens to point at (code the gates never saw) is
+ * unrepresentable. Throws on a malformed SHA rather than degrading. */
+export function mergePrArgs(repo: string, prUrl: string, matchHeadSha: string): string[] {
+  if (!/^[0-9a-f]{7,40}$/i.test(matchHeadSha)) {
+    throw new Error(`mergePr refuses an unpinned merge for ${prUrl} — no valid gated head SHA (got "${matchHeadSha.slice(0, 40)}")`);
+  }
+  return ["pr", "merge", prUrl, "--repo", repo, "--squash", "--delete-branch", "--match-head-commit", matchHeadSha];
+}
+
+/** Did the merge fail BECAUSE the PR head no longer matches the pinned SHA?
+ * GitHub's refusal reads "Head branch was modified. Review and try the merge
+ * again." (gh surfaces it verbatim, sometimes GraphQL-wrapped); the expected-
+ * head/match-head phrasings cover gh's own client-side variants. Pure and
+ * exported so the classification is unit-testable without gh. A match means
+ * "branch moved since gates passed" — the caller must route to a human, never
+ * retry against the new (ungated) head. */
+export function mergeRefusedBecauseHeadMoved(out: string): boolean {
+  return /head branch (?:was|has been) modified|expected head|match[- ]head/i.test(out);
+}
+
+/** Squash-merge a PR, PINNED to the head SHA the gates ran against. GitHub
+ * enforces the pin atomically server-side: if anything (steward follow-up,
+ * sibling task, a human) pushed to the branch after gate time, the merge is
+ * refused and `headMoved` is true — the caller folds that into needs-human
+ * rather than retrying (the new head's code was never gated). A malformed SHA
+ * never spawns gh at all (mergePrArgs throws; mapped to ok:false so the
+ * existing merge-failed → human-review fallback handles it). */
+export function mergePr(repo: string, prUrl: string, matchHeadSha: string): { ok: boolean; out: string; headMoved: boolean } {
+  let args: string[];
+  try {
+    args = mergePrArgs(repo, prUrl, matchHeadSha);
+  } catch (e) {
+    return { ok: false, out: (e instanceof Error ? e.message : String(e)).slice(0, 300), headMoved: false };
+  }
+  const r = spawnSync("gh", args, { encoding: "utf8", timeout: 60_000 });
+  const out = ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300);
+  return { ok: r.status === 0, out, headMoved: r.status !== 0 && mergeRefusedBecauseHeadMoved(out) };
 }
 
 export function createPr(ws: Workspace, title: string, body: string): string {
