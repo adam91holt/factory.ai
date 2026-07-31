@@ -37,8 +37,11 @@ function Row({ item }: { item: FeedItem }) {
   );
 }
 
-export function ToolFeed({ issueKey }: { issueKey: string }) {
-  const feed = useFactory((s) => s.feeds[issueKey] ?? []);
+/** Live runs read the per-run feed from the store (SSE-updated); history runs
+ *  pass a reconstructed `items` array built from GET /run-events. */
+export function ToolFeed({ issueKey, items }: { issueKey: string; items?: FeedItem[] }) {
+  const storeFeed = useFactory((s) => s.feeds[issueKey] ?? []);
+  const feed = items ?? storeFeed;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
 
