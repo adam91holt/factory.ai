@@ -1,17 +1,23 @@
-import type { BrowserEvidence, GateMeta, GateStrength } from "./events";
 import { isMockMode } from "./fixtures";
 
 // ---------------------------------------------------------------------------
 // Approvals client + pure review-queue helpers.
 //
-// CONTRACT (inbox-backend stream — src/server.ts approvals routes). The JSON is
-// the contract, duplicated by design like lessons.ts/telemetry.ts. Everything
-// wire-shaped lives in THIS one file so reconciling with the backend branch is
-// a one-file diff:
+// CONTRACT (src/server.ts approvals routes + src/db.ts ApprovalItem — the
+// backend is the authority; this file is the ONLY place the wire shape lives,
+// duplicated by design like lessons.ts/telemetry.ts):
 //
-//   GET  /approvals                    → ApprovalsPayload
-//   POST /approvals/approve  {id}      → ApprovalActionResponse
-//   POST /approvals/pushback {id, feedback} → ApprovalActionResponse
+//   GET  /approvals                     → { pending: WireApprovalItem[]; count: number }
+//   POST /approvals/:id/approve  {}     → 200 { ok, merged, sha, prUrl, warnings? }
+//                                       | 4xx/5xx { error, item? }
+//   POST /approvals/:id/pushback {feedback}
+//                                       → 200 { ok, requeued, issueKey }
+//                                       | 4xx/5xx { error, item? }
+//
+// The backend serves PENDING items only (a decided row disappears from the
+// list on the next poll); the "Recently handled" section is session-local —
+// we snapshot a card at the moment an action settles it (including a stale
+// refusal, whose verbatim reason the backend returns in `item.resolution`).
 //
 // TIGHTEN-ONLY invariant (mirrors the backend's): this UI holds NO merge
 // authority of its own. [Approve & merge] only asks the daemon to run the
@@ -24,31 +30,62 @@ import { isMockMode } from "./fixtures";
 
 export type ApprovalStatus = "pending" | "stale" | "approved" | "pushed_back";
 
-export interface ApprovalItem {
-  /** Stable id the action POSTs target (backend-chosen; issueKey is the natural key). */
-  id: string;
+/** Per-gate test-count ratchet slice ("tests 631 → 640") — db.ts ApprovalGateTests. */
+export interface ApprovalGateTests { name: string; from: number | null; to: number | null }
+
+/** The backend row exactly as GET /approvals serves it (db.ts ApprovalItem). */
+export interface WireApprovalItem {
+  id: number;
+  createdAt: number;
+  updatedAt: number;
   issueKey: string;
-  /** Redacted at emit time server-side (redactSecrets) — still render as plain text only. */
   title: string;
   repo: string;
-  /** Epoch ms the run parked / entered needsHuman — "waiting 3h" on the card. */
+  prUrl: string;
+  gatedHeadSha: string | null;
+  /** ONE verbatim string — loop.ts joins its hold reasons with "; " before filing. */
+  holdReasons: string;
+  gateSummary: { green: boolean; strength: string; tests: ApprovalGateTests[] } | null;
+  /** "pass" | "fail" | "none" (loop.ts writes "none" when no review ran). */
+  securityVerdict: string;
+  /** "pass" | "fail" | "error" | "not-required". */
+  tasteVerdict: string;
+  findingsDigest: string;
+  /** Preformatted by loop.ts, e.g. "6 files · 212 changed lines". */
+  diffStat: string;
+  costUsd: number;
+  turns: number;
+  status: ApprovalStatus;
+  /** Why the row left pending — for a stale row this is the refusal reason. */
+  resolution: string;
+}
+
+/** The view-model the page/cards render — wire item + session-derived fields. */
+export interface ApprovalItem {
+  /** String form of the backend's numeric row id — the action URLs' :id. */
+  id: string;
+  issueKey: string;
+  /** Redacted at write time server-side (redactSecrets) — still render as plain text only. */
+  title: string;
+  repo: string;
+  /** Epoch ms the item was filed (backend createdAt) — "parked 3h ago" on the card. */
   parkedAt: number;
-  /** loop.ts holdReasons VERBATIM — the exact strings the daemon recorded when
-   *  it withheld the merge. Untrusted-derived text: plain text only. */
+  /** loop.ts hold reasons VERBATIM. The backend stores ONE joined string; it is
+   *  kept whole (never re-split — reasons may themselves contain "; ").
+   *  Untrusted-derived text: plain text only. */
   holdReasons: string[];
   prUrl: string | null;
-  linearUrl: string | null;
   costUsd: number | null;
   turns: number | null;
-  /** Latest run_gates snapshot — same shape the run views use. */
-  gates: { green: boolean; strength: GateStrength; gates: GateMeta[] } | null;
-  securityVerdict: "pass" | "fail" | null;
-  /** Design taste gate: null = not a UI-touching diff / not run. */
-  tasteVerdict: "pass" | "fail" | null;
-  browser: BrowserEvidence | null;
+  /** Backend gateSummary verbatim: overall green/strength + per-gate test ratchet. */
+  gates: { green: boolean; strength: string; tests: ApprovalGateTests[] } | null;
+  /** Raw backend verdict strings — cards decide which values earn a chip. */
+  securityVerdict: string;
+  tasteVerdict: string;
   /** Reviewer findings digest (redacted, plain text) — collapsible on the card. */
   findings: string | null;
-  diffStat: { files: number; additions: number; deletions: number } | null;
+  /** Preformatted diff stat string from the backend. */
+  diffStat: string | null;
   /** The SHA the gates ran against — what an approval merge is pinned to. */
   gatedHeadSha: string | null;
   status: ApprovalStatus;
@@ -63,6 +100,35 @@ export interface ApprovalsPayload {
 }
 
 export type ApprovalActionResponse = { ok: true; id: string } | { error: string };
+
+/** Wire → view-model. Pure; exported so the mapping is pinned by tests. */
+export function mapApprovalItem(w: WireApprovalItem): ApprovalItem {
+  // An unknown status can only come from a newer backend — degrade to "stale"
+  // (never approvable) exactly like db.ts's own toApprovalItem does.
+  const status: ApprovalStatus = ["pending", "stale", "approved", "pushed_back"].includes(w.status)
+    ? w.status
+    : "stale";
+  return {
+    id: String(w.id),
+    issueKey: w.issueKey,
+    title: w.title,
+    repo: w.repo,
+    parkedAt: w.createdAt,
+    holdReasons: w.holdReasons.trim() === "" ? [] : [w.holdReasons],
+    prUrl: w.prUrl.trim() === "" ? null : w.prUrl,
+    costUsd: Number.isFinite(w.costUsd) ? w.costUsd : null,
+    turns: Number.isFinite(w.turns) ? w.turns : null,
+    gates: w.gateSummary,
+    securityVerdict: w.securityVerdict,
+    tasteVerdict: w.tasteVerdict,
+    findings: w.findingsDigest.trim() === "" ? null : w.findingsDigest,
+    diffStat: w.diffStat.trim() === "" ? null : w.diffStat,
+    gatedHeadSha: w.gatedHeadSha,
+    status,
+    staleReason: status === "stale" && w.resolution.trim() !== "" ? w.resolution : null,
+    handledAt: status === "pending" ? null : w.updatedAt,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers — kept out of the components so the queue split and the
@@ -108,15 +174,16 @@ export function approveDisabledReason(item: ApprovalItem): string | null {
 
 /** Test-count ratchet evidence for the strip: the first gate carrying counts
  *  ("tests 631 → 640"); `decreased` is the withhold signal and renders red.
- *  Null when no gate parsed a count on either side. */
+ *  Null when no gate parsed a count on either side. Operates on the backend's
+ *  gateSummary.tests slices (name/from/to). */
 export function testCountDelta(
-  gates: GateMeta[],
+  tests: ApprovalGateTests[],
 ): { baseline: number | null; current: number | null; decreased: boolean } | null {
-  for (const g of gates) {
-    const b = g.baselineTestCount ?? null;
-    const t = g.testCount ?? null;
-    if (b !== null || t !== null) {
-      return { baseline: b, current: t, decreased: b !== null && t !== null && t < b };
+  for (const t of tests) {
+    const b = t.from ?? null;
+    const c = t.to ?? null;
+    if (b !== null || c !== null) {
+      return { baseline: b, current: c, decreased: b !== null && c !== null && c < b };
     }
   }
   return null;
@@ -133,134 +200,158 @@ export function statusLabel(status: ApprovalStatus): string {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch/POST client. In ?mock=1 mode the queue is served (and mutated) from
-// in-memory fixtures so the page renders and both actions are exercisable with
-// no daemon — the same convention as every other view.
+// Fetch/POST client. The backend lists PENDING rows only, so "recently
+// handled" is session state: when an action settles an item (success OR a
+// stale refusal that carries the decided row back), we snapshot it here and
+// fetchApprovals splices the snapshots in for splitApprovals to section.
+// In ?mock=1 mode the queue is served (and mutated) from in-memory wire-shaped
+// fixtures flowing through the SAME mapping — the convention of every view.
 // ---------------------------------------------------------------------------
 
+const sessionHandled = new Map<string, ApprovalItem>();
+/** Last-fetched pending cards by id — the snapshot source when an action's
+ *  response doesn't echo the row back (the success cases). */
+const lastFetched = new Map<string, ApprovalItem>();
+
+function recordHandled(id: string, status: Exclude<ApprovalStatus, "pending">, staleReason: string | null): void {
+  const snap = lastFetched.get(id);
+  if (!snap) return;
+  sessionHandled.set(id, { ...snap, status, staleReason, handledAt: Date.now() });
+}
+
 export async function fetchApprovals(): Promise<ApprovalsPayload> {
-  if (isMockMode()) return { items: mockApprovalItems() };
+  const pending = isMockMode() ? mockPending() : await fetchPendingWire();
+  lastFetched.clear();
+  for (const item of pending) lastFetched.set(item.id, item);
+  // A superseded/re-filed issue gets a NEW row id, so a handled snapshot can
+  // only collide with pending if the server resurrected the exact row — in
+  // that unexpected case the server's view wins and the snapshot is dropped.
+  const handled = [...sessionHandled.values()].filter((h) => !lastFetched.has(h.id));
+  return { items: [...pending, ...handled] };
+}
+
+async function fetchPendingWire(): Promise<ApprovalItem[]> {
   const res = await fetch("/approvals", { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`GET /approvals → ${res.status}`);
-  return (await res.json()) as ApprovalsPayload;
+  const payload = (await res.json()) as { pending: WireApprovalItem[] };
+  return (payload.pending ?? []).map(mapApprovalItem);
+}
+
+/** POST one action; both endpoints answer { ok } on success and { error }
+ *  (optionally with the decided wire row as `item`) on refusal. A refusal that
+ *  reports the row already decided (stale/approved/pushed_back — e.g. this
+ *  click lost a race, or the branch moved) snapshots it into the handled
+ *  section so the card's disappearance from pending is explained, not silent. */
+async function postAction(
+  id: string,
+  action: "approve" | "pushback",
+  body: Record<string, unknown>,
+): Promise<ApprovalActionResponse> {
+  const res = await fetch(`/approvals/${id}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = (await res.json().catch(() => null)) as
+    | { ok?: unknown; error?: unknown; item?: WireApprovalItem | null }
+    | null;
+  if (res.ok && json?.ok === true) {
+    recordHandled(id, action === "approve" ? "approved" : "pushed_back", null);
+    return { ok: true, id };
+  }
+  const error = typeof json?.error === "string" && json.error !== ""
+    ? json.error
+    : `POST /approvals/${id}/${action} → ${res.status}`;
+  if (json?.item && json.item.status !== "pending") {
+    const mapped = mapApprovalItem(json.item);
+    sessionHandled.set(id, { ...mapped, staleReason: mapped.staleReason ?? error, handledAt: Date.now() });
+  }
+  return { error };
 }
 
 export async function approveItem(id: string): Promise<ApprovalActionResponse> {
   if (isMockMode()) return mockAct(id, "approved");
-  const res = await fetch("/approvals/approve", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id }),
-  });
-  return (await res.json()) as ApprovalActionResponse;
+  // guardedJsonBody requires a parseable JSON body on every mutation route —
+  // approve carries no fields, so it sends the empty object.
+  return postAction(id, "approve", {});
 }
 
 export async function pushbackItem(id: string, feedback: string): Promise<ApprovalActionResponse> {
   if (isMockMode()) return mockAct(id, "pushed_back");
-  const res = await fetch("/approvals/pushback", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id, feedback }),
-  });
-  return (await res.json()) as ApprovalActionResponse;
+  return postAction(id, "pushback", { feedback });
 }
 
 // ---------------------------------------------------------------------------
-// Mock fixtures (?mock=1) — realistic queue states: a guarded-path hold, a
-// warranted-but-absent security review, a stale item (branch moved), and two
-// recently handled rows. Session-local mutation state so approve/pushback
-// visibly move a card to "recently handled" without a backend.
+// Mock fixtures (?mock=1) — realistic queue states in the WIRE shape (so the
+// mapping above is exercised too): a guarded-path hold, a warranted-but-absent
+// security review, a taste fail whose approve will be refused as stale.
+// Session-local mutation state so approve/pushback visibly move a card to
+// "recently handled" without a backend — via the same recordHandled path.
 // ---------------------------------------------------------------------------
 
-const mockHandled = new Map<string, { status: ApprovalStatus; at: number }>();
-
-function mockAct(id: string, status: ApprovalStatus): Promise<ApprovalActionResponse> {
+function mockAct(id: string, status: Exclude<ApprovalStatus, "pending" | "stale">): Promise<ApprovalActionResponse> {
   return new Promise((r) =>
     setTimeout(() => {
-      if (id === "FAC-31") {
-        r({ error: "branch moved since gating — needs re-gate (gated 4f9c2ab, head now 7d01e33)" });
+      if (id === "31") {
+        const reason = "branch moved since gating — needs re-gate";
+        recordHandled(id, "stale", reason);
+        r({ error: reason });
         return;
       }
-      mockHandled.set(id, { status, at: Date.now() });
+      recordHandled(id, status, null);
       r({ ok: true, id });
     }, 350),
   );
 }
 
-function mockGates(green: boolean, strength: GateStrength, tests: [number, number]): ApprovalItem["gates"] {
-  return {
-    green,
-    strength,
-    gates: [
-      { name: "typecheck", baselinePassed: true, passed: true, outputTail: "" },
-      { name: "test", baselinePassed: true, passed: green, outputTail: green ? "" : "2 tests failed",
-        baselineTestCount: tests[0], testCount: tests[1] },
-      { name: "build", baselinePassed: true, passed: true, outputTail: "" },
-    ],
-  };
-}
-
-function mockApprovalItems(): ApprovalItem[] {
+function mockPending(): ApprovalItem[] {
   const now = Date.now();
-  const base: ApprovalItem[] = [
+  const wire: WireApprovalItem[] = [
     {
-      id: "FAC-27", issueKey: "FAC-27", title: "Rotate webhook signing secret handling into config",
-      repo: "rapido/api", parkedAt: now - 3 * 3_600_000,
-      holdReasons: ["guarded paths touched: src/config.ts, .env.example"],
-      prUrl: "https://github.com/rapido/api/pull/214", linearUrl: "https://linear.app/rapido/issue/FAC-27",
-      costUsd: 3.42, turns: 61, gates: mockGates(true, "strong", [631, 640]),
-      securityVerdict: "pass", tasteVerdict: null, browser: "pass",
-      findings: "reviewer-claude: no blocking findings; suggested narrowing the config type.\nreviewer-codex: confirmed guarded-path change is additive only.",
-      diffStat: { files: 6, additions: 212, deletions: 38 }, gatedHeadSha: "9b31c7de41aa",
-      status: "pending", staleReason: null, handledAt: null,
+      id: 27, createdAt: now - 3 * 3_600_000, updatedAt: now - 3 * 3_600_000,
+      issueKey: "FAC-27", title: "Rotate webhook signing secret handling into config",
+      repo: "rapido/api", prUrl: "https://github.com/rapido/api/pull/214",
+      gatedHeadSha: "9b31c7de41aa", holdReasons: "guarded paths touched: src/config.ts, .env.example",
+      gateSummary: { green: true, strength: "strong", tests: [{ name: "test", from: 631, to: 640 }] },
+      securityVerdict: "pass", tasteVerdict: "not-required",
+      findingsDigest: "reviewer-claude: no blocking findings; suggested narrowing the config type.\nreviewer-codex: confirmed guarded-path change is additive only.",
+      diffStat: "6 files · 250 changed lines", costUsd: 3.42, turns: 61,
+      status: "pending", resolution: "",
     },
     {
-      id: "FAC-29", issueKey: "FAC-29", title: "Client portal: invoice export to CSV",
-      repo: "rapido/portal", parkedAt: now - 55 * 60_000,
-      holdReasons: [
-        "security review did not complete on a 842-line diff (stage error or no parseable verdict line) — cannot auto-merge unreviewed",
-      ],
-      prUrl: "https://github.com/rapido/portal/pull/88", linearUrl: "https://linear.app/rapido/issue/FAC-29",
-      costUsd: 5.87, turns: 94, gates: mockGates(true, "real", [204, 213]),
-      securityVerdict: null, tasteVerdict: "pass", browser: "partial",
-      findings: "reviewer-claude: CSV escaping fixed in round 2.\nreviewer-codex: flagged missing pagination on export query (fixed).",
-      diffStat: { files: 11, additions: 604, deletions: 92 }, gatedHeadSha: "51fe0a92cc03",
-      status: "pending", staleReason: null, handledAt: null,
+      id: 29, createdAt: now - 55 * 60_000, updatedAt: now - 55 * 60_000,
+      issueKey: "FAC-29", title: "Client portal: invoice export to CSV",
+      repo: "rapido/portal", prUrl: "https://github.com/rapido/portal/pull/88",
+      gatedHeadSha: "51fe0a92cc03",
+      holdReasons: "security review did not complete on a 842-line diff (stage error or no parseable verdict line) — cannot auto-merge unreviewed",
+      gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 204, to: 213 }] },
+      securityVerdict: "none", tasteVerdict: "pass",
+      findingsDigest: "reviewer-claude: CSV escaping fixed in round 2.\nreviewer-codex: flagged missing pagination on export query (fixed).",
+      diffStat: "11 files · 696 changed lines", costUsd: 5.87, turns: 94,
+      status: "pending", resolution: "",
     },
     {
-      id: "FAC-31", issueKey: "FAC-31", title: "Switch tower sync to incremental cursor",
-      repo: "rapido/api", parkedAt: now - 26 * 3_600_000,
-      holdReasons: ["design taste gate failed (see design review)"],
-      prUrl: "https://github.com/rapido/api/pull/217", linearUrl: "https://linear.app/rapido/issue/FAC-31",
-      costUsd: 2.11, turns: 40, gates: mockGates(true, "real", [640, 640]),
-      securityVerdict: "pass", tasteVerdict: "fail", browser: "missing",
-      findings: "design reviewer: cursor state machine is sound but the settings surface is cluttered.",
-      diffStat: { files: 4, additions: 130, deletions: 44 }, gatedHeadSha: "4f9c2ab77d10",
-      status: "pending", staleReason: null, handledAt: null,
+      id: 31, createdAt: now - 26 * 3_600_000, updatedAt: now - 26 * 3_600_000,
+      issueKey: "FAC-31", title: "Switch tower sync to incremental cursor",
+      repo: "rapido/api", prUrl: "https://github.com/rapido/api/pull/217",
+      gatedHeadSha: "4f9c2ab77d10", holdReasons: "design taste gate failed (see design review)",
+      gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 640, to: 640 }] },
+      securityVerdict: "pass", tasteVerdict: "fail",
+      findingsDigest: "design reviewer: cursor state machine is sound but the settings surface is cluttered.",
+      diffStat: "4 files · 174 changed lines", costUsd: 2.11, turns: 40,
+      status: "pending", resolution: "",
     },
     {
-      id: "FAC-22", issueKey: "FAC-22", title: "Fix flaky retry test in backoff suite",
-      repo: "adam91holt/factory.ai", parkedAt: now - 2 * 86_400_000,
-      holdReasons: ["change DELETES test files (tests/backoff-old.test.ts) — categorical human review"],
-      prUrl: "https://github.com/adam91holt/factory.ai/pull/61", linearUrl: "https://linear.app/rapido/issue/FAC-22",
-      costUsd: 1.09, turns: 22, gates: mockGates(true, "real", [598, 597]),
-      securityVerdict: "pass", tasteVerdict: null, browser: "not-required",
-      findings: null, diffStat: { files: 2, additions: 41, deletions: 78 }, gatedHeadSha: null,
-      status: "stale", staleReason: "branch moved since gating — needs re-gate", handledAt: now - 86_400_000,
-    },
-    {
-      id: "FAC-19", issueKey: "FAC-19", title: "Add spend-cap alerting to Slack",
-      repo: "adam91holt/factory.ai", parkedAt: now - 3 * 86_400_000,
-      holdReasons: ["guarded paths touched: src/alerts.ts"],
-      prUrl: "https://github.com/adam91holt/factory.ai/pull/57", linearUrl: "https://linear.app/rapido/issue/FAC-19",
-      costUsd: 0.84, turns: 18, gates: mockGates(true, "strong", [590, 598]),
-      securityVerdict: "pass", tasteVerdict: null, browser: "pass",
-      findings: null, diffStat: { files: 3, additions: 96, deletions: 12 }, gatedHeadSha: "e2ab99c01f44",
-      status: "approved", staleReason: null, handledAt: now - 2 * 86_400_000,
+      id: 22, createdAt: now - 2 * 86_400_000, updatedAt: now - 2 * 86_400_000,
+      issueKey: "FAC-22", title: "Fix flaky retry test in backoff suite",
+      repo: "adam91holt/factory.ai", prUrl: "https://github.com/adam91holt/factory.ai/pull/61",
+      gatedHeadSha: null,
+      holdReasons: "passing test count DECREASED vs baseline (598 → 597) — possible gutted/skipped tests; human must adjudicate",
+      gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 598, to: 597 }] },
+      securityVerdict: "pass", tasteVerdict: "not-required",
+      findingsDigest: "", diffStat: "2 files · 119 changed lines", costUsd: 1.09, turns: 22,
+      status: "pending", resolution: "",
     },
   ];
-  return base.map((item) => {
-    const acted = mockHandled.get(item.id);
-    return acted ? { ...item, status: acted.status, handledAt: acted.at } : item;
-  });
+  return wire.map(mapApprovalItem).filter((i) => !sessionHandled.has(i.id));
 }

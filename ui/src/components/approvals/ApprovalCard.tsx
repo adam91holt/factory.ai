@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { ArrowUpRight, Check, ChevronRight, CornerUpLeft, GitPullRequest } from "lucide-react";
+import { Check, ChevronRight, CornerUpLeft, GitPullRequest } from "lucide-react";
 import type { ApprovalItem } from "../../lib/approvals";
 import { approveDisabledReason, testCountDelta } from "../../lib/approvals";
 import { relTime, usd } from "../../lib/format";
@@ -32,21 +32,32 @@ function EvidenceChip({ label, tone, title }: { label: string; tone: "ok" | "err
   );
 }
 
-/** Gates + tests + security + taste + browser on one strip. Reuses the
+/** Verdict string → chip tone, or null to render no chip at all. The backend
+ *  ships raw strings ("pass" | "fail" | "none" for security; "pass" | "fail" |
+ *  "error" | "not-required" for taste) — only values that carry signal earn a
+ *  chip; "none"/"not-required" mean the check wasn't warranted, so silence. */
+function verdictTone(verdict: string): "ok" | "err" | "warn" | null {
+  if (verdict === "pass") return "ok";
+  if (verdict === "fail") return "err";
+  if (verdict === "error") return "warn";
+  return null;
+}
+
+/** Gates + tests ratchet + security + taste on one strip. Reuses the
  *  green/red/strength grading of GateRounds so evidence reads the same here as
- *  on the run drill-down. */
+ *  on the run drill-down. The backend's gateSummary carries overall
+ *  green/strength plus per-gate TEST COUNTS only (no per-gate pass marks —
+ *  those live on the run drill-down), so that is exactly what renders. */
 function EvidenceStrip({ item }: { item: ApprovalItem }) {
   const g = item.gates;
-  const tests = g ? testCountDelta(g.gates) : null;
+  const tests = g ? testCountDelta(g.tests) : null;
+  const security = verdictTone(item.securityVerdict);
+  const taste = verdictTone(item.tasteVerdict);
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
       {g ? (
         <>
-          <EvidenceChip
-            label={g.green ? "gates green" : "gates red"}
-            tone={g.green ? "ok" : "err"}
-            title={g.gates.map((x) => `${x.name}: ${x.passed === true ? "pass" : x.passed === false ? "FAIL" : "no-gate"}`).join(" · ")}
-          />
+          <EvidenceChip label={g.green ? "gates green" : "gates red"} tone={g.green ? "ok" : "err"} />
           <span
             className={cn(
               "font-mono text-[10px]",
@@ -55,18 +66,6 @@ function EvidenceStrip({ item }: { item: ApprovalItem }) {
           >
             strength {g.strength}
           </span>
-          {g.gates.map((gate) => (
-            <span
-              key={gate.name}
-              className={cn(
-                "font-mono text-[10px]",
-                gate.passed === true ? "text-fg-dim" : gate.passed === false ? "text-err" : "text-fg-faint",
-              )}
-              title={gate.passed === null ? "fails on the clean baseline — not counted" : undefined}
-            >
-              {gate.name} {gate.passed === true ? "✓" : gate.passed === false ? "✗" : "∅"}
-            </span>
-          ))}
         </>
       ) : (
         <EvidenceChip label="gates not run" tone="warn" />
@@ -79,18 +78,8 @@ function EvidenceStrip({ item }: { item: ApprovalItem }) {
           tests {tests.baseline ?? "?"} → {tests.current ?? "?"}
         </span>
       )}
-      {item.securityVerdict !== null && (
-        <EvidenceChip label={`security ${item.securityVerdict}`} tone={item.securityVerdict === "pass" ? "ok" : "err"} />
-      )}
-      {item.tasteVerdict !== null && (
-        <EvidenceChip label={`taste ${item.tasteVerdict}`} tone={item.tasteVerdict === "pass" ? "ok" : "err"} />
-      )}
-      {item.browser !== null && item.browser !== "not-required" && (
-        <EvidenceChip
-          label={`browser ${item.browser}`}
-          tone={item.browser === "pass" ? "ok" : item.browser === "fail" ? "err" : "warn"}
-        />
-      )}
+      {security && <EvidenceChip label={`security ${item.securityVerdict}`} tone={security} />}
+      {taste && <EvidenceChip label={`taste ${item.tasteVerdict}`} tone={taste} />}
     </div>
   );
 }
@@ -290,11 +279,8 @@ export function ApprovalCard({
       {/* diff stat + links */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-fg-faint">
         {item.diffStat && (
-          <span>
-            {item.diffStat.files} files{" "}
-            <span className="text-ok">+{item.diffStat.additions}</span>{" "}
-            <span className="text-err">−{item.diffStat.deletions}</span>
-          </span>
+          // Preformatted by the backend (loop.ts): "6 files · 212 changed lines".
+          <span>{item.diffStat}</span>
         )}
         {item.gatedHeadSha && (
           <span title="the head SHA the gates ran against — an approval merge is pinned to exactly this commit">
@@ -314,12 +300,6 @@ export function ApprovalCard({
         >
           full run →
         </Link>
-        {item.linearUrl && (
-          <a href={item.linearUrl} target="_blank" rel="noreferrer" className="flex items-center gap-0.5 text-fg-dim transition-colors duration-100 hover:text-live">
-            {item.issueKey}
-            <ArrowUpRight className="size-3" strokeWidth={1.75} />
-          </a>
-        )}
       </div>
 
       {/* backend refusal, verbatim — e.g. "branch moved since gating — needs re-gate" */}
