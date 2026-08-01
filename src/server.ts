@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
+import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
 import { getIssueDetail, type IssueDetail } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
@@ -14,13 +15,16 @@ import { killSwitch } from "./control.ts";
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
 // Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
 // file reads outside ui/dist and factory-history.jsonl. The exceptions are the
-// three guarded POSTs: /catalog/save (the catalog manager), which reads a
+// guarded POSTs: /catalog/save (the catalog manager), which reads a
 // bounded JSON body and writes ONE validated card/skill file under
 // agents|skills|groundskeepers, then commits it; /lessons/archive, which flips
-// archived=1 on ONE lesson row (never a delete); and /stop (B6 kill switch,
-// prerequisite-0), which aborts every in-flight stage and enters drain mode —
-// all three are a human acting through the loopback UI, all three behind the
-// same guardedJsonBody() CSRF/DNS-rebinding gate. All emitted payload strings
+// archived=1 on ONE lesson row (never a delete); /stop (B6 kill switch,
+// prerequisite-0), which aborts every in-flight stage and enters drain mode;
+// and the approvals-inbox actions /approvals/:id/approve|pushback
+// (approvals.ts — the human review lane; approve is the one human merge
+// authority, still pinned through mergePr) — every one of them a human acting
+// through the loopback UI, all behind the same guardedJsonBody()
+// CSRF/DNS-rebinding gate. All emitted payload strings
 // were redacted at emit time. node:http only (Bun implements it) — no new
 // dependencies.
 
@@ -487,6 +491,34 @@ export function startDashboard(): {
       return;
     }
 
+    // Write routes: approvals inbox actions (stream inbox-backend). Same
+    // guardedJsonBody gate as every other mutation route. approve is the ONE
+    // human merge authority this server exposes — approvals.ts re-verifies
+    // the PR head against the gated SHA and merges through the existing
+    // pinned mergePr path (or refuses); pushback posts owner feedback and
+    // requeues, and structurally cannot merge (its dep set has no merge).
+    // Both act only on a pending item claimed atomically in db.ts, so a
+    // double-click or concurrent request can never double-act.
+    const approvalAction = url.pathname.match(/^\/approvals\/(\d{1,12})\/(approve|pushback)$/);
+    if (approvalAction) {
+      void guardedJsonBody(req, res).then(async (guarded) => {
+        if (guarded === null) return; // refusal already written
+        const id = Number(approvalAction[1]);
+        try {
+          const result = approvalAction[2] === "approve"
+            ? await approveItem(id)
+            : await pushbackItem(id, (guarded.body as { feedback?: unknown } | null)?.feedback);
+          res.writeHead(result.status, { "content-type": "application/json" });
+          res.end(JSON.stringify(result.json));
+        } catch (error) {
+          console.error(`[dashboard] approval ${approvalAction[2]} failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"approval action failed"}');
+        }
+      });
+      return;
+    }
+
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain" });
       res.end("method not allowed");
@@ -616,6 +648,25 @@ export function startDashboard(): {
         console.error(`[dashboard] lessons failed: ${error instanceof Error ? error.message : error}`);
         res.writeHead(500, { "content-type": "application/json" });
         res.end('{"error":"lessons unavailable"}');
+      }
+      return;
+    }
+
+    if (url.pathname === "/approvals") {
+      // Same SPA/API split as /runs, /telemetry, /catalog and /lessons.
+      // Fresh read every request (no watermark cache) — a just-approved or
+      // just-pushed-back item must disappear from the list immediately. All
+      // stored strings were redacted at write time (approvals.ts); `count`
+      // backs the nav badge. A read error must 500 this request only.
+      if (wantsHtml && serveIndex(res)) return;
+      try {
+        const body = JSON.stringify(approvalsView());
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      } catch (error) {
+        console.error(`[dashboard] approvals failed: ${error instanceof Error ? error.message : error}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end('{"error":"approvals unavailable"}');
       }
       return;
     }
