@@ -39,19 +39,100 @@ export class LinearRateLimited extends Error {
   constructor(status: number) { super(`Linear rate-limited/unavailable (HTTP ${status})`); }
 }
 
-async function gql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
-  const res = await fetch(ENDPOINT, {
-    method: "POST",
-    headers: { Authorization: config.linearApiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (res.status === 429 || res.status >= 500) throw new LinearRateLimited(res.status);
+// --- Connection hygiene (recycle the pool after repeated 5xx/network failures) ---
+//
+// Observed in prod 2026-08-02: after ~24h uptime EVERY Linear request returned
+// 503/504 for hours while a fresh curl with the SAME key from the SAME machine
+// got 200 with rate limits untouched — a poisoned kept-alive connection pool in
+// the long-running Bun process, which the tick backoff then faithfully retried
+// over the same dead sockets forever. Bun's fetch has no pool-bypass option
+// (bun-types 1.3.x: BunFetchRequestInit adds tls/proxy/verbose only; standard
+// `keepalive` governs page-unload semantics, not pooling), so the lever is the
+// request header: "Connection: close" makes Bun open a fresh socket for that
+// request and drop it afterward instead of reusing/parking a pooled one.
+// This is HYGIENE only — backoff timing (LinearBackoff in index.ts) is untouched.
+
+/** Consecutive 5xx/network failures before requests refuse the pooled socket. */
+export const FRESH_CONNECTION_AFTER = 3;
+/** Consecutive failures before the ONE loud operator-facing log line fires —
+ * the per-tick "[tick] … backing off Ns" line repeats identically forever, so
+ * without a distinct escalation an operator cannot tell a wedge from a blip. */
+export const LOUD_LOG_AFTER = 10;
+
+/** Tracks consecutive transport-level failures (HTTP 5xx or fetch throwing —
+ * NOT 429, NOT 4xx, NOT GraphQL errors: those prove the connection is alive
+ * and the request reached Linear). Injectable log for tests; the counter is
+ * process-wide (one shared pool → one shared health) via `defaultDeps` below. */
+export class ConnectionHealth {
+  private consecutive = 0;
+  constructor(private readonly log: (msg: string) => void = console.error) {}
+
+  get consecutiveFailures(): number { return this.consecutive; }
+
+  /** Should the NEXT request bypass the kept-alive pool? Stays true until a
+   * success resets — once we suspect the pool, every retry gets a fresh socket
+   * (each "Connection: close" response also evicts one possibly-dead socket). */
+  get forceFresh(): boolean { return this.consecutive >= FRESH_CONNECTION_AFTER; }
+
+  recordFailure(): void {
+    this.consecutive += 1;
+    // Exactly-at-threshold so the loud line fires ONCE per wedge, not per
+    // request; a recovery then re-wedge legitimately fires it again.
+    if (this.consecutive === LOUD_LOG_AFTER) {
+      this.log(`[linear] ${this.consecutive} consecutive 5xx/network failures — likely stale connection pool or Linear outage; forcing fresh connections`);
+    }
+  }
+
+  recordSuccess(): void { this.consecutive = 0; }
+}
+
+// Injectable seam (postmerge.ts's DeployDeps pattern) so the fresh-connection
+// escalation is testable without a network: tests pass a fake fetch + their own
+// ConnectionHealth; production shares ONE health instance across all queries
+// because they share one connection pool.
+export interface LinearTransportDeps {
+  fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
+  health: ConnectionHealth;
+}
+
+const defaultDeps: LinearTransportDeps = {
+  fetchImpl: (url, init) => fetch(url, init),
+  health: new ConnectionHealth(),
+};
+
+/** Transport layer of every Linear query — exported for tests only (production
+ * callers go through the module's typed query functions, which use gql below). */
+export async function gqlWith<T>(deps: LinearTransportDeps, query: string, variables: Record<string, unknown> = {}): Promise<T> {
+  const { fetchImpl, health } = deps;
+  const headers: Record<string, string> = { Authorization: config.linearApiKey, "Content-Type": "application/json" };
+  if (health.forceFresh) headers.Connection = "close";
+  let res: Response;
+  try {
+    res = await fetchImpl(ENDPOINT, { method: "POST", headers, body: JSON.stringify({ query, variables }) });
+  } catch (error) {
+    // Network-level failure (e.g. ECONNRESET/timeout on a dead pooled socket)
+    // counts toward recycling — this is exactly the poisoned-pool signature.
+    health.recordFailure();
+    throw error;
+  }
+  if (res.status >= 500) {
+    health.recordFailure();
+    throw new LinearRateLimited(res.status);
+  }
+  // Any sub-500 response proves the socket + server path are alive, so the
+  // consecutive counter resets BEFORE status handling: a genuine 429 rate
+  // limit must not push us into (pointless) connection recycling.
+  health.recordSuccess();
+  if (res.status === 429) throw new LinearRateLimited(res.status);
   if (!res.ok) throw new Error(`Linear HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
   const payload = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };
   if (payload.errors?.length) throw new Error(`Linear: ${payload.errors.map((e) => e.message).join("; ")}`);
   if (!payload.data) throw new Error("Linear: empty response");
   return payload.data;
 }
+
+const gql = <T>(query: string, variables: Record<string, unknown> = {}): Promise<T> =>
+  gqlWith<T>(defaultDeps, query, variables);
 
 export interface Issue {
   id: string;
