@@ -157,6 +157,13 @@ export const config = {
   // the cards off the repo tree.
   projectsDir: (process.env.FACTORY_PROJECTS_DIR ?? "").trim() ? expandHome(process.env.FACTORY_PROJECTS_DIR!) : "",
 
+  // Approvals inbox macOS notification (notify.ts): when a run files an
+  // approval item, ping the owner via osascript so held work is noticed in
+  // minutes, not at the next dashboard glance. ON by default because it is
+  // pure local UX (no spend, no remote call, throttled to one per item);
+  // APPROVALS_NOTIFY=0 disables. No-op off macOS regardless.
+  approvalsNotify: (process.env.APPROVALS_NOTIFY ?? "1").trim() !== "0",
+
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
   // The factory's OWN repo slug — NEVER auto-merged regardless of enrollment or
   // ceiling (isSelfRepo in merge-ladder.ts also matches any `.../factory`).

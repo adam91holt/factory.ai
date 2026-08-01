@@ -1,8 +1,11 @@
 import { Link } from "@tanstack/react-router";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { Activity, BarChart3, Columns3, GraduationCap, History, Inbox, Library } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { Activity, BarChart3, Columns3, GraduationCap, History, Inbox, Library, ListChecks } from "lucide-react";
 import { useFactory } from "../../lib/store";
 import { usd } from "../../lib/format";
+import { fetchApprovals, splitApprovals } from "../../lib/approvals";
+import { APPROVALS_REFETCH_MS } from "../../pages/ApprovalsPage";
 import { LiveRunPill } from "./LiveRunPill";
 import { Separator } from "../ui/separator";
 
@@ -10,6 +13,7 @@ const NAV = [
   { to: "/", label: "Board", icon: Columns3 },
   { to: "/runs", label: "Runs", icon: Activity },
   { to: "/queue", label: "Queue", icon: Inbox },
+  { to: "/approvals", label: "Review", icon: ListChecks },
   { to: "/history", label: "History", icon: History },
   { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
   { to: "/catalog", label: "Catalog", icon: Library },
@@ -29,6 +33,20 @@ export function Sidebar() {
     (s) => s.mission.board.filter((i) => i.lane === "needs_human" || i.lane === "parked").length,
   );
   const [pillsRef] = useAutoAnimate({ duration: 220, easing: "ease-out" });
+
+  // Review-queue count: same query key + poll cadence as the /approvals page,
+  // so the two never disagree and the cache is shared. The backend may not
+  // carry the approvals routes yet (separate stream) — retry:false keeps a 404
+  // from re-polling as an error loop, and an errored/absent queue just renders
+  // no badge (never a fake zero).
+  const { data: approvalsData } = useQuery({
+    queryKey: ["approvals"],
+    queryFn: fetchApprovals,
+    staleTime: 10_000,
+    refetchInterval: APPROVALS_REFETCH_MS,
+    retry: false,
+  });
+  const reviewCount = approvalsData ? splitApprovals(approvalsData.items).pending.length : 0;
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-line bg-bg1">
@@ -55,6 +73,11 @@ export function Sidebar() {
             {label === "Queue" && attention > 0 && (
               <span className="ml-auto rounded-md border border-human/35 bg-human/10 px-1.5 font-mono text-[10.5px] text-human">
                 {attention}
+              </span>
+            )}
+            {label === "Review" && reviewCount > 0 && (
+              <span className="ml-auto rounded-md border border-live/35 bg-live/10 px-1.5 font-mono text-[10.5px] text-live">
+                {reviewCount}
               </span>
             )}
           </Link>

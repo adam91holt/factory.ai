@@ -401,6 +401,20 @@ export function mergeBaseIntoBranch(ws: Workspace): { ok: boolean; out: string }
   return { ok: m.ok, out: m.out.slice(0, 400) };
 }
 
+/** Current head commit of a PR as GITHUB sees it (`gh pr view --json
+ * headRefOid`) — the approvals inbox's freshness pre-check: an approve action
+ * compares this against the item's gated SHA BEFORE merging, so a branch that
+ * moved since gating is refused up front (and --match-head-commit still
+ * enforces the same pin atomically server-side as the backstop). null on any
+ * gh failure or a malformed SHA — the caller must treat "can't read the head"
+ * as "not proven fresh" and refuse, never merge blind. */
+export function prHeadSha(repo: string, prUrl: string): string | null {
+  const r = spawnSync("gh", ["pr", "view", prUrl, "--repo", repo, "--json", "headRefOid", "-q", ".headRefOid"],
+    { encoding: "utf8", timeout: 30_000 });
+  const sha = (r.stdout ?? "").trim();
+  return r.status === 0 && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+}
+
 /** Build the `gh pr merge` argv. PINNED-BY-CONSTRUCTION (same pattern as
  * ghRepoCreateArgs): --match-head-commit is always present and the SHA is
  * validated, so no code path can produce an UNPINNED merge argv — merging

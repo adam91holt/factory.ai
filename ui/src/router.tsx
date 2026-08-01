@@ -8,6 +8,7 @@ import { BoardPage } from "./pages/BoardPage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
 import { QueuePage } from "./pages/QueuePage";
+import { ApprovalsPage } from "./pages/ApprovalsPage";
 import { HistoryPage } from "./pages/HistoryPage";
 import { TelemetryPage } from "./pages/TelemetryPage";
 import { CatalogPage } from "./pages/CatalogPage";
@@ -44,6 +45,12 @@ const queueRoute = createRoute({
   component: QueuePage,
 });
 
+const approvalsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/approvals",
+  component: ApprovalsPage,
+});
+
 const historyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/history",
@@ -73,6 +80,7 @@ const routeTree = rootRoute.addChildren([
   runsRoute,
   runDetailRoute,
   queueRoute,
+  approvalsRoute,
   historyRoute,
   telemetryRoute,
   catalogRoute,

@@ -32,6 +32,14 @@ export default defineConfig({
         bypass: (req) =>
           req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
       },
+      // /approvals is the JSON read endpoint AND the SPA route;
+      // /approvals/:id/approve + /approvals/:id/pushback are the POST writes
+      // (inbox-backend stream). Identical split to /catalog.
+      "/approvals": {
+        target: "http://127.0.0.1:8787",
+        bypass: (req) =>
+          req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
+      },
       // /lessons is the JSON read endpoint AND the SPA route; /lessons/archive
       // is the POST write. Identical split to /catalog.
       "/lessons": {
