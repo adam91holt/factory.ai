@@ -383,6 +383,15 @@ export async function transition(issue: Issue, kind: StateKind): Promise<boolean
   return true;
 }
 
+/** The one post-MERGE ticket transition, shared so the auto-merge path
+ * (loop.ts) and the approvals inbox's human merge (approvals.ts) cannot drift:
+ * a merged change moves to done; a team without a completed-type state falls
+ * back to review (best-effort) so the ticket at least leaves the working lane. */
+export async function transitionAfterMerge(issue: Issue): Promise<void> {
+  const moved = await transition(issue, "done");
+  if (!moved) await transition(issue, "review").catch(() => {});
+}
+
 /** Create a contract-conforming child under an epic (PLAN stage). Lands in the
  * default triage-less backlog state; the factory picks it up like any ticket. */
 export async function createSubIssue(parent: Issue, title: string, description: string): Promise<string> {

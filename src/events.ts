@@ -135,7 +135,20 @@ export type FactoryEventBody =
   // or null when no fallback was configured/usable — the exact "one 429 took
   // the whole factory down" scenario this exists to surface. Daemon-only, like
   // park_mutation_failed above — not mirrored to the UI's copy of this union.
-  | { type: "provider_failover"; stage: string; fromModel: string; toModel: string | null; reason: string };
+  | { type: "provider_failover"; stage: string; fromModel: string; toModel: string | null; reason: string }
+  // ---- Approvals inbox (approvals.ts): the human review lane as actionable
+  // state. approval_created fires when a run ends routed-to-human with an open
+  // PR; approval_granted marks the HUMAN merge (the run itself already
+  // terminated needs_human/pr_open, so no second run_finished is emitted —
+  // telemetry run counts stay single-counted and the outcomes ledger already
+  // classified the run as routed from its recorded reason); approval_pushed_back
+  // and approval_stale record the other two decisions. All strings are redacted
+  // and capped before emit. Daemon-only additions like park_mutation_failed —
+  // not yet mirrored to the UI's copy of this union.
+  | { type: "approval_created"; issueKey: string; approvalId: number; prUrl: string; holdReasons: string }
+  | { type: "approval_granted"; issueKey: string; approvalId: number; prUrl: string; sha: string }
+  | { type: "approval_pushed_back"; issueKey: string; approvalId: number; feedback: string }
+  | { type: "approval_stale"; issueKey: string; approvalId: number; reason: string };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

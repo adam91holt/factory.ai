@@ -53,6 +53,40 @@ function ensureSchema(d: Database): void {
   d.run(`CREATE TABLE IF NOT EXISTS deploys (
     repo TEXT NOT NULL, sha TEXT NOT NULL, outcome TEXT, at INTEGER,
     PRIMARY KEY (repo, sha))`);
+  // Approvals inbox (human review lane): one row per run that ended routed to
+  // a human with an OPEN PR — the actionable item behind GET /approvals. The
+  // row carries everything a human needs to DECIDE without leaving the app
+  // (hold reasons, gate summary, verdicts, findings digest, diff stat, spend)
+  // plus gated_head_sha — the exact commit the evidence ran against, which the
+  // approve action re-verifies and pins the merge to (--match-head-commit).
+  // status transitions: pending → approved | pushed_back | stale; the
+  // pending→X step is a single atomic UPDATE ... WHERE status='pending'
+  // (claimApproval below) so a double-click can never double-merge. All free
+  // text is redacted at write time (approvals.ts) — same emit-time discipline
+  // as the events table.
+  d.run(`CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    issue_key TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL, pr_url TEXT NOT NULL,
+    gated_head_sha TEXT,
+    hold_reasons TEXT NOT NULL DEFAULT '',
+    gate_summary_json TEXT,
+    security_verdict TEXT NOT NULL DEFAULT 'none',
+    taste_verdict TEXT NOT NULL DEFAULT 'not-required',
+    findings_digest TEXT NOT NULL DEFAULT '',
+    diff_stat TEXT NOT NULL DEFAULT '',
+    cost_usd REAL NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolution TEXT NOT NULL DEFAULT '')`);
+  d.run("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, id)");
+  // Push-back feedback handoff: the owner's directive travels from the
+  // pushback endpoint to the NEXT run of the same issue via this one-row-per-
+  // issue table. Consumed exactly once (takePushbackFeedback = read+delete) so
+  // stale direction can never resurrect on a later unrelated re-run; the
+  // durable copy for humans is the Linear comment approvals.ts posts.
+  d.run(`CREATE TABLE IF NOT EXISTS pushback_feedback (
+    issue_key TEXT PRIMARY KEY, feedback TEXT NOT NULL, created_at INTEGER NOT NULL)`);
 }
 
 export function startEventStore(): void {
@@ -573,6 +607,159 @@ export function deployAttempted(repo: string, sha: string): boolean {
   if (!db || !repo || !sha) return false;
   const row = db.prepare("SELECT 1 AS n FROM deploys WHERE repo = ? AND sha = ?").get(repo, sha) as { n: number } | null;
   return row !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Approvals inbox rows — persistence ONLY, same split as the merge ladder
+// above: every decision about WHEN an item is filed, whether an approve may
+// merge, and what a pushback does lives in approvals.ts; these helpers just
+// read/write rows through the daemon's single shared handle. Closed-store
+// behavior mirrors the rest of this file: reads return empty/null, writes
+// return null/false, nothing ever throws into the pipeline or a request.
+// ---------------------------------------------------------------------------
+
+export type ApprovalStatus = "pending" | "approved" | "pushed_back" | "stale";
+
+/** Per-gate test-count ratchet slice ("tests 631 → 640") for the approval card. */
+export interface ApprovalGateTests { name: string; from: number | null; to: number | null }
+
+export interface ApprovalItem {
+  id: number;
+  createdAt: number;
+  updatedAt: number;
+  issueKey: string;
+  title: string;
+  repo: string;
+  prUrl: string;
+  /** The head SHA the evidence gates ran against — the ONLY commit approve may
+   *  merge (pinned via --match-head-commit). null when the run could not record
+   *  one; approve refuses such an item outright. */
+  gatedHeadSha: string | null;
+  holdReasons: string;
+  gateSummary: { green: boolean; strength: string; tests: ApprovalGateTests[] } | null;
+  securityVerdict: string;
+  tasteVerdict: string;
+  findingsDigest: string;
+  diffStat: string;
+  costUsd: number;
+  turns: number;
+  status: ApprovalStatus;
+  resolution: string;
+}
+
+interface RawApprovalRow {
+  id: number; created_at: number; updated_at: number; issue_key: string; title: string;
+  repo: string; pr_url: string; gated_head_sha: string | null; hold_reasons: string;
+  gate_summary_json: string | null; security_verdict: string; taste_verdict: string;
+  findings_digest: string; diff_stat: string; cost_usd: number; turns: number;
+  status: string; resolution: string;
+}
+
+const APPROVAL_COLUMNS = "id, created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, status, resolution";
+
+function toApprovalItem(r: RawApprovalRow): ApprovalItem {
+  let gateSummary: ApprovalItem["gateSummary"] = null;
+  if (r.gate_summary_json) {
+    try { gateSummary = JSON.parse(r.gate_summary_json) as ApprovalItem["gateSummary"]; } catch { /* legacy/bad row degrades to null */ }
+  }
+  return {
+    id: r.id, createdAt: r.created_at, updatedAt: r.updated_at, issueKey: r.issue_key,
+    title: r.title, repo: r.repo, prUrl: r.pr_url, gatedHeadSha: r.gated_head_sha,
+    holdReasons: r.hold_reasons, gateSummary, securityVerdict: r.security_verdict,
+    tasteVerdict: r.taste_verdict, findingsDigest: r.findings_digest, diffStat: r.diff_stat,
+    costUsd: num(r.cost_usd), turns: num(r.turns),
+    status: (["pending", "approved", "pushed_back", "stale"].includes(r.status) ? r.status : "stale") as ApprovalStatus,
+    resolution: r.resolution,
+  };
+}
+
+/** Insert a new approval item, superseding any still-pending item for the same
+ *  issue (a re-run's fresh evidence makes the old card unreliable — its gated
+ *  SHA no longer matches the branch, so it could only ever refuse). Returns the
+ *  new row id, or null when the store is closed. Caller (approvals.ts) has
+ *  already redacted/capped every string. */
+export function insertApproval(row: {
+  issueKey: string; title: string; repo: string; prUrl: string;
+  gatedHeadSha: string | null; holdReasons: string;
+  gateSummary: ApprovalItem["gateSummary"];
+  securityVerdict: string; tasteVerdict: string; findingsDigest: string;
+  diffStat: string; costUsd: number; turns: number;
+}): number | null {
+  if (!db) return null;
+  const now = Date.now();
+  db.prepare("UPDATE approvals SET status = 'stale', resolution = 'superseded by a newer run', updated_at = ? WHERE issue_key = ? AND status = 'pending'")
+    .run(now, row.issueKey);
+  const res = db.prepare(
+    `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, status, resolution)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '')`,
+  ).run(now, now, row.issueKey, row.title, row.repo, row.prUrl, row.gatedHeadSha, row.holdReasons,
+    row.gateSummary ? JSON.stringify(row.gateSummary) : null,
+    row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns);
+  return Number(res.lastInsertRowid);
+}
+
+/** Pending items, newest first — the GET /approvals payload. */
+export function listPendingApprovals(limit = 100): ApprovalItem[] {
+  if (!db) return [];
+  const rows = db.prepare(`SELECT ${APPROVAL_COLUMNS} FROM approvals WHERE status = 'pending' ORDER BY id DESC LIMIT ?`)
+    .all(limit) as RawApprovalRow[];
+  return rows.map(toApprovalItem);
+}
+
+/** Count of pending items — the nav badge. */
+export function pendingApprovalCount(): number {
+  if (!db) return 0;
+  const row = db.prepare("SELECT COUNT(*) AS n FROM approvals WHERE status = 'pending'").get() as { n: number };
+  return row.n;
+}
+
+export function getApproval(id: number): ApprovalItem | null {
+  if (!db) return null;
+  const row = db.prepare(`SELECT ${APPROVAL_COLUMNS} FROM approvals WHERE id = ?`).get(id) as RawApprovalRow | null;
+  return row ? toApprovalItem(row) : null;
+}
+
+/** ATOMIC pending→`to` transition — the idempotency/double-click guard. A
+ *  single conditional UPDATE (WHERE status='pending'), so of two concurrent
+ *  approve calls exactly ONE observes changes>0 and proceeds to merge; the
+ *  other gets false and returns 409 without acting. Also what makes "no
+ *  endpoint can flip a decision for a run that is not in the human lane" hold:
+ *  a run outside the lane has no pending row to claim. */
+export function claimApproval(id: number, to: Exclude<ApprovalStatus, "pending">): boolean {
+  if (!db) return false;
+  const res = db.prepare("UPDATE approvals SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'")
+    .run(to, Date.now(), id);
+  return res.changes > 0;
+}
+
+/** Unconditional status/resolution write — used AFTER a successful claim to
+ *  record the outcome detail, roll a failed action back to pending (merge
+ *  refused for a non-head reason), or mark an item stale. Never a substitute
+ *  for claimApproval on the act path. */
+export function finalizeApproval(id: number, status: ApprovalStatus, resolution: string): void {
+  if (!db) return;
+  db.prepare("UPDATE approvals SET status = ?, resolution = ?, updated_at = ? WHERE id = ?")
+    .run(status, resolution.slice(0, 1000), Date.now(), id);
+}
+
+/** Store the owner's pushback directive for the issue's next run (one row per
+ *  issue — a second pushback before the re-run replaces the first, matching
+ *  what the owner most recently said). Returns false when the store is closed. */
+export function recordPushbackFeedback(issueKey: string, feedback: string): boolean {
+  if (!db || !issueKey) return false;
+  db.prepare("INSERT OR REPLACE INTO pushback_feedback (issue_key, feedback, created_at) VALUES (?, ?, ?)")
+    .run(issueKey, feedback, Date.now());
+  return true;
+}
+
+/** Read-and-delete the pending directive for an issue (exactly-once handoff
+ *  into the re-run's prompts). null when none / store closed. */
+export function takePushbackFeedback(issueKey: string): string | null {
+  if (!db || !issueKey) return null;
+  const row = db.prepare("SELECT feedback FROM pushback_feedback WHERE issue_key = ?").get(issueKey) as { feedback: string } | null;
+  if (!row) return null;
+  db.prepare("DELETE FROM pushback_feedback WHERE issue_key = ?").run(issueKey);
+  return row.feedback;
 }
 
 // ---------------------------------------------------------------------------
