@@ -10,5 +10,8 @@ process.env.LINEAR_API_KEY = "lin_api_TESTDUMMY0000000000";
 // exact-value redaction leg of redactSecrets (C18) in isolation.
 process.env.PROXY_AUTH_TOKEN = "factory-test-proxy-token-a1b2c3";
 // Keep the daemon fully inert if anything ever touches config-driven behavior.
+// APPROVALS_NOTIFY defaults ON (config.ts), so a filing test that reaches the
+// real notifier would pop a desktop notification on a darwin dev box.
+process.env.APPROVALS_NOTIFY ??= "0";
 process.env.GROUNDSKEEPERS_ENABLED ??= "";
 process.env.MERGE_AUTO_REPOS ??= "";

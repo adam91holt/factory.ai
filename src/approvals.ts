@@ -3,7 +3,7 @@ import { redactSecrets } from "./agents.ts";
 import * as linear from "./linear.ts";
 import { mergePr as realMergePr, prHeadSha as realPrHeadSha } from "./repos.ts";
 import { postMergeTick } from "./postmerge.ts";
-import { notifyApproval } from "./notify.ts";
+import { notifyApproval, type ApprovalNotice } from "./notify.ts";
 import {
   insertApproval, listPendingApprovals, pendingApprovalCount, getApproval,
   claimApproval, finalizeApproval, recordPushbackFeedback,
@@ -36,6 +36,9 @@ import {
 // TIGHTEN-ONLY invariants (pinned in tests/approvals.test.ts):
 //   - approve NEVER merges when the PR head != the gated SHA (or when no
 //     gated SHA was recorded at all);
+//   - approve NEVER merges evidence the caller did not see: the request
+//     carries the gated SHA its card rendered, and a row that has since been
+//     superseded (a re-run files a fresh one) refuses with "card out of date";
 //   - pushback has no merge dep — it structurally cannot merge;
 //   - both actions act only on a `pending` row claimed via ONE atomic
 //     conditional UPDATE (db.ts claimApproval), so a double-click cannot
@@ -73,6 +76,21 @@ export function shouldFileApproval(prUrl: string | null, mergedOk: boolean): boo
   return prUrl !== null && prUrl !== "" && !mergedOk;
 }
 
+/** Does this run's hold record a FAILED pre-merge re-gate against the combined
+ *  head? loop.ts preMergeIntegrity updates a behind-main branch with main and
+ *  re-runs the gates; when that combination comes back red the branch is never
+ *  pushed, so the PR head is still the ORIGINAL gated commit — approve's
+ *  freshness check passes and the card's stored gateSummary still reads green.
+ *  It is green: against an obsolete main. A human reading only that strip would
+ *  merge a combination the factory already proved broken, so the item carries
+ *  this as its own flag and the card shouts it. Matched on loop.ts's phrasing —
+ *  the same marker-string coupling ui/src/lib/history.ts classifyOutcome uses;
+ *  rewording the hold there means updating the marker here (pinned by a test
+ *  that quotes the live string). */
+export function regateFailedAgainstMain(holdReasons: string): boolean {
+  return holdReasons.includes("gates FAILED against the combined head");
+}
+
 export interface ApprovalInput {
   issueKey: string;
   title: string;
@@ -95,13 +113,16 @@ export interface ApprovalInput {
  *  must never throw into the delivery path — the PR and Linear comment remain
  *  the fallback surface. Every free-text field is redacted+capped HERE, the
  *  one write seam, even though holdReasons/findings arrive pre-redacted from
- *  loop.ts (defence in depth — same posture as post()). */
-export function fileApproval(input: ApprovalInput): number | null {
+ *  loop.ts (defence in depth — same posture as post()). `notify` is injectable
+ *  (the DeployDeps pattern) so tests can assert what leaves for the desktop
+ *  without spawning osascript. */
+export function fileApproval(input: ApprovalInput, notify: (notice: ApprovalNotice) => void = notifyApproval): number | null {
   try {
     const clean = (s: string, cap: number): string => redactSecrets(s).clean.slice(0, cap);
+    const title = clean(input.title, 300);
     const id = insertApproval({
       issueKey: input.issueKey,
-      title: clean(input.title, 300),
+      title,
       repo: input.repo,
       prUrl: input.prUrl,
       gatedHeadSha: input.gatedHeadSha,
@@ -113,11 +134,17 @@ export function fileApproval(input: ApprovalInput): number | null {
       diffStat: clean(input.diffStat, 200),
       costUsd: input.costUsd,
       turns: input.turns,
+      // Derived from the hold text at the single write seam, so ANY caller that
+      // files this hold gets the flag — no second place to keep in sync.
+      regateFailed: regateFailedAgainstMain(input.holdReasons),
     });
     if (id === null) return null; // store closed (--once) — nothing durable to act on later
     const holdReasons = clean(input.holdReasons, 300);
     bus.emit({ type: "approval_created", issueKey: input.issueKey, approvalId: id, prUrl: input.prUrl, holdReasons });
-    notifyApproval({ id, issueKey: input.issueKey, title: input.title, holdReasons });
+    // The REDACTED/clamped title, like holdReasons: a ticket title is untrusted
+    // Linear text on its way into an AppleScript literal, and notify.ts's own
+    // sanitizer neutralizes syntax, not secrets.
+    notify({ id, issueKey: input.issueKey, title, holdReasons });
     return id;
   } catch (error) {
     console.error(`[approvals] filing item for ${input.issueKey} failed: ${error instanceof Error ? error.message : error}`);
@@ -154,6 +181,29 @@ export interface ApproveDeps {
 }
 
 const STALE_BRANCH_MOVED = "branch moved since gating — needs re-gate";
+const CARD_OUT_OF_DATE = "this card is out of date — the evidence shown was filed against a different gated head SHA than the item now carries; refresh the queue and re-read it before approving";
+
+/** Normalize a gated head SHA for comparison: absent/blank/non-string → null,
+ *  otherwise lowercased and trimmed (GitHub and git print different cases). */
+function normalizeSha(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim().toLowerCase();
+  return s === "" ? null : s;
+}
+
+/** Is the SHA the human's card RENDERED still the one the item carries?
+ *
+ *  An approve request is consent to merge SPECIFIC EVIDENCE, not consent to
+ *  merge whatever row id 41 happens to hold now. A re-run supersedes the row
+ *  and files a fresh one (db.ts insertApproval), so a card left open in a tab
+ *  can name a commit and a hold reason that no longer describe the item behind
+ *  the button. Binding the request to the rendered SHA makes that a refusal
+ *  instead of a merge of unread evidence. Absent on ONE side only is a mismatch
+ *  too (tighten-only: ambiguity resolves toward refusing); absent on BOTH is
+ *  the no-gated-SHA item, which approve refuses further down anyway. */
+export function approvalEvidenceMatches(requested: unknown, current: string | null): boolean {
+  return normalizeSha(requested) === normalizeSha(current);
+}
 
 const defaultApproveDeps: ApproveDeps = {
   getApproval, claimApproval, finalizeApproval,
@@ -166,8 +216,11 @@ const defaultApproveDeps: ApproveDeps = {
   postMerge: () => postMergeTick(),
 };
 
-/** POST /approvals/:id/approve. Sequence (each step fails CLOSED — there is no
- *  path from any failure to a merge):
+/** POST /approvals/:id/approve {gatedHeadSha}. Sequence (each step fails CLOSED
+ *  — there is no path from any failure to a merge):
+ *    0. evidence binding: the SHA the caller's card rendered must still be the
+ *       item's. A mismatch is refused BEFORE the claim, so a stale tab costs a
+ *       refresh, not the row — the item stays pending and approvable;
  *    1. atomic pending→approved claim (double-click / concurrent-request guard);
  *    2. refuse outright if the item recorded no gated SHA (nothing to pin to);
  *    3. freshness: current PR head (GitHub's view) must EQUAL the gated SHA —
@@ -180,9 +233,12 @@ const defaultApproveDeps: ApproveDeps = {
  *       drop the needs-human hold label, emit approval_granted, run normal
  *       post-merge handling. Linear/postmerge failures after the merge are
  *       reported but the action is still a 200 — the merge HAPPENED. */
-export async function approveItem(id: number, deps: ApproveDeps = defaultApproveDeps): Promise<ApprovalActionResult> {
+export async function approveItem(id: number, requestedHeadSha: unknown, deps: ApproveDeps = defaultApproveDeps): Promise<ApprovalActionResult> {
   const item = deps.getApproval(id);
   if (!item) return { status: 404, json: { error: "no approval item with that id" } };
+  if (!approvalEvidenceMatches(requestedHeadSha, item.gatedHeadSha)) {
+    return { status: 409, json: { error: CARD_OUT_OF_DATE, item } };
+  }
   if (!deps.claimApproval(id, "approved")) {
     // Not pending (already decided, superseded, or a concurrent click won).
     const now = deps.getApproval(id);

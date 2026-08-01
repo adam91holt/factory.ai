@@ -81,7 +81,21 @@ export function ApprovalsPage() {
   // point of surfacing them). Keyed by item id so one refusal never bleeds onto
   // a neighbouring card.
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // In-flight ids PER ACTION. A single mutation's `variables` only ever names
+  // the MOST RECENT call, so with one shared mutation clicking card B while
+  // card A's merge was still running re-enabled A's button mid-request — an
+  // invitation to double-click the one action that merges. Sets keyed by item
+  // id keep each card disabled until ITS OWN request settles.
+  const [approving, setApproving] = useState<ReadonlySet<string>>(new Set());
+  const [pushingBack, setPushingBack] = useState<ReadonlySet<string>>(new Set());
   const [listRef] = useAutoAnimate({ duration: 220, easing: "ease-out" });
+
+  const mark = (set: (f: (s: ReadonlySet<string>) => ReadonlySet<string>) => void, id: string, inFlight: boolean) =>
+    set((prev) => {
+      const next = new Set(prev);
+      if (inFlight) next.add(id); else next.delete(id);
+      return next;
+    });
 
   const settle = (id: string, res: { ok: true; id: string } | { error: string }) => {
     if ("error" in res) {
@@ -101,14 +115,20 @@ export function ApprovalsPage() {
     setErrors((prev) => ({ ...prev, [id]: e instanceof Error ? e.message : "request failed" }));
 
   const approve = useMutation({
-    mutationFn: (id: string) => approveItem(id),
-    onSuccess: (res, id) => settle(id, res),
-    onError: (e, id) => fail(id, e),
+    // gatedHeadSha travels with the click: it is the SHA the CARD showed, so
+    // the daemon can refuse a merge of evidence this human never read.
+    mutationFn: ({ id, gatedHeadSha }: { id: string; gatedHeadSha: string | null }) => approveItem(id, gatedHeadSha),
+    onMutate: ({ id }) => { mark(setApproving, id, true); },
+    onSuccess: (res, { id }) => settle(id, res),
+    onError: (e, { id }) => fail(id, e),
+    onSettled: (_d, _e, { id }) => { mark(setApproving, id, false); },
   });
   const pushback = useMutation({
     mutationFn: ({ id, feedback }: { id: string; feedback: string }) => pushbackItem(id, feedback),
+    onMutate: ({ id }) => { mark(setPushingBack, id, true); },
     onSuccess: (res, { id }) => settle(id, res),
     onError: (e, { id }) => fail(id, e),
+    onSettled: (_d, _e, { id }) => { mark(setPushingBack, id, false); },
   });
 
   const { pending, handled } = splitApprovals(data?.items ?? []);
@@ -144,10 +164,10 @@ export function ApprovalsPage() {
               key={item.id}
               item={item}
               now={now}
-              approvePending={approve.isPending && approve.variables === item.id}
-              pushbackPending={pushback.isPending && pushback.variables?.id === item.id}
+              approvePending={approving.has(item.id)}
+              pushbackPending={pushingBack.has(item.id)}
               error={errors[item.id] ?? null}
-              onApprove={(id) => approve.mutate(id)}
+              onApprove={(id, gatedHeadSha) => approve.mutate({ id, gatedHeadSha })}
               onPushback={(id, feedback) => pushback.mutate({ id, feedback })}
             />
           ))}

@@ -77,8 +77,14 @@ function ensureSchema(d: Database): void {
     findings_digest TEXT NOT NULL DEFAULT '',
     diff_stat TEXT NOT NULL DEFAULT '',
     cost_usd REAL NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0,
+    regate_failed INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     resolution TEXT NOT NULL DEFAULT '')`);
+  // regate_failed post-dates the table by one commit, so a store an earlier
+  // build of this branch created lacks it — and SELECT names every column, so
+  // every read would throw. SQLite has no ADD COLUMN IF NOT EXISTS; the ALTER
+  // is idempotent by way of failing (duplicate column) on an up-to-date store.
+  try { d.run("ALTER TABLE approvals ADD COLUMN regate_failed INTEGER NOT NULL DEFAULT 0"); } catch { /* already present */ }
   d.run("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, id)");
   // Push-back feedback handoff: the owner's directive travels from the
   // pushback endpoint to the NEXT run of the same issue via this one-row-per-
@@ -643,6 +649,11 @@ export interface ApprovalItem {
   diffStat: string;
   costUsd: number;
   turns: number;
+  /** The recorded gateSummary green is KNOWN NOT to describe this branch merged
+   *  with current main: the pre-merge re-gate ran against the combined head and
+   *  FAILED (loop.ts preMergeIntegrity). Carried as its own field because the
+   *  card's green evidence would otherwise read as the whole story. */
+  regateFailed: boolean;
   status: ApprovalStatus;
   resolution: string;
 }
@@ -652,10 +663,10 @@ interface RawApprovalRow {
   repo: string; pr_url: string; gated_head_sha: string | null; hold_reasons: string;
   gate_summary_json: string | null; security_verdict: string; taste_verdict: string;
   findings_digest: string; diff_stat: string; cost_usd: number; turns: number;
-  status: string; resolution: string;
+  regate_failed: number; status: string; resolution: string;
 }
 
-const APPROVAL_COLUMNS = "id, created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, status, resolution";
+const APPROVAL_COLUMNS = "id, created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, regate_failed, status, resolution";
 
 function toApprovalItem(r: RawApprovalRow): ApprovalItem {
   let gateSummary: ApprovalItem["gateSummary"] = null;
@@ -667,7 +678,7 @@ function toApprovalItem(r: RawApprovalRow): ApprovalItem {
     title: r.title, repo: r.repo, prUrl: r.pr_url, gatedHeadSha: r.gated_head_sha,
     holdReasons: r.hold_reasons, gateSummary, securityVerdict: r.security_verdict,
     tasteVerdict: r.taste_verdict, findingsDigest: r.findings_digest, diffStat: r.diff_stat,
-    costUsd: num(r.cost_usd), turns: num(r.turns),
+    costUsd: num(r.cost_usd), turns: num(r.turns), regateFailed: r.regate_failed === 1,
     status: (["pending", "approved", "pushed_back", "stale"].includes(r.status) ? r.status : "stale") as ApprovalStatus,
     resolution: r.resolution,
   };
@@ -683,18 +694,19 @@ export function insertApproval(row: {
   gatedHeadSha: string | null; holdReasons: string;
   gateSummary: ApprovalItem["gateSummary"];
   securityVerdict: string; tasteVerdict: string; findingsDigest: string;
-  diffStat: string; costUsd: number; turns: number;
+  diffStat: string; costUsd: number; turns: number; regateFailed: boolean;
 }): number | null {
   if (!db) return null;
   const now = Date.now();
   db.prepare("UPDATE approvals SET status = 'stale', resolution = 'superseded by a newer run', updated_at = ? WHERE issue_key = ? AND status = 'pending'")
     .run(now, row.issueKey);
   const res = db.prepare(
-    `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, status, resolution)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '')`,
+    `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, regate_failed, status, resolution)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '')`,
   ).run(now, now, row.issueKey, row.title, row.repo, row.prUrl, row.gatedHeadSha, row.holdReasons,
     row.gateSummary ? JSON.stringify(row.gateSummary) : null,
-    row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns);
+    row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns,
+    row.regateFailed ? 1 : 0);
   return Number(res.lastInsertRowid);
 }
 
@@ -750,6 +762,18 @@ export function recordPushbackFeedback(issueKey: string, feedback: string): bool
   db.prepare("INSERT OR REPLACE INTO pushback_feedback (issue_key, feedback, created_at) VALUES (?, ?, ?)")
     .run(issueKey, feedback, Date.now());
   return true;
+}
+
+/** Put a TAKEN directive back when the run that consumed it never delivered
+ *  anything for the owner to review (parked/aborted/threw before a PR existed).
+ *  INSERT OR IGNORE, never REPLACE: a directive the owner recorded DURING that
+ *  run is newer and must win — a restore may never resurrect superseded
+ *  direction over it. loop.ts owns the when (ownerFeedbackHandoff). */
+export function restorePushbackFeedback(issueKey: string, feedback: string): boolean {
+  if (!db || !issueKey) return false;
+  const res = db.prepare("INSERT OR IGNORE INTO pushback_feedback (issue_key, feedback, created_at) VALUES (?, ?, ?)")
+    .run(issueKey, feedback, Date.now());
+  return res.changes > 0;
 }
 
 /** Read-and-delete the pending directive for an issue (exactly-once handoff

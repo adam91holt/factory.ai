@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Check, ChevronRight, CornerUpLeft, GitPullRequest } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CornerUpLeft, GitPullRequest } from "lucide-react";
 import type { ApprovalItem } from "../../lib/approvals";
-import { approveDisabledReason, testCountDelta } from "../../lib/approvals";
+import { approveDisabledReason, safeHref, testCountDelta } from "../../lib/approvals";
 import { relTime, usd } from "../../lib/format";
 import { Badge } from "../ui/badge";
 import { cn } from "../../lib/utils";
@@ -214,10 +214,13 @@ export function ApprovalCard({
   pushbackPending: boolean;
   /** Verbatim backend refusal for THIS item (e.g. "branch moved since gating"). */
   error: string | null;
-  onApprove: (id: string) => void;
+  /** Carries the SHA THIS card rendered — the backend refuses the merge if the
+   *  item has moved on since (lib/approvals approveItem). */
+  onApprove: (id: string, gatedHeadSha: string | null) => void;
   onPushback: (id: string, feedback: string) => void;
 }) {
   const disabledReason = approveDisabledReason(item);
+  const prHref = safeHref(item.prUrl);
 
   return (
     <div className="flex flex-col gap-2.5 rounded-xl border border-line bg-bg1 px-3.5 py-3 transition-colors duration-100 hover:border-line2">
@@ -261,6 +264,26 @@ export function ApprovalCard({
         )}
       </div>
 
+      {/* Known-red combination. Sits ABOVE the evidence strip because the strip
+          below it says "gates green" — true of this branch alone, against an
+          obsolete main. Approve stays enabled: the human is the authority here,
+          but the override has to be an informed one. */}
+      {item.regateFailed && (
+        <div className="flex items-start gap-2 rounded-lg border border-err/60 bg-err/10 px-3 py-2">
+          <AlertTriangle className="mt-px size-3.5 shrink-0 text-err" strokeWidth={2} />
+          <div className="flex flex-col gap-0.5">
+            <div className="font-mono text-[11.5px] font-medium text-err">
+              Re-gate against current main FAILED — merging anyway ships a known-red combination
+            </div>
+            <div className="font-mono text-[10.5px] leading-relaxed text-fg-dim">
+              The gate results below are green for this branch alone. The factory merged current main in,
+              re-ran the gates, and they failed — so this PR was never pushed past that point and its head
+              is still the older gated commit.
+            </div>
+          </div>
+        </div>
+      )}
+
       <EvidenceStrip item={item} />
 
       {/* findings digest — collapsible, plain text */}
@@ -288,10 +311,19 @@ export function ApprovalCard({
           </span>
         )}
         {item.prUrl && (
-          <a href={item.prUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-ok transition-colors duration-100 hover:text-fg">
-            <GitPullRequest className="size-3" strokeWidth={1.75} />
-            {item.prUrl.replace("https://github.com/", "")}
-          </a>
+          // A URL that isn't http(s) renders as inert text, never a target —
+          // the string comes from the daemon, not from whoever is reading it.
+          prHref !== null ? (
+            <a href={prHref} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-ok transition-colors duration-100 hover:text-fg">
+              <GitPullRequest className="size-3" strokeWidth={1.75} />
+              {item.prUrl.replace("https://github.com/", "")}
+            </a>
+          ) : (
+            <span className="flex items-center gap-1 text-fg-faint" title="not a usable http(s) link — shown as text">
+              <GitPullRequest className="size-3" strokeWidth={1.75} />
+              {item.prUrl}
+            </span>
+          )
         )}
         <Link
           to="/runs/$issueKey"
@@ -314,7 +346,7 @@ export function ApprovalCard({
         <ApproveButton
           disabledReason={disabledReason}
           pending={approvePending}
-          onApprove={() => onApprove(item.id)}
+          onApprove={() => onApprove(item.id, item.gatedHeadSha)}
         />
         <PushbackForm pending={pushbackPending} onPushback={(fb) => onPushback(item.id, fb)} />
       </div>

@@ -2,14 +2,17 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   openTestDatabase, closeTestDatabase, insertApproval, listPendingApprovals,
   pendingApprovalCount, getApproval, claimApproval, finalizeApproval,
-  recordPushbackFeedback, takePushbackFeedback,
+  recordPushbackFeedback, restorePushbackFeedback, takePushbackFeedback,
 } from "../src/db.ts";
 import {
   approveItem, pushbackItem, fileApproval, shouldFileApproval, normalizeFeedback,
-  approvalsView, type ApproveDeps, type PushbackDeps,
+  approvalsView, approvalEvidenceMatches, regateFailedAgainstMain,
+  type ApproveDeps, type PushbackDeps,
 } from "../src/approvals.ts";
-import { notifyApproval, sanitizeNotificationText, resetNotifyThrottleForTest, approvalsUrl } from "../src/notify.ts";
+import { ownerFeedbackHandoff, preMergeIntegrity } from "../src/loop.ts";
+import { notifyApproval, sanitizeNotificationText, resetNotifyThrottleForTest, approvalsUrl, type ApprovalNotice } from "../src/notify.ts";
 import type { Issue } from "../src/linear.ts";
+import type { Workspace } from "../src/repos.ts";
 
 // Safety invariants of the approvals inbox (stream inbox-backend), pinned:
 //   1. approve NEVER merges when the PR head != the gated SHA (pre-check
@@ -43,7 +46,7 @@ function seedItem(overrides: Partial<Parameters<typeof insertApproval>[0]> = {})
     gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 631, to: 640 }] },
     securityVerdict: "pass", tasteVerdict: "not-required",
     findingsDigest: "fixed: 2, rejected: 1", diffStat: "3 files · 42 changed lines",
-    costUsd: 1.23, turns: 17,
+    costUsd: 1.23, turns: 17, regateFailed: false,
     ...overrides,
   });
   if (id === null) throw new Error("insertApproval returned null with an open test store");
@@ -124,7 +127,7 @@ describe("approve — the human merge authority", () => {
   test("merges through the pinned mergePr path when head == gated SHA, then closes out Linear", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps();
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(200);
     expect(calls.merged).toEqual([["acme/widgets", "https://github.com/acme/widgets/pull/7", GATED]]);
     expect(getApproval(id)?.status).toBe("approved");
@@ -137,7 +140,7 @@ describe("approve — the human merge authority", () => {
   test("NEVER merges when the PR head moved since gating — item goes stale", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps({ head: MOVED });
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(0); // the invariant: no merge call at all
     const item = getApproval(id);
@@ -148,7 +151,9 @@ describe("approve — the human merge authority", () => {
   test("NEVER merges when no gated SHA was recorded", async () => {
     const id = seedItem({ gatedHeadSha: null });
     const { deps, calls } = approveDeps();
-    const r = await approveItem(id, deps);
+    // The card rendered no SHA either, so the evidence binding matches and the
+    // refusal comes from the rule that matters here: nothing to pin to.
+    const r = await approveItem(id, null, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(0);
     expect(getApproval(id)?.status).toBe("stale");
@@ -157,7 +162,7 @@ describe("approve — the human merge authority", () => {
   test("an unreadable PR head refuses the merge but stays retryable (pending)", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps({ head: null });
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(502);
     expect(calls.merged).toHaveLength(0);
     expect(getApproval(id)?.status).toBe("pending");
@@ -166,7 +171,7 @@ describe("approve — the human merge authority", () => {
   test("a --match-head-commit refusal (headMoved backstop) marks stale, never retries the new head", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps({ mergeOk: false, headMoved: true });
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(1); // one pinned attempt, refused by GitHub
     expect(getApproval(id)?.status).toBe("stale");
@@ -175,7 +180,7 @@ describe("approve — the human merge authority", () => {
   test("a non-head merge failure rolls back to pending (retryable), no Linear transition", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps({ mergeOk: false });
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(502);
     expect(getApproval(id)?.status).toBe("pending");
     expect(calls.transitions).toHaveLength(0);
@@ -184,8 +189,8 @@ describe("approve — the human merge authority", () => {
   test("double-click cannot double-merge: second call is a 409 and merge ran once", async () => {
     const id = seedItem();
     const { deps, calls } = approveDeps();
-    const first = await approveItem(id, deps);
-    const second = await approveItem(id, deps);
+    const first = await approveItem(id, GATED, deps);
+    const second = await approveItem(id, GATED, deps);
     expect(first.status).toBe(200);
     expect(second.status).toBe(409);
     expect(calls.merged).toHaveLength(1);
@@ -194,7 +199,7 @@ describe("approve — the human merge authority", () => {
   test("no endpoint can flip a decided item (pushback after approve refused)", async () => {
     const id = seedItem();
     const { deps } = approveDeps();
-    await approveItem(id, deps);
+    await approveItem(id, GATED, deps);
     const pb = pushbackDeps();
     const r = await pushbackItem(id, "do it differently", pb.deps);
     expect(r.status).toBe(409);
@@ -203,16 +208,164 @@ describe("approve — the human merge authority", () => {
 
   test("a missing item is a 404, never an action", async () => {
     const { deps, calls } = approveDeps();
-    expect((await approveItem(999, deps)).status).toBe(404);
+    expect((await approveItem(999, GATED, deps)).status).toBe(404);
     expect(calls.merged).toHaveLength(0);
   });
 
   test("self-repo items CAN be approved — the human IS the merge authority, still pinned", async () => {
     const id = seedItem({ repo: "adam91holt/factory.ai", prUrl: "https://github.com/adam91holt/factory.ai/pull/5" });
     const { deps, calls } = approveDeps();
-    const r = await approveItem(id, deps);
+    const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(200);
     expect(calls.merged).toEqual([["adam91holt/factory.ai", "https://github.com/adam91holt/factory.ai/pull/5", GATED]]);
+  });
+});
+
+describe("approve is bound to the evidence the human SAW", () => {
+  test("a card rendered against a different gated SHA is refused — no claim, no merge, still approvable", async () => {
+    const id = seedItem();
+    const { deps, calls } = approveDeps();
+    const r = await approveItem(id, MOVED, deps);
+    expect(r.status).toBe(409);
+    expect(String(r.json.error)).toContain("card is out of date");
+    expect(calls.merged).toHaveLength(0);
+    // The row is untouched: a stale tab costs a refresh, never the item.
+    expect(getApproval(id)?.status).toBe("pending");
+    expect((await approveItem(id, GATED, deps)).status).toBe(200);
+  });
+
+  test("an approve with no gatedHeadSha at all cannot merge an item that has one", async () => {
+    const id = seedItem();
+    const { deps, calls } = approveDeps();
+    expect((await approveItem(id, undefined, deps)).status).toBe(409);
+    expect((await approveItem(id, "", deps)).status).toBe(409);
+    expect(calls.merged).toHaveLength(0);
+    expect(getApproval(id)?.status).toBe("pending");
+  });
+
+  test("approvalEvidenceMatches: case/whitespace-insensitive, both-absent matches, one-sided never does", () => {
+    expect(approvalEvidenceMatches(GATED.toUpperCase(), GATED)).toBe(true);
+    expect(approvalEvidenceMatches(` ${GATED} `, GATED)).toBe(true);
+    expect(approvalEvidenceMatches(null, null)).toBe(true);
+    expect(approvalEvidenceMatches(GATED, null)).toBe(false);
+    expect(approvalEvidenceMatches(null, GATED)).toBe(false);
+    expect(approvalEvidenceMatches(42, GATED)).toBe(false);
+  });
+
+  test("a superseded card cannot merge the run that replaced it", async () => {
+    seedItem();                                      // the card the human is looking at
+    const fresh = seedItem({ gatedHeadSha: MOVED }); // a re-run supersedes it
+    const { deps, calls } = approveDeps({ head: MOVED });
+    // The human clicks approve on the OLD card; its id is stale, but even the
+    // NEW row refuses the old card's SHA.
+    expect((await approveItem(fresh, GATED, deps)).status).toBe(409);
+    expect(calls.merged).toHaveLength(0);
+  });
+});
+
+describe("integrity-hold prominence (regateFailed)", () => {
+  const ws = { dir: "/tmp/x", branch: "factory/FAC-1", baseRef: "origin/main" } as Workspace;
+
+  test("the flag is set by the LIVE preMergeIntegrity red-re-gate hold (marker coupling)", () => {
+    const result = preMergeIntegrity(ws, GATED, {
+      fetchBase: () => ({ ok: true, out: "" }),
+      commitsBehindBase: () => 3,
+      mergeBaseIntoBranch: () => ({ ok: true, out: "" }),
+      regate: () => ({ green: false, failures: [{ name: "test" }] }),
+      push: () => {},
+      headSha: () => MOVED,
+    });
+    expect(result.ok).toBe(false);
+    // The producer's phrasing, straight into the consumer's predicate: if
+    // loop.ts rewords the hold, this fails instead of silently dropping the
+    // banner from the card.
+    expect(regateFailedAgainstMain(`merge-integrity: ${(result as { hold: string }).hold}`)).toBe(true);
+  });
+
+  test("ordinary holds do not raise it", () => {
+    expect(regateFailedAgainstMain("guarded paths touched: src/config.ts")).toBe(false);
+    expect(regateFailedAgainstMain("security review returned a FAIL verdict")).toBe(false);
+    // A branch that moved is a different failure — approve's freshness check
+    // catches that one; this flag is about a green that describes an old main.
+    expect(regateFailedAgainstMain("merge-integrity: branch moved since gates passed (--match-head-commit refused the merge) — the new head was never gated; human must re-review")).toBe(false);
+  });
+
+  test("fileApproval persists the flag so the card can shout, and approve is still allowed", async () => {
+    const id = fileApproval({
+      issueKey: "FAC-60", title: "t", repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/60",
+      gatedHeadSha: GATED,
+      holdReasons: "merge-integrity: branch was 3 commit(s) behind origin/main; after updating, gates FAILED against the combined head (test)",
+      gateSummary: { green: true, strength: "strong", tests: [] }, securityVerdict: "pass",
+      tasteVerdict: "not-required", findingsDigest: "", diffStat: "", costUsd: 1, turns: 5,
+    }, () => {});
+    expect(id).not.toBeNull();
+    expect(getApproval(id!)?.regateFailed).toBe(true);
+    // Presentation + flag, NOT a new block: informed human authority stands.
+    const { deps, calls } = approveDeps();
+    expect((await approveItem(id!, GATED, deps)).status).toBe(200);
+    expect(calls.merged).toHaveLength(1);
+  });
+});
+
+describe("owner pushback directive survives a run that never delivered", () => {
+  const handoffDeps = () => {
+    const restored: string[] = [];
+    return {
+      restored,
+      deps: {
+        take: takePushbackFeedback,
+        restore: (key: string, fb: string) => { restored.push(`${key}: ${fb}`); return restorePushbackFeedback(key, fb); },
+      },
+    };
+  };
+
+  test("an EARLY park never consumes it — the next run still gets the directive", () => {
+    recordPushbackFeedback("FAC-70", "use the existing helper");
+    const { deps, restored } = handoffDeps();
+    // Workspace error / deps failure / freshness park / budget expiry: the run
+    // ends before the implementer prompt is built, so take() was never called.
+    ownerFeedbackHandoff("FAC-70", deps).settle(false);
+    expect(restored).toEqual([]);              // nothing to put back — nothing was taken
+    expect(takePushbackFeedback("FAC-70")).toBe("use the existing helper");
+  });
+
+  test("a park AFTER the implementer read it puts it back for the next attempt", () => {
+    recordPushbackFeedback("FAC-71", "use the existing helper");
+    const { deps } = handoffDeps();
+    const h = ownerFeedbackHandoff("FAC-71", deps);
+    expect(h.take()).toBe("use the existing helper");
+    expect(takePushbackFeedback("FAC-71")).toBeNull(); // genuinely consumed mid-run
+    h.settle(false);                                   // run parked before any PR
+    expect(takePushbackFeedback("FAC-71")).toBe("use the existing helper");
+  });
+
+  test("a delivering run consumes it exactly once — settle twice cannot resurrect it", () => {
+    recordPushbackFeedback("FAC-72", "split the endpoint");
+    const { deps, restored } = handoffDeps();
+    const h = ownerFeedbackHandoff("FAC-72", deps);
+    expect(h.take()).toBe("split the endpoint");
+    h.settle(true);
+    h.settle(false); // a stray second settle must not restore a spent directive
+    expect(restored).toEqual([]);
+    expect(takePushbackFeedback("FAC-72")).toBeNull();
+  });
+
+  test("take is memoized: two reads in one run hit the store once", () => {
+    recordPushbackFeedback("FAC-73", "one directive");
+    const { deps } = handoffDeps();
+    const h = ownerFeedbackHandoff("FAC-73", deps);
+    expect(h.take()).toBe("one directive");
+    expect(h.take()).toBe("one directive"); // not null — the take-once already happened
+  });
+
+  test("restoring never clobbers a directive the owner recorded DURING the run", () => {
+    recordPushbackFeedback("FAC-74", "old direction");
+    const { deps } = handoffDeps();
+    const h = ownerFeedbackHandoff("FAC-74", deps);
+    h.take();
+    recordPushbackFeedback("FAC-74", "actually, do this instead"); // owner pushes back again
+    h.settle(false);
+    expect(takePushbackFeedback("FAC-74")).toBe("actually, do this instead");
   });
 });
 
@@ -256,6 +409,21 @@ describe("pushback — the feedback loop", () => {
 });
 
 describe("filing + view", () => {
+  test("the owner notification gets the REDACTED, clamped title — not the raw ticket text", () => {
+    const notices: ApprovalNotice[] = [];
+    const leak = `deploy with lin_api_${"c".repeat(24)} ${"x".repeat(400)}`;
+    fileApproval({
+      issueKey: "FAC-52", title: leak, repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/12",
+      gatedHeadSha: GATED, holdReasons: "guarded paths touched: src/config.ts",
+      gateSummary: null, securityVerdict: "pass", tasteVerdict: "not-required",
+      findingsDigest: "", diffStat: "", costUsd: 0, turns: 0,
+    }, (n) => { notices.push(n); });
+    const notice = notices[0]!;
+    expect(notice.title).toContain("[REDACTED-SECRET]");
+    expect(notice.title).not.toContain("lin_api_");
+    expect(notice.title.length).toBe(300); // clamped like the stored row
+  });
+
   test("fileApproval persists a redacted card and approvalsView serves it with a count", () => {
     const id = fileApproval({
       issueKey: "FAC-50", title: "add auth", repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/9",
@@ -263,7 +431,7 @@ describe("filing + view", () => {
       gateSummary: { green: true, strength: "strong", tests: [{ name: "test", from: 10, to: 12 }] },
       securityVerdict: "fail", tasteVerdict: "pass", findingsDigest: "one real finding fixed",
       diffStat: "2 files · 30 changed lines", costUsd: 2.5, turns: 30,
-    });
+    }, () => {});
     expect(id).not.toBeNull();
     const view = approvalsView();
     expect(view.count).toBe(1);
@@ -280,7 +448,7 @@ describe("filing + view", () => {
       issueKey: "FAC-51", title: "x", repo: "a/b", prUrl: "https://github.com/a/b/pull/1",
       gatedHeadSha: GATED, holdReasons: "r", gateSummary: null, securityVerdict: "none",
       tasteVerdict: "not-required", findingsDigest: "", diffStat: "", costUsd: 0, turns: 0,
-    });
+    }, () => {});
     expect(id).toBeNull();
     openTestDatabase(); // afterEach closes again
   });

@@ -8,7 +8,8 @@ import { isMockMode } from "./fixtures";
 // duplicated by design like lessons.ts/telemetry.ts):
 //
 //   GET  /approvals                     → { pending: WireApprovalItem[]; count: number }
-//   POST /approvals/:id/approve  {}     → 200 { ok, merged, sha, prUrl, warnings? }
+//   POST /approvals/:id/approve  {gatedHeadSha}
+//                                       → 200 { ok, merged, sha, prUrl, warnings? }
 //                                       | 4xx/5xx { error, item? }
 //   POST /approvals/:id/pushback {feedback}
 //                                       → 200 { ok, requeued, issueKey }
@@ -25,7 +26,10 @@ import { isMockMode } from "./fixtures";
 // (--match-head-commit); if the branch moved since gating the backend REFUSES
 // and the error ("branch moved since gating — needs re-gate") is rendered
 // verbatim on the card. The UI's job is context + explicit human intent, never
-// a second merge path.
+// a second merge path. That intent is bound to what was ON SCREEN: approve
+// sends back the gatedHeadSha of the fetched item it rendered, so a card left
+// open across a re-run (which supersedes the row) is refused as out of date
+// instead of merging evidence the human never read.
 // ---------------------------------------------------------------------------
 
 export type ApprovalStatus = "pending" | "stale" | "approved" | "pushed_back";
@@ -55,6 +59,9 @@ export interface WireApprovalItem {
   diffStat: string;
   costUsd: number;
   turns: number;
+  /** The stored gateSummary green does NOT describe this branch merged with
+   *  current main: the pre-merge re-gate against the combined head FAILED. */
+  regateFailed: boolean;
   status: ApprovalStatus;
   /** Why the row left pending — for a stale row this is the refusal reason. */
   resolution: string;
@@ -88,6 +95,11 @@ export interface ApprovalItem {
   diffStat: string | null;
   /** The SHA the gates ran against — what an approval merge is pinned to. */
   gatedHeadSha: string | null;
+  /** The green above is stale-by-construction: the factory re-gated this branch
+   *  against current main and the combined head FAILED. The card renders this
+   *  as its own red banner — approving is still allowed (the human is the
+   *  authority) but it must be an INFORMED override, not a misread strip. */
+  regateFailed: boolean;
   status: ApprovalStatus;
   /** Why the item can no longer be approved (e.g. branch moved since gating). */
   staleReason: string | null;
@@ -124,6 +136,9 @@ export function mapApprovalItem(w: WireApprovalItem): ApprovalItem {
     findings: w.findingsDigest.trim() === "" ? null : w.findingsDigest,
     diffStat: w.diffStat.trim() === "" ? null : w.diffStat,
     gatedHeadSha: w.gatedHeadSha,
+    // Absent on a row an older backend wrote → false (no banner), never
+    // undefined leaking into a `&&` render.
+    regateFailed: w.regateFailed === true,
     status,
     staleReason: status === "stale" && w.resolution.trim() !== "" ? w.resolution : null,
     handledAt: status === "pending" ? null : w.updatedAt,
@@ -187,6 +202,26 @@ export function testCountDelta(
     }
   }
   return null;
+}
+
+/** A URL safe to put in an href, or null to render it as inert text.
+ *
+ *  Card URLs (the PR link) arrive from the daemon, which built them from `gh`
+ *  output — not typed by the human looking at them. Only http(s) may become a
+ *  clickable target: `javascript:` executes in the dashboard's origin on click
+ *  and `data:`/`blob:` open attacker-controlled documents there. Parsed with
+ *  the URL parser rather than string-matched, so no encoding trick
+ *  ("java\tscript:", "JavaScript:") reaches the attribute. Absolute only —
+ *  every URL on a card is an absolute PR/ticket link, so a relative or
+ *  unparseable string is malformed and gets no href either. */
+export function safeHref(url: string | null): string | null {
+  if (url === null || url.trim() === "") return null;
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : null;
+  } catch {
+    return null; // unparseable / relative — never a link
+  }
 }
 
 /** Human-readable label for a handled row's terminal status. */
@@ -269,11 +304,13 @@ async function postAction(
   return { error };
 }
 
-export async function approveItem(id: string): Promise<ApprovalActionResponse> {
+/** Approve = "merge THIS, the thing on my screen". The caller passes the
+ *  gatedHeadSha of the item it rendered (never a re-read of fresher state), so
+ *  if the row was superseded between render and click the backend answers
+ *  "card out of date" and nothing merges. */
+export async function approveItem(id: string, gatedHeadSha: string | null): Promise<ApprovalActionResponse> {
   if (isMockMode()) return mockAct(id, "approved");
-  // guardedJsonBody requires a parseable JSON body on every mutation route —
-  // approve carries no fields, so it sends the empty object.
-  return postAction(id, "approve", {});
+  return postAction(id, "approve", { gatedHeadSha });
 }
 
 export async function pushbackItem(id: string, feedback: string): Promise<ApprovalActionResponse> {
@@ -316,19 +353,22 @@ function mockPending(): ApprovalItem[] {
       securityVerdict: "pass", tasteVerdict: "not-required",
       findingsDigest: "reviewer-claude: no blocking findings; suggested narrowing the config type.\nreviewer-codex: confirmed guarded-path change is additive only.",
       diffStat: "6 files · 250 changed lines", costUsd: 3.42, turns: 61,
-      status: "pending", resolution: "",
+      regateFailed: false, status: "pending", resolution: "",
     },
     {
       id: 29, createdAt: now - 55 * 60_000, updatedAt: now - 55 * 60_000,
       issueKey: "FAC-29", title: "Client portal: invoice export to CSV",
       repo: "rapido/portal", prUrl: "https://github.com/rapido/portal/pull/88",
       gatedHeadSha: "51fe0a92cc03",
-      holdReasons: "security review did not complete on a 842-line diff (stage error or no parseable verdict line) — cannot auto-merge unreviewed",
+      // Two holds at once — and the second is the known-red combination the
+      // card must shout about (regateFailed), not something to infer from a
+      // long joined string sitting under a green gate strip.
+      holdReasons: "security review did not complete on a 842-line diff (stage error or no parseable verdict line) — cannot auto-merge unreviewed; merge-integrity: branch was 3 commit(s) behind origin/main; after updating, gates FAILED against the combined head (test)",
       gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 204, to: 213 }] },
       securityVerdict: "none", tasteVerdict: "pass",
       findingsDigest: "reviewer-claude: CSV escaping fixed in round 2.\nreviewer-codex: flagged missing pagination on export query (fixed).",
       diffStat: "11 files · 696 changed lines", costUsd: 5.87, turns: 94,
-      status: "pending", resolution: "",
+      regateFailed: true, status: "pending", resolution: "",
     },
     {
       id: 31, createdAt: now - 26 * 3_600_000, updatedAt: now - 26 * 3_600_000,
@@ -339,7 +379,7 @@ function mockPending(): ApprovalItem[] {
       securityVerdict: "pass", tasteVerdict: "fail",
       findingsDigest: "design reviewer: cursor state machine is sound but the settings surface is cluttered.",
       diffStat: "4 files · 174 changed lines", costUsd: 2.11, turns: 40,
-      status: "pending", resolution: "",
+      regateFailed: false, status: "pending", resolution: "",
     },
     {
       id: 22, createdAt: now - 2 * 86_400_000, updatedAt: now - 2 * 86_400_000,
@@ -350,7 +390,7 @@ function mockPending(): ApprovalItem[] {
       gateSummary: { green: true, strength: "real", tests: [{ name: "test", from: 598, to: 597 }] },
       securityVerdict: "pass", tasteVerdict: "not-required",
       findingsDigest: "", diffStat: "2 files · 119 changed lines", costUsd: 1.09, turns: 22,
-      status: "pending", resolution: "",
+      regateFailed: false, status: "pending", resolution: "",
     },
   ];
   return wire.map(mapApprovalItem).filter((i) => !sessionHandled.has(i.id));

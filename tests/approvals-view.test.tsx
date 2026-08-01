@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   approveDisabledReason,
+  approveItem,
   mapApprovalItem,
+  safeHref,
   splitApprovals,
   statusLabel,
   testCountDelta,
@@ -28,7 +30,7 @@ function item(overrides: Partial<ApprovalItem> = {}): ApprovalItem {
     gates: { green: true, strength: "strong", tests: [] },
     securityVerdict: "pass", tasteVerdict: "not-required",
     findings: null, diffStat: null, gatedHeadSha: "abc123",
-    status: "pending", staleReason: null, handledAt: null,
+    regateFailed: false, status: "pending", staleReason: null, handledAt: null,
     ...overrides,
   };
 }
@@ -42,7 +44,7 @@ function wire(overrides: Partial<WireApprovalItem> = {}): WireApprovalItem {
     gateSummary: { green: true, strength: "strong", tests: [{ name: "test", from: 631, to: 640 }] },
     securityVerdict: "fail", tasteVerdict: "not-required",
     findingsDigest: "reviewer: fine", diffStat: "3 files · 96 changed lines",
-    costUsd: 2.5, turns: 33, status: "pending", resolution: "",
+    costUsd: 2.5, turns: 33, regateFailed: false, status: "pending", resolution: "",
     ...overrides,
   };
 }
@@ -75,6 +77,15 @@ describe("mapApprovalItem — the UI's copy of the backend wire contract", () =>
     const m = mapApprovalItem(wire({ status: "wat" as WireApprovalItem["status"] }));
     expect(m.status).toBe("stale");
     expect(approveDisabledReason(m)).not.toBeNull();
+  });
+
+  test("the re-gate-failed flag maps through; a row without it never renders the banner", () => {
+    expect(mapApprovalItem(wire({ regateFailed: true })).regateFailed).toBe(true);
+    expect(mapApprovalItem(wire()).regateFailed).toBe(false);
+    // An older backend omits the field entirely — must be false, not undefined.
+    const legacy = wire();
+    delete (legacy as Partial<WireApprovalItem>).regateFailed;
+    expect(mapApprovalItem(legacy).regateFailed).toBe(false);
   });
 
   test("empty strings become nulls the card treats as absent (pr/findings/diffStat/holdReasons)", () => {
@@ -173,6 +184,62 @@ describe("testCountDelta — the a→b ratchet evidence on the strip", () => {
 
   test("no slice carries counts → null (strip renders nothing)", () => {
     expect(testCountDelta([slice({ name: "typecheck" }), slice({ name: "build" })])).toBeNull();
+  });
+});
+
+describe("safeHref — only http(s) may become a clickable target", () => {
+  test("http/https pass through", () => {
+    expect(safeHref("https://github.com/acme/x/pull/1")).toBe("https://github.com/acme/x/pull/1");
+    expect(safeHref("http://127.0.0.1:8787/approvals")).toBe("http://127.0.0.1:8787/approvals");
+    expect(safeHref("https://linear.app/x/issue/FAC-1")).toBe("https://linear.app/x/issue/FAC-1");
+  });
+
+  test("script-bearing and document-bearing schemes get NO href", () => {
+    expect(safeHref("javascript:alert(1)")).toBeNull();
+    expect(safeHref("  JavaScript:alert(1)")).toBeNull();
+    expect(safeHref("java\tscript:alert(1)")).toBeNull();
+    expect(safeHref("data:text/html,<script>alert(1)</script>")).toBeNull();
+    expect(safeHref("blob:https://evil.example/x")).toBeNull();
+    expect(safeHref("vbscript:msgbox(1)")).toBeNull();
+    expect(safeHref("file:///etc/passwd")).toBeNull();
+  });
+
+  test("absent / malformed / relative is not a link either", () => {
+    expect(safeHref(null)).toBeNull();
+    expect(safeHref("   ")).toBeNull();
+    expect(safeHref("not a url")).toBeNull();
+    expect(safeHref("/runs/FAC-1")).toBeNull();
+  });
+});
+
+describe("approveItem sends the evidence the card rendered", () => {
+  // The client reads isMockMode() (window.location.search) and fetch; both are
+  // stubbed here so the request shape itself can be asserted without a DOM.
+  const realFetch = globalThis.fetch;
+  let lastRequest: { url: string; body: unknown } | null = null;
+
+  beforeAll(() => {
+    (globalThis as { window?: unknown }).window = { location: { search: "" } };
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
+      lastRequest = { url, body: JSON.parse(String(init?.body ?? "null")) };
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    }) as typeof fetch;
+  });
+  afterAll(() => {
+    globalThis.fetch = realFetch;
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  test("the gated head SHA on the card travels with the click (backend 409s a mismatch)", async () => {
+    const res = await approveItem("41", "abc123def456");
+    expect(res).toEqual({ ok: true, id: "41" });
+    expect(lastRequest?.url).toBe("/approvals/41/approve");
+    expect(lastRequest?.body).toEqual({ gatedHeadSha: "abc123def456" });
+  });
+
+  test("an item with no gated SHA sends null — never an omitted field the backend must guess at", async () => {
+    await approveItem("42", null);
+    expect(lastRequest?.body).toEqual({ gatedHeadSha: null });
   });
 });
 

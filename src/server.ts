@@ -505,8 +505,11 @@ export function startDashboard(): {
         if (guarded === null) return; // refusal already written
         const id = Number(approvalAction[1]);
         try {
+          // approve binds to the evidence the caller SAW: body.gatedHeadSha is
+          // the SHA rendered on their card, and a mismatch (superseded row,
+          // stale tab) is refused rather than merged — see approvals.ts.
           const result = approvalAction[2] === "approve"
-            ? await approveItem(id)
+            ? await approveItem(id, (guarded.body as { gatedHeadSha?: unknown } | null)?.gatedHeadSha)
             : await pushbackItem(id, (guarded.body as { feedback?: unknown } | null)?.feedback);
           res.writeHead(result.status, { "content-type": "application/json" });
           res.end(JSON.stringify(result.json));
