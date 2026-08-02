@@ -40,8 +40,11 @@ export function StageTimeline({ run }: { run: RunView }) {
         const width = Math.max(1.2, pct(end) - left);
         const running = s.finishedAt === null;
         return (
-          <div key={`${s.stage}-${i}`} className="group grid grid-cols-[10.5rem_1fr_9rem] items-center gap-3">
-            <div className="flex items-center justify-end gap-1.5 text-right">
+          <div key={`${s.stage}-${i}`} className="group grid grid-cols-1 gap-1 sm:grid-cols-[10.5rem_1fr_9rem] sm:items-center sm:gap-3">
+            {/* Mobile: name left + meta right on ONE wrapping line; the fixed
+                three-column grid left the nowrap meta ~9rem and it plowed into
+                the bar (live overlap scan 2026-08-02: "15m 15s" x "$0.4483"). */}
+            <div className="flex items-center gap-1.5 sm:justify-end sm:text-right">
               {s.degraded && (
                 <Badge variant="parked" className="px-1 text-[9.5px]">DEGRADED</Badge>
               )}
@@ -53,13 +56,13 @@ export function StageTimeline({ run }: { run: RunView }) {
                 title={`${s.model}${s.viaProxy ? " · via proxy" : ""}`}
               />
             </div>
-            <div className="relative h-7 rounded-md border border-line/60 bg-bg0">
+            <div className="relative order-3 h-5 rounded-md border border-line/60 bg-bg0 sm:order-none sm:h-7">
               <div
                 className={cn("absolute top-1 bottom-1 rounded border", segmentClass(s))}
                 style={{ left: `${left}%`, width: `${width}%` }}
               />
             </div>
-            <span className={cn("whitespace-nowrap text-right font-mono text-[10px]", running ? "text-live" : "text-fg-faint")}>
+            <span className={cn("order-2 -mt-1 font-mono text-[10px] sm:order-none sm:mt-0 sm:whitespace-nowrap sm:text-right", running ? "text-live" : "text-fg-faint")}>
               {secs((end - s.startedAt) / 1000)}
               {s.finishedAt !== null && <> · {s.turns}t · {usd(s.costUsd)}</>}
               {running && s.toolCalls > 0 && <> · {s.toolCalls} tools</>}
@@ -67,13 +70,13 @@ export function StageTimeline({ run }: { run: RunView }) {
           </div>
         );
       })}
-      <div className="mt-1 grid grid-cols-[10.5rem_1fr_9rem] gap-3">
-        <span />
+      <div className="mt-1 grid grid-cols-1 sm:grid-cols-[10.5rem_1fr_9rem] sm:gap-3">
+        <span className="hidden sm:block" />
         <div className="flex justify-between font-mono text-[9.5px] text-fg-faint">
           <span>t+0s</span>
           <span>{secs(span / 1000)}</span>
         </div>
-        <span />
+        <span className="hidden sm:block" />
       </div>
     </div>
   );

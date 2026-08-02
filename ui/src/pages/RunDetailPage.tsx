@@ -91,15 +91,15 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
   const bootstrap = recon?.bootstrap ?? null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3">
+    <div className="flex flex-col gap-3 lg:h-full lg:min-h-0">
       {/* header */}
       <div className="flex items-start gap-4">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
             <Link to="/runs" className="text-fg-faint transition-colors duration-100 hover:text-fg">
               <ArrowLeft className="size-3.5" strokeWidth={1.75} />
             </Link>
-            <span className="font-mono text-base font-medium text-fg">{run.issueKey}</span>
+            <span className="whitespace-nowrap font-mono text-base font-medium text-fg">{run.issueKey}</span>
             <OutcomeBadge status={run.status} />
             {outcomeClass && (
               <Tooltip
@@ -149,8 +149,8 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
       {/* body */}
       {/* Mobile/tablet: single column — the 7/5 split at 390px gave each column
     ~180px and wrapped model names letter-by-letter (live review 2026-08-02). */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
-        <div className="flex min-h-0 flex-col gap-3">
+      <div className="grid grid-cols-1 gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)] lg:overflow-y-auto">
+        <div className="flex flex-col gap-3 lg:min-h-0">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle>Stage timeline</CardTitle>
@@ -167,14 +167,14 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
               <StageDetail run={run} usageByStage={usageByStage} />
             </div>
           </Card>
-          <Card className="flex min-h-64 flex-1 flex-col">
+          <Card className="flex min-h-64 flex-col lg:flex-1">
             <CardHeader className="pb-1.5">
               <CardTitle>Agent activity</CardTitle>
             </CardHeader>
             <ToolFeed issueKey={run.issueKey} items={useLive ? undefined : recon?.feed} />
           </Card>
         </div>
-        <div className="flex min-h-0 flex-col gap-3">
+        <div className="flex flex-col gap-3 lg:min-h-0">
           <Card>
             <CardHeader className="pb-1.5">
               <CardTitle>Review findings</CardTitle>
