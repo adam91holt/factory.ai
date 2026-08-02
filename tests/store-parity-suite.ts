@@ -134,6 +134,44 @@ export function registerStoreParitySuite(
         expect(rows[1]?.flag).toBe(false);
       });
 
+      test("jsonb bound via ::text::jsonb round-trips as an OBJECT (register frontmatter/attach, 2026-08-02)", async () => {
+        // Live-found on the real driver: a bare `$n::jsonb` cast makes Bun.sql
+        // infer the param as jsonb and JSON-encode the ALREADY-stringified
+        // payload — storing a jsonb string scalar ('"{...}"') that the read
+        // path degrades to {}. PGlite binds the same param as text, so only
+        // the real-PG leg of this suite could ever catch it. `::text::jsonb`
+        // pins the param to text on both drivers; this is the write shape the
+        // register insert sites use.
+        await s.exec("CREATE TABLE IF NOT EXISTS parity_jsonb (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, doc JSONB NOT NULL)");
+        await s.exec("DELETE FROM parity_jsonb");
+        await s.exec("INSERT INTO parity_jsonb (doc) VALUES ($1::text::jsonb)",
+          [JSON.stringify({ roles: ["implementer"], projects: [] })]);
+        const rows = await s.query<{ t: unknown; roles: unknown }>(
+          "SELECT jsonb_typeof(doc) AS t, doc->'roles'->>0 AS roles FROM parity_jsonb");
+        expect(rows[0]?.t).toBe("object");
+        expect(rows[0]?.roles).toBe("implementer");
+      });
+
+      test("the migrate() repair unwraps a double-encoded jsonb string scalar", async () => {
+        // The damaged shape rows written before the fix hold, then the exact
+        // repair expression migrate() ships: (col #>> '{}')::jsonb guarded by
+        // jsonb_typeof = 'string'. Idempotent — a second pass matches nothing.
+        await s.exec("CREATE TABLE IF NOT EXISTS parity_jsonb (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, doc JSONB NOT NULL)");
+        await s.exec("DELETE FROM parity_jsonb");
+        await s.exec("INSERT INTO parity_jsonb (doc) VALUES (to_jsonb($1::text))",
+          [JSON.stringify({ roles: ["fixer"] })]);
+        const before = await s.query<{ t: unknown }>("SELECT jsonb_typeof(doc) AS t FROM parity_jsonb");
+        expect(before[0]?.t).toBe("string"); // the damaged shape, reproduced deliberately
+        for (let i = 0; i < 2; i++) { // twice: the repair must be idempotent
+          await s.exec(`UPDATE parity_jsonb SET doc = (doc #>> '{}')::jsonb
+            WHERE jsonb_typeof(doc) = 'string' AND left(doc #>> '{}', 1) = '{'`);
+        }
+        const after = await s.query<{ t: unknown; roles: unknown }>(
+          "SELECT jsonb_typeof(doc) AS t, doc->'roles'->>0 AS roles FROM parity_jsonb");
+        expect(after[0]?.t).toBe("object");
+        expect(after[0]?.roles).toBe("fixer");
+      });
+
       test("DOUBLE PRECISION keeps cents across a sum (why cost_usd is not REAL)", async () => {
         await reset();
         for (let i = 0; i < 3; i++) await s.exec("INSERT INTO parity (at, cost) VALUES ($1, $2)", [i, 0.01]);

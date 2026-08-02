@@ -275,6 +275,17 @@ const DDL: string[] = [
     created_by TEXT NOT NULL DEFAULT 'operator',
     UNIQUE (name, version))`,
   "CREATE UNIQUE INDEX IF NOT EXISTS skill_register_active ON skill_register(name) WHERE enabled",
+  // One-time data repair (2026-08-02): the Bun driver infers a bound param's
+  // type from a bare `::jsonb` cast and jsonb-encodes the pre-stringified
+  // JSON, storing a jsonb STRING SCALAR ('"{...}"') instead of an object —
+  // which the read path degrades to {} (empty frontmatter/attach). PGlite
+  // treats the same bind as text, so tests never saw it. The insert sites now
+  // bind `::text::jsonb`; these unwrap any rows written before the fix.
+  // Idempotent: the WHERE clause matches only the damaged shape.
+  `UPDATE agent_register SET frontmatter = (frontmatter #>> '{}')::jsonb
+     WHERE jsonb_typeof(frontmatter) = 'string' AND left(frontmatter #>> '{}', 1) = '{'`,
+  `UPDATE skill_register SET attach = (attach #>> '{}')::jsonb
+     WHERE jsonb_typeof(attach) = 'string' AND left(attach #>> '{}', 1) = '{'`,
 ];
 
 /** Create the full schema on `s`. Idempotent. */
@@ -1738,11 +1749,15 @@ interface RawSkillRegisterRow { id: unknown; name: string; version: unknown; des
   content: string; attach: unknown; content_hash: string; enabled: boolean; created_at: unknown; created_by: string }
 
 /** Normalise a jsonb column read back `::text` (or, defensively, as an already-
- *  parsed object) into a plain object. Anything else degrades to {}. */
+ *  parsed object) into a plain object. Anything else degrades to {}.
+ *  Parses AT MOST twice: once for the ::text read, and once more iff that
+ *  yields a string — the double-encoded shape a bare `::jsonb` bind under the
+ *  Bun driver used to write (jsonb string scalar holding JSON; see the
+ *  migrate() repair). Bounded, never recursive. */
 function jsonbObject(v: unknown): Record<string, unknown> {
   let parsed: unknown = v;
-  if (typeof v === "string") {
-    try { parsed = JSON.parse(v) as unknown; } catch { parsed = null; }
+  for (let i = 0; i < 2 && typeof parsed === "string"; i++) {
+    try { parsed = JSON.parse(parsed) as unknown; } catch { parsed = null; }
   }
   return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>) : {};
@@ -1928,7 +1943,7 @@ export async function insertAgentRegisterVersion(row: {
              UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
            )
            INSERT INTO agent_register (name, version, frontmatter, prompt, content_hash, enabled, created_at, created_by)
-           SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::jsonb, $3, $4, TRUE, $5, $6
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::text::jsonb, $3, $4, TRUE, $5, $6
            WHERE (SELECT COUNT(*) FROM deactivated) >= 0
            RETURNING id::float8 AS id, version::int AS version`,
           [row.name, fmJson, row.prompt, row.contentHash, now, row.createdBy]);
@@ -1981,7 +1996,7 @@ export async function insertSkillRegisterVersion(row: {
              UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
            )
            INSERT INTO skill_register (name, version, description, content, attach, content_hash, enabled, created_at, created_by)
-           SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::jsonb, $5, TRUE, $6, $7
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::text::jsonb, $5, TRUE, $6, $7
            WHERE (SELECT COUNT(*) FROM deactivated) >= 0
            RETURNING id::float8 AS id, version::int AS version`,
           [row.name, row.description, row.content, attachJson, row.contentHash, now, row.createdBy]);
