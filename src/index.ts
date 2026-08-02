@@ -13,7 +13,7 @@ import { runIntake } from "./intake.ts";
 import { bootstrapProject } from "./bootstrap.ts";
 import { EPIC_LABEL, INTAKE_LABEL, BOOTSTRAP_LABEL } from "./linear.ts";
 import { parseFactoryMeta, resolveTicketRoute } from "./meta.ts";
-import { selectRunnable, type Schedulable } from "./dag.ts";
+import { selectRunnable, deriveImplicitDeps, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
@@ -187,15 +187,28 @@ async function tick(): Promise<boolean> {
       const schedulable: Schedulable = { identifier: issue.identifier, dependsOn: meta.depends_on ?? [], touches: meta.touches ?? [] };
       return { issue, schedulable };
     });
+  // Implicit depends_on (issue #6 Part 2, dag.ts): when the decomposer gave
+  // two queued siblings overlapping `touches` but omitted the edge between
+  // them, derive the ordering (later ticket waits for the earlier one) instead
+  // of relying on the file mutex alone, which serializes without ordering.
+  // Explicit depends_on entries are never removed; children declaring no
+  // touches (or no overlap) pass through untouched — today's behavior. Each
+  // derived edge is logged loudly so the ordering is auditable, and the
+  // decomposer's omission is visible rather than silently papered over.
+  const { augmented, added } = deriveImplicitDeps(candidates.map((c) => c.schedulable));
+  for (const a of added) {
+    console.log(`[dag] implicit depends_on: ${a.identifier} now waits for ${a.dependsOn} (touches overlap: ${a.overlap}) — decomposer omitted the edge; explicit depends_on untouched`);
+  }
   // One dependency-state query per tick, and only when some candidate declares
-  // deps — negligible rate-limit impact. It re-validates the frontier against
-  // LIVE Linear state each tick (the freshness pattern), so a dep merged/closed
-  // out-of-band immediately unblocks its dependents. A LinearRateLimited here
-  // propagates up to tick()'s existing backoff, like every other query.
-  const depIds = [...new Set(candidates.flatMap((c) => c.schedulable.dependsOn))];
+  // (or was derived) deps — negligible rate-limit impact. It re-validates the
+  // frontier against LIVE Linear state each tick (the freshness pattern), so a
+  // dep merged/closed out-of-band immediately unblocks its dependents. A
+  // LinearRateLimited here propagates up to tick()'s existing backoff, like
+  // every other query.
+  const depIds = [...new Set(augmented.flatMap((c) => c.dependsOn))];
   const depTypes = depIds.length > 0 ? await fetchStatesByIdentifiers(depIds) : new Map<string, string>();
   const busyTouches = [...inFlight.values()];
-  const { run } = selectRunnable(candidates.map((c) => c.schedulable), (id) => depTypes.get(id), busyTouches, capacity);
+  const { run } = selectRunnable(augmented, (id) => depTypes.get(id), busyTouches, capacity);
   const runSet = new Set(run);
   const batch = candidates.filter((c) => runSet.has(c.schedulable.identifier));
   if (batch.length > 0) console.log(`[tick] claiming ${batch.length} (in-flight ${inFlight.size}/${config.caps.wipLimit})`);

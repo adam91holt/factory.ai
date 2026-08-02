@@ -8,6 +8,7 @@
 
 import { config } from "./config.ts";
 import { parsePrecondition } from "./precondition.ts";
+import { resolveTierModel, type RiskClass, type RiskRoutedStage } from "./risk.ts";
 
 export interface FactoryMeta {
   repo?: string;                       // org/name — machine-exact, no regex
@@ -305,6 +306,43 @@ const GATE_STAGES: ReadonlySet<keyof typeof config.models> = new Set([
 export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta): string {
   if (GATE_STAGES.has(stage)) return config.models[stage];
   return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? config.models[stage];
+}
+
+/** Did the TICKET explicitly request a model for this stage (models: entry,
+ *  the "*" wildcard, or the legacy scalar `model:`)? Always false for the
+ *  cross-vendor gate stages — meta is never consulted for them (GATE_STAGES
+ *  above), so nothing a description says can count as a pin there. Used by
+ *  resolveModelForRisk: an explicit, isKnownModel-validated ticket request is
+ *  a legitimate NARROWING (the ticket may request within the operator's
+ *  roster — docs/ticket-contract.md) and outranks the risk-tier adjustment. */
+export function metaPinsModel(stage: keyof typeof config.models, meta: FactoryMeta): boolean {
+  if (GATE_STAGES.has(stage)) return false;
+  return (meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model) !== undefined;
+}
+
+/** Risk-aware model resolution (issue #6 Part 2) for the risk-routed stages —
+ *  resolveModel's precedence chain with ONE extra, evidence-driven layer at
+ *  the bottom:
+ *
+ *    ticket meta pin (non-gate stages only, isKnownModel-validated)
+ *      > risk-tier model (risk.ts RISK_MODEL_TIERS × config.modelTiers —
+ *        BOTH inputs operator/code-owned: the table is in-code and the tier
+ *        models come from env vars, so no description-sourced value exists
+ *        anywhere in this leg; `risk` itself is derived by deriveRiskClass
+ *        from diff/worktree evidence, never ticket text)
+ *      > config.models[stage] (today's default).
+ *
+ *  The GATE_STAGES pin is inherited intact from resolveModel: for
+ *  reviewerClaude/reviewerCodex/securityReviewer the base is always
+ *  config.models[stage] and meta can never pin, so the ONLY thing risk can do
+ *  to a safety gate is swap in another operator-declared model — and
+ *  RISK_MODEL_TIERS never maps a gate stage below "standard", so it can only
+ *  ever be a STRONGER one. `risk === undefined` (caller has no evidence yet)
+ *  returns resolveModel verbatim — the additive path. */
+export function resolveModelForRisk(stage: RiskRoutedStage, meta: FactoryMeta, risk: RiskClass | undefined): string {
+  const base = resolveModel(stage, meta);
+  if (risk === undefined || metaPinsModel(stage, meta)) return base;
+  return resolveTierModel(stage, risk, config.modelTiers, base);
 }
 
 /** Per-stage reasoning-effort resolution (execution-profiles), the effort

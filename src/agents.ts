@@ -26,6 +26,11 @@ export interface StageResult {
   error?: string;
   degraded?: boolean;
   modelUsage?: ModelUsageCompact;
+  // Structured gate outputs (issue #6 Part 1): the SDK result's
+  // `structured_output`, present only when the stage ran with an outputFormat.
+  // Deliberately `unknown` — NOTHING consumes it except gate.ts's strict
+  // validator (resolveGateOutput), which fails CLOSED on any shape violation.
+  structured?: unknown;
 }
 
 interface StageOptions {
@@ -57,6 +62,15 @@ interface StageOptions {
   // runStage call this change didn't touch) gets the SDK's own default,
   // unchanged from before this field existed.
   effort?: Effort;
+  // Structured gate outputs: json_schema outputFormat passed straight through
+  // to the SDK. Smoke-tested 2026-08-02 (scripts/gate-smoke.ts) through
+  // CLIProxyAPI on deepseek-v4-flash-0731 / qwen3.8-max-preview / glm-5.2 and
+  // direct sonnet — all four return a schema-valid `structured_output`. The
+  // schema constant lives in gate.ts; only gate stages set this. A model that
+  // cannot satisfy the schema surfaces as subtype
+  // error_max_structured_output_retries → a stage ERROR (C7), which every gate
+  // caller already routes fail-closed.
+  outputFormat?: { type: "json_schema"; schema: Record<string, unknown> };
 }
 
 // B8: the SDK needs a strictly positive maxBudgetUsd to attempt real work, so a
@@ -431,6 +445,7 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
         maxTurns: opts.maxTurns,
         maxBudgetUsd: stageBudgetUsd(opts.budgetUsd),
         ...(opts.effort ? { effort: opts.effort } : {}),
+        ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads
@@ -484,6 +499,10 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
       : undefined;
     // Per-model token/cost usage (present on both success and error results).
     const modelUsage = compactModelUsage(result?.modelUsage);
+    // structured_output rides only on SUCCESS results (SDKResultSuccess) — an
+    // errored stage never carries one, so gate.ts's error-first precedence
+    // (resolveGateOutput) can never see a verdict from a failed run.
+    const structured = result !== null && "structured_output" in result ? result.structured_output : undefined;
     const out: StageResult = {
       label,
       text: typeof result?.result === "string" ? result.result : "",
@@ -492,6 +511,7 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
       wallSeconds: Math.round((Date.now() - t0) / 1000),
       error: subtypeError,
       ...(modelUsage ? { modelUsage } : {}),
+      ...(structured !== undefined ? { structured } : {}),
     };
     opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: out.costUsd, turns: out.turns,
       wallSeconds: out.wallSeconds, resultText: redactSecrets(out.text).clean.slice(0, 4000),
