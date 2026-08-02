@@ -237,6 +237,44 @@ const DDL: string[] = [
   `CREATE OR REPLACE TRIGGER trg_project_config_audit_guard
      BEFORE UPDATE OR DELETE ON project_config_audit
      FOR EACH ROW EXECUTE FUNCTION project_config_audit_guard()`,
+  // ---------------------------------------------------------------------------
+  // Issue #16 WP1: agent + skill REGISTERS — versioned prompt/skill content in
+  // Postgres, consulted PG-first by catalog.ts with the files as seed/fallback.
+  // Saves are APPEND-ONLY new versions (never UPDATE a version row) — rollback
+  // is "re-enable version N" — and the partial unique index makes "exactly one
+  // ACTIVE version per name" a DATABASE invariant, the same structural trick as
+  // idx_project_policy_one_active. frontmatter/attach are JSONB per the issue's
+  // mandate: unlike the events/policy TEXT columns these hold STRUCTURED config
+  // (a flat string map / an attach selector), not forensic logs, so jsonb's
+  // key-order normalisation is harmless. The drivers still disagree on how raw
+  // jsonb comes back (Bun: string, PGlite: object), so every read here selects
+  // it `::text` and JSON.parses in JS — one shape on both drivers, the same
+  // normalise-on-read discipline num() applies to numerics.
+  `CREATE TABLE IF NOT EXISTS agent_register (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    frontmatter JSONB NOT NULL,
+    prompt TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at BIGINT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'operator',
+    UNIQUE (name, version))`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS agent_register_active ON agent_register(name) WHERE enabled",
+  `CREATE TABLE IF NOT EXISTS skill_register (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    attach JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content_hash TEXT NOT NULL DEFAULT '',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at BIGINT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'operator',
+    UNIQUE (name, version))`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS skill_register_active ON skill_register(name) WHERE enabled",
 ];
 
 /** Create the full schema on `s`. Idempotent. */
@@ -426,6 +464,10 @@ export async function startEventStore(): Promise<void> {
     store = s;
     state = "open";
     writeHealthy = true;
+    // A daemon restart must pick up the register state the last process wrote —
+    // catalog.ts reads the snapshot synchronously, so it is loaded here once and
+    // then refreshed by every register write.
+    await refreshRegisterSnapshot();
     if (!subscribed) subscribed = bus.subscribe(enqueue);
   })().catch((error) => {
     opening = null;
@@ -1633,6 +1675,333 @@ export async function listProjectAudit(projectId: number, limit = 100): Promise<
 }
 
 // ---------------------------------------------------------------------------
+// Agent + skill register rows (issue #16 WP1) — persistence ONLY, same split as
+// every section above: WHAT gets written (parse, canonical hashing, secret
+// scanning, file import/export) lives in register-io.ts, and WHO consumes an
+// active row (PG-first card loading) lives in catalog.ts. db.ts owns the SQL,
+// the exactly-one-active discipline, and the in-memory ACTIVE-ROW SNAPSHOT +
+// GENERATION COUNTER that lets catalog.ts stay synchronous:
+//
+//   - every successful register write refreshes the snapshot and bumps the
+//     generation, so the NEXT getCard() sees the new row with no polling and
+//     no restart (the cache key in catalog.ts is the generation);
+//   - a closed store has an empty snapshot and a never-bumping generation, so
+//     a fresh checkout with no database behaves byte-identically to the
+//     file-only catalog (the additive-only pin).
+//
+// Structural validation (name charset, 64KB cap) is enforced HERE as well as in
+// register-io.ts — the helpers are the raw write path, and a cap that can be
+// bypassed by calling one layer lower is not a cap. The constants are
+// deliberately duplicated from catalog-manager.ts rather than imported:
+// catalog-manager imports db.ts, so importing back would be a cycle (the same
+// reason routing.ts duplicates KNOWN_GATE_NAMES).
+// ---------------------------------------------------------------------------
+
+const REGISTER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const MAX_REGISTER_CONTENT_BYTES = 64 * 1024;
+/** Attempts a register write makes when it keeps losing the one-active-per-name
+ *  index to a concurrent writer. IN-CODE CONSTANT, not an env knob (CLAUDE.md)
+ *  — same shape as MAX_APPROVAL_INSERT_ATTEMPTS / MAX_POLICY_ACTIVATE_ATTEMPTS. */
+const MAX_REGISTER_WRITE_ATTEMPTS = 3;
+const MAX_REGISTER_LIST_ROWS = 500;
+
+export interface AgentRegisterRow {
+  id: number; name: string; version: number;
+  /** Flat string map, exactly the shape catalog.ts's Card.frontmatter holds.
+   *  Non-string JSONB values are dropped on read — the register can never hand
+   *  routing/meta a shape the file parser could not have produced. */
+  frontmatter: Record<string, string>;
+  prompt: string;
+  /** Canonical content hash (register-io.ts) — the importer's idempotency key. */
+  contentHash: string;
+  enabled: boolean; createdAt: number; createdBy: string;
+}
+
+export interface SkillRegisterRow {
+  id: number; name: string; version: number;
+  description: string;
+  /** The SKILL.md body, verbatim. */
+  content: string;
+  /** {roles?, projects?, match?} carry-selector — consumed by a later WP; WP1
+   *  only stores and round-trips it. Repo facts only, never ticket text. */
+  attach: Record<string, unknown>;
+  contentHash: string;
+  enabled: boolean; createdAt: number; createdBy: string;
+}
+
+const AGENT_REGISTER_COLUMNS = "id::float8 AS id, name, version::int AS version, frontmatter::text AS frontmatter, prompt, content_hash, enabled, created_at::float8 AS created_at, created_by";
+const SKILL_REGISTER_COLUMNS = "id::float8 AS id, name, version::int AS version, description, content, attach::text AS attach, content_hash, enabled, created_at::float8 AS created_at, created_by";
+
+interface RawAgentRegisterRow { id: unknown; name: string; version: unknown; frontmatter: unknown;
+  prompt: string; content_hash: string; enabled: boolean; created_at: unknown; created_by: string }
+interface RawSkillRegisterRow { id: unknown; name: string; version: unknown; description: string;
+  content: string; attach: unknown; content_hash: string; enabled: boolean; created_at: unknown; created_by: string }
+
+/** Normalise a jsonb column read back `::text` (or, defensively, as an already-
+ *  parsed object) into a plain object. Anything else degrades to {}. */
+function jsonbObject(v: unknown): Record<string, unknown> {
+  let parsed: unknown = v;
+  if (typeof v === "string") {
+    try { parsed = JSON.parse(v) as unknown; } catch { parsed = null; }
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>) : {};
+}
+
+function toFlatStringMap(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(jsonbObject(v))) {
+    if (typeof val === "string") out[k] = val;
+  }
+  return out;
+}
+
+function toAgentRegisterRow(r: RawAgentRegisterRow): AgentRegisterRow {
+  return { id: num(r.id), name: r.name, version: num(r.version), frontmatter: toFlatStringMap(r.frontmatter),
+    prompt: r.prompt, contentHash: r.content_hash, enabled: r.enabled === true,
+    createdAt: num(r.created_at), createdBy: r.created_by };
+}
+
+function toSkillRegisterRow(r: RawSkillRegisterRow): SkillRegisterRow {
+  return { id: num(r.id), name: r.name, version: num(r.version), description: r.description,
+    content: r.content, attach: jsonbObject(r.attach), contentHash: r.content_hash,
+    enabled: r.enabled === true, createdAt: num(r.created_at), createdBy: r.created_by };
+}
+
+// --- The active-row snapshot + generation counter (catalog.ts's sync seam). ---
+
+let registerGen = 0;
+let agentRegisterSnapshot = new Map<string, AgentRegisterRow>();
+let skillRegisterSnapshot = new Map<string, SkillRegisterRow>();
+
+/** Monotone counter bumped on EVERY register change (write, rollback, store
+ *  open/close/truncate). catalog.ts keys its card cache on this, which is what
+ *  makes a register edit take effect on the next stage with no polling and no
+ *  restart. Synchronous module state, never a query. */
+export function registerGeneration(): number {
+  return registerGen;
+}
+
+/** The active agent register rows, by name — a snapshot refreshed on every
+ *  register write. Empty when the store is closed / the register is empty,
+ *  which is exactly the file-fallback (pre-register) behaviour. Synchronous so
+ *  catalog.ts's getCard stays sync. */
+export function activeAgentRegisterSnapshot(): ReadonlyMap<string, AgentRegisterRow> {
+  return agentRegisterSnapshot;
+}
+
+/** The active skill register rows, by name — same contract as the agent map. */
+export function activeSkillRegisterSnapshot(): ReadonlyMap<string, SkillRegisterRow> {
+  return skillRegisterSnapshot;
+}
+
+/** Reload the snapshot from the store (empty when closed) and bump the
+ *  generation. Called by every register write helper, by startEventStore (so a
+ *  daemon restart picks up register state), and by the test seam. */
+export async function refreshRegisterSnapshot(): Promise<void> {
+  if (!store) {
+    agentRegisterSnapshot = new Map();
+    skillRegisterSnapshot = new Map();
+    registerGen += 1;
+    return;
+  }
+  const agents = await listActiveAgentRegisterRows();
+  const skills = await listActiveSkillRegisterRows();
+  agentRegisterSnapshot = new Map(agents.map((r) => [r.name, r]));
+  skillRegisterSnapshot = new Map(skills.map((r) => [r.name, r]));
+  registerGen += 1;
+}
+
+// --- Reads. ---
+
+/** Every version of one name (or of every name), newest first, bounded. */
+export async function listAgentRegisterRows(name?: string): Promise<AgentRegisterRow[]> {
+  if (!store) return [];
+  const rows = name === undefined
+    ? await store.query<RawAgentRegisterRow>(
+        `SELECT ${AGENT_REGISTER_COLUMNS} FROM agent_register ORDER BY name, version DESC LIMIT $1`, [MAX_REGISTER_LIST_ROWS])
+    : await store.query<RawAgentRegisterRow>(
+        `SELECT ${AGENT_REGISTER_COLUMNS} FROM agent_register WHERE name = $1 ORDER BY version DESC LIMIT $2`, [name, MAX_REGISTER_LIST_ROWS]);
+  return rows.map(toAgentRegisterRow);
+}
+
+export async function listSkillRegisterRows(name?: string): Promise<SkillRegisterRow[]> {
+  if (!store) return [];
+  const rows = name === undefined
+    ? await store.query<RawSkillRegisterRow>(
+        `SELECT ${SKILL_REGISTER_COLUMNS} FROM skill_register ORDER BY name, version DESC LIMIT $1`, [MAX_REGISTER_LIST_ROWS])
+    : await store.query<RawSkillRegisterRow>(
+        `SELECT ${SKILL_REGISTER_COLUMNS} FROM skill_register WHERE name = $1 ORDER BY version DESC LIMIT $2`, [name, MAX_REGISTER_LIST_ROWS]);
+  return rows.map(toSkillRegisterRow);
+}
+
+/** The ONE active version for a name, or null (none active / store closed). */
+export async function getActiveAgentRegisterRow(name: string): Promise<AgentRegisterRow | null> {
+  if (!store) return null;
+  const rows = await store.query<RawAgentRegisterRow>(
+    `SELECT ${AGENT_REGISTER_COLUMNS} FROM agent_register WHERE name = $1 AND enabled`, [name]);
+  return rows[0] ? toAgentRegisterRow(rows[0]) : null;
+}
+
+export async function getActiveSkillRegisterRow(name: string): Promise<SkillRegisterRow | null> {
+  if (!store) return null;
+  const rows = await store.query<RawSkillRegisterRow>(
+    `SELECT ${SKILL_REGISTER_COLUMNS} FROM skill_register WHERE name = $1 AND enabled`, [name]);
+  return rows[0] ? toSkillRegisterRow(rows[0]) : null;
+}
+
+export async function listActiveAgentRegisterRows(): Promise<AgentRegisterRow[]> {
+  if (!store) return [];
+  const rows = await store.query<RawAgentRegisterRow>(
+    `SELECT ${AGENT_REGISTER_COLUMNS} FROM agent_register WHERE enabled ORDER BY name LIMIT $1`, [MAX_REGISTER_LIST_ROWS]);
+  return rows.map(toAgentRegisterRow);
+}
+
+export async function listActiveSkillRegisterRows(): Promise<SkillRegisterRow[]> {
+  if (!store) return [];
+  const rows = await store.query<RawSkillRegisterRow>(
+    `SELECT ${SKILL_REGISTER_COLUMNS} FROM skill_register WHERE enabled ORDER BY name LIMIT $1`, [MAX_REGISTER_LIST_ROWS]);
+  return rows.map(toSkillRegisterRow);
+}
+
+// --- Writes (append-only versions; exactly-one-active is the DB's invariant). ---
+
+/** Structural validation shared by both insert helpers. Returns an error string
+ *  or null. The cap and charset live in code, not env (CLAUDE.md). */
+function registerWriteViolation(name: string, contentBytes: number): string | null {
+  if (!REGISTER_NAME_RE.test(name)) return `register name ${JSON.stringify(name)} fails the charset lock`;
+  if (contentBytes > MAX_REGISTER_CONTENT_BYTES) return `register content exceeds the ${MAX_REGISTER_CONTENT_BYTES / 1024}KB cap`;
+  return null;
+}
+
+/** Append a NEW version of an agent card and make it the active one. The claim
+ *  pattern (deactivate-then-insert, retried on the unique-index conflict a
+ *  concurrent writer causes) keeps exactly-one-active true under any
+ *  interleaving — the partial index is the invariant, this loop is just how a
+ *  loser converges. Returns {id, version}, or null (closed store / validation
+ *  failure / lost the race MAX_REGISTER_WRITE_ATTEMPTS times). */
+export async function insertAgentRegisterVersion(row: {
+  name: string; frontmatter: Record<string, string>; prompt: string;
+  contentHash: string; createdBy: string;
+}): Promise<{ id: number; version: number } | null> {
+  if (!store) return null;
+  const fmJson = JSON.stringify(row.frontmatter);
+  const violation = registerWriteViolation(row.name, Buffer.byteLength(row.prompt, "utf8") + Buffer.byteLength(fmJson, "utf8"));
+  if (violation) {
+    console.error(`[db] agent register write refused: ${violation}`);
+    return null;
+  }
+  const now = Date.now();
+  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+    await store.exec("UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled", [row.name]);
+    try {
+      const rows = await store.query<{ id: unknown; version: unknown }>(
+        `INSERT INTO agent_register (name, version, frontmatter, prompt, content_hash, enabled, created_at, created_by)
+         SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::jsonb, $3, $4, TRUE, $5, $6
+         RETURNING id::float8 AS id, version::int AS version`,
+        [row.name, fmJson, row.prompt, row.contentHash, now, row.createdBy]);
+      const id = num(rows[0]?.id);
+      if (id > 0) {
+        await refreshRegisterSnapshot();
+        return { id, version: num(rows[0]?.version) };
+      }
+    } catch { /* one-active or (name,version) conflict — a concurrent writer; loop */ }
+  }
+  console.error(`[db] insertAgentRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
+  return null;
+}
+
+/** Append a NEW version of a skill pack and make it the active one. Same claim
+ *  discipline as insertAgentRegisterVersion. `attach` must be a plain object
+ *  ({roles/projects/match} selector) — it is stored verbatim as jsonb. */
+export async function insertSkillRegisterVersion(row: {
+  name: string; description: string; content: string; attach: Record<string, unknown>;
+  contentHash: string; createdBy: string;
+}): Promise<{ id: number; version: number } | null> {
+  if (!store) return null;
+  const attachJson = JSON.stringify(row.attach);
+  const violation = registerWriteViolation(row.name, Buffer.byteLength(row.content, "utf8") + Buffer.byteLength(attachJson, "utf8"));
+  if (violation) {
+    console.error(`[db] skill register write refused: ${violation}`);
+    return null;
+  }
+  const now = Date.now();
+  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+    await store.exec("UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled", [row.name]);
+    try {
+      const rows = await store.query<{ id: unknown; version: unknown }>(
+        `INSERT INTO skill_register (name, version, description, content, attach, content_hash, enabled, created_at, created_by)
+         SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::jsonb, $5, TRUE, $6, $7
+         RETURNING id::float8 AS id, version::int AS version`,
+        [row.name, row.description, row.content, attachJson, row.contentHash, now, row.createdBy]);
+      const id = num(rows[0]?.id);
+      if (id > 0) {
+        await refreshRegisterSnapshot();
+        return { id, version: num(rows[0]?.version) };
+      }
+    } catch { /* conflict — loop */ }
+  }
+  console.error(`[db] insertSkillRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
+  return null;
+}
+
+/** Flip one version's enabled flag. enabled=true is ROLLBACK — "make version N
+ *  the active one" — under the same deactivate-then-activate claim pattern (the
+ *  partial index turns any race into a retried conflict, never two active
+ *  rows). enabled=false disables JUST that version; disabling the active one
+ *  leaves the name with NO active version, which reads as file-fallback in
+ *  catalog.ts (fail towards the git-committed content, never towards a stale
+ *  row). Returns true when the named version exists and the state was applied. */
+async function setRegisterEnabled(table: "agent_register" | "skill_register", name: string, version: number, enabled: boolean): Promise<boolean> {
+  if (!store) return false;
+  // Static SQL per table — `table` is a two-value union from OUR callers, never
+  // caller-interpolated text, but keeping whole literals static preserves the
+  // cast-discipline lint's assumptions.
+  const probeSql = table === "agent_register"
+    ? "SELECT 1 AS n FROM agent_register WHERE name = $1 AND version = $2"
+    : "SELECT 1 AS n FROM skill_register WHERE name = $1 AND version = $2";
+  const disableOthersSql = table === "agent_register"
+    ? "UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2"
+    : "UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2";
+  const enableSql = table === "agent_register"
+    ? "UPDATE agent_register SET enabled = TRUE WHERE name = $1 AND version = $2"
+    : "UPDATE skill_register SET enabled = TRUE WHERE name = $1 AND version = $2";
+  const disableSql = table === "agent_register"
+    ? "UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND version = $2"
+    : "UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND version = $2";
+  // Existence probe FIRST: a rollback to a version that does not exist must be
+  // a no-op refusal, never "deactivate the current version and activate nothing".
+  const probe = await store.query(probeSql, [name, version]);
+  if (probe.length === 0) return false;
+  if (!enabled) {
+    await store.exec(disableSql, [name, version]);
+    await refreshRegisterSnapshot();
+    return true;
+  }
+  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+    await store.exec(disableOthersSql, [name, version]);
+    try {
+      const changed = await store.exec(enableSql, [name, version]);
+      if (changed > 0) {
+        await refreshRegisterSnapshot();
+        return true;
+      }
+      return false; // the row vanished between probe and update — refuse
+    } catch { /* a concurrent activation won the index — supersede it and retry */ }
+  }
+  console.error(`[db] setRegisterEnabled lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${table}/${name}@${version}`);
+  return false;
+}
+
+export async function setAgentRegisterEnabled(name: string, version: number, enabled: boolean): Promise<boolean> {
+  return setRegisterEnabled("agent_register", name, version, enabled);
+}
+
+export async function setSkillRegisterEnabled(name: string, version: number, enabled: boolean): Promise<boolean> {
+  return setRegisterEnabled("skill_register", name, version, enabled);
+}
+
+// ---------------------------------------------------------------------------
 // Test seam — an in-process PGlite (WASM Postgres) database with the full
 // schema, used only by the unit suite (no bus subscription, no write queue, no
 // file, no server, no port). Kept here so the module-level `store` handle stays
@@ -1656,7 +2025,7 @@ export { num as coerceNumeric };
 
 let testEngine: Store | null = null;
 
-const TEST_TABLES ="events, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit";
+const TEST_TABLES ="events, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit, agent_register, skill_register";
 
 export interface TestStoreOptions {
   /** Also wire the write-behind queue to the event bus, exactly as
@@ -1738,6 +2107,12 @@ export async function openTestDatabase(opts: TestStoreOptions = {}): Promise<voi
   inFlightEvents = 0;
   droppedEvents = 0;
   lastWriteError = null;
+  // The TRUNCATE above emptied both registers; the snapshot must agree, and the
+  // generation must MOVE (never reset — catalog.ts's cache entries from an
+  // earlier test would otherwise read as fresh at a re-used generation value).
+  agentRegisterSnapshot = new Map();
+  skillRegisterSnapshot = new Map();
+  registerGen += 1;
   if (opts.subscribeBus && !subscribed) subscribed = bus.subscribe(enqueue);
 }
 
@@ -1766,6 +2141,11 @@ export async function closeTestDatabase(): Promise<void> {
   inFlightEvents = 0;
   droppedEvents = 0;
   lastWriteError = null;
+  // Closed store = empty register snapshot (file-fallback behaviour), and the
+  // generation moves forward so no cached card survives the close.
+  agentRegisterSnapshot = new Map();
+  skillRegisterSnapshot = new Map();
+  registerGen += 1;
 }
 
 /** Test-only: insert a raw event row directly into the durable log, bypassing

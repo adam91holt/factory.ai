@@ -9,6 +9,7 @@ import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
 import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry, projectGroundskeeperRowsForCard } from "./db.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
+import type { StagePin } from "./skills.ts";
 
 // Groundskeepers — per-project loop MASTERS (roadmap "Groundskeeper spec v2").
 // Each groundskeepers/<name>.md is a scheduled work GENERATOR: on its cron it
@@ -312,9 +313,17 @@ function writeState(state: GkState): boolean {
 // Tick + run.
 // ---------------------------------------------------------------------------
 
-function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
+// `pins` (issue #16 WP2): stage label → version pins so run_stage_started
+// records which groundskeeper card ran. Groundskeeper cards live in
+// groundskeepers/*.md (never the agent register), so the pin is always
+// "<card>@0" — file-sourced by construction; no skills are carried.
+function forwardStage(issueKey: string, pins?: ReadonlyMap<string, StagePin>): (e: AgentStreamEvent) => void {
   return (e) => {
-    if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+    if (e.kind === "stage_started") {
+      const pin = pins?.get(e.stage);
+      bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy,
+        ...(pin ? { card: pin.card, skills: pin.skills } : {}) });
+    }
     else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
     else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
     else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });
@@ -543,7 +552,8 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
 
   const stage = await runStage("groundskeeper", prompt, {
     model: card.model, cwd, allowedTools, maxTurns: config.caps.turnsImplementer,
-    budgetUsd: card.budget.perRun, deadlineMs: deadline, onEvent: forwardStage(issueKey),
+    budgetUsd: card.budget.perRun, deadlineMs: deadline,
+    onEvent: forwardStage(issueKey, new Map<string, StagePin>([["groundskeeper", { card: `${card.name}@0`, skills: [] }]])),
   });
 
   const finish = (outcome: "planned" | "parked", reason: string): void => {

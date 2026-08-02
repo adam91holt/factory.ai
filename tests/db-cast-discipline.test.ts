@@ -30,7 +30,7 @@ const NUMERIC_COLUMNS = ["id", "at", "seq", "created_at", "updated_at", "turns"]
 /** Aggregates and window functions — always int8/numeric out of Postgres. */
 const AGGREGATES = ["COUNT(", "MAX(", "MIN(", "SUM(", "AVG(", "GREATEST(", "LEAST("];
 /** The two select lists db.ts builds from module constants. */
-const INTERPOLATED = ["LESSON_COLUMNS", "APPROVAL_COLUMNS", "TEST_TABLES", "PROJECT_COLUMNS", "POLICY_COLUMNS", "PROJECT_AUDIT_COLUMNS"];
+const INTERPOLATED = ["LESSON_COLUMNS", "APPROVAL_COLUMNS", "TEST_TABLES", "PROJECT_COLUMNS", "POLICY_COLUMNS", "PROJECT_AUDIT_COLUMNS", "AGENT_REGISTER_COLUMNS", "SKILL_REGISTER_COLUMNS"];
 
 /** Strip line and block comments so prose that merely says "SELECT" is ignored.
  *  The `[^:]` guard keeps `https://` style text from being read as a comment. */

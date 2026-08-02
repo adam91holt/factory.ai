@@ -8,7 +8,7 @@ import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
 import { liftPreconditions } from "./precondition.ts";
-import { renderPrompt, cardEffort, listRoutableCards } from "./catalog.ts";
+import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 import { lastParkReasonForIssue } from "./db.ts";
 
@@ -144,7 +144,9 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
       allowedTools: stewardTools.tools,
       maxTurns: config.caps.turnsFixer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline,
       onEvent: (e) => {
-        if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey: epic.identifier, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+        // Version pins (issue #16 WP2): the steward always runs its own card;
+        // no skills are carried outside the pipeline's repo-facts context.
+        if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey: epic.identifier, stage: e.stage, model: e.model, viaProxy: e.viaProxy, card: cardPin("steward"), skills: [] });
         else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey: epic.identifier, stage: e.stage, tool: e.tool, detail: e.detail });
         else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey: epic.identifier, stage: e.stage, text: e.text });
         else bus.emit({ type: "run_stage_finished", issueKey: epic.identifier, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });

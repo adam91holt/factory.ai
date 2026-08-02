@@ -14,8 +14,9 @@
 // all key on (`changed > 0`) — a governance property, pinned here against the
 // real server.
 //
-// The suite creates/drops only its own `parity` / `parity_pk` tables, so
-// running it against the live compose database never touches factory rows.
+// The suite creates/drops only its own `parity` / `parity_pk` / `parity_reg`
+// tables, so running it against the live compose database never touches
+// factory rows.
 // Connection: FACTORY_PG_INTEGRATION_URL wins; otherwise the compose defaults
 // (docker-compose.yml — user/db `factory`, 127.0.0.1:5460, password from
 // FACTORY_PG_PASSWORD or the checked-in local-dev default).

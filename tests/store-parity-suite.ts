@@ -60,6 +60,7 @@ export function registerStoreParitySuite(
       // where the database outlives the process).
       await s.exec("DROP TABLE IF EXISTS parity");
       await s.exec("DROP TABLE IF EXISTS parity_pk");
+      await s.exec("DROP TABLE IF EXISTS parity_reg");
       // Same column types db.ts's real DDL uses, so the shapes asserted below
       // are the shapes the daemon actually reads.
       await s.exec(`CREATE TABLE parity (
@@ -75,6 +76,7 @@ export function registerStoreParitySuite(
       if (!s) return; // boot failed — nothing to clean up or close
       await s.exec("DROP TABLE IF EXISTS parity").catch(() => {});
       await s.exec("DROP TABLE IF EXISTS parity_pk").catch(() => {});
+      await s.exec("DROP TABLE IF EXISTS parity_reg").catch(() => {});
       await s.close();
     });
 
@@ -206,6 +208,49 @@ export function registerStoreParitySuite(
         expect(deleted).toBe(1);
         const noop = await s.exec("DELETE FROM parity WHERE label = $1", ["a"]);
         expect(noop).toBe(0);
+      });
+
+      test("partial unique index — the registers' exactly-one-active invariant (issue #16)", async () => {
+        // agent_register/skill_register enforce "exactly one ACTIVE version per
+        // name" with `CREATE UNIQUE INDEX ... (name) WHERE enabled` plus
+        // UNIQUE(name, version). Both drivers must (a) REJECT a second active
+        // row, (b) accept any number of disabled versions, and (c) let the
+        // deactivate-then-activate claim pattern converge — the discipline
+        // insertAgentRegisterVersion / setRegisterEnabled are built on.
+        await s.exec(`CREATE TABLE IF NOT EXISTS parity_reg (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          name TEXT NOT NULL,
+          version INTEGER NOT NULL,
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          UNIQUE (name, version))`);
+        await s.exec("CREATE UNIQUE INDEX IF NOT EXISTS parity_reg_active ON parity_reg(name) WHERE enabled");
+        await s.exec("DELETE FROM parity_reg");
+
+        await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, TRUE)", ["card", 1]);
+        // (a) a second ACTIVE version is a loud conflict, not a second row.
+        await expect(
+          s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, TRUE)", ["card", 2]),
+        ).rejects.toThrow();
+        // (a') flipping a disabled row active while another is active — same.
+        await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, FALSE)", ["card", 2]);
+        await expect(
+          s.exec("UPDATE parity_reg SET enabled = TRUE WHERE name = $1 AND version = $2", ["card", 2]),
+        ).rejects.toThrow();
+        // (b) UNIQUE(name, version) — append-only versions can never collide.
+        await expect(
+          s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, FALSE)", ["card", 2]),
+        ).rejects.toThrow();
+        // (c) the claim pattern: deactivate the rest, then activate the target.
+        const off = await s.exec("UPDATE parity_reg SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2", ["card", 2]);
+        expect(off).toBe(1);
+        const on = await s.exec("UPDATE parity_reg SET enabled = TRUE WHERE name = $1 AND version = $2", ["card", 2]);
+        expect(on).toBe(1);
+        const active = await s.query<{ version: unknown }>(
+          "SELECT version::int AS version FROM parity_reg WHERE name = $1 AND enabled", ["card"]);
+        expect(active.length).toBe(1);
+        expect(active[0]?.version).toBe(2);
+        // A different NAME is untouched by the index.
+        await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, TRUE)", ["other", 1]);
       });
 
       test("ON CONFLICT DO NOTHING reports 0 affected — restorePushbackFeedback's contract", async () => {

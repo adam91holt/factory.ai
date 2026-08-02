@@ -148,6 +148,11 @@ export function applyEvent(mission: MissionState, e: FactoryEvent): MissionState
           ...run.stages,
           {
             stage: e.stage, model: e.model, viaProxy: e.viaProxy, startedAt: e.at,
+            // Version pins (issue #16 WP3) — kept in lockstep with the daemon
+            // reducer in src/server.ts (spread-conditional: old events fold
+            // byte-identically).
+            ...(e.card !== undefined ? { card: e.card } : {}),
+            ...(e.skills !== undefined ? { skills: e.skills } : {}),
             finishedAt: null, costUsd: 0, turns: 0, toolCalls: 0, lastActivity: "",
             resultText: "",
           },

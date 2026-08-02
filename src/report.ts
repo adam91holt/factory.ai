@@ -174,6 +174,12 @@ export function buildReport(input: ReportInput): string {
     lines.push(`      turns: ${s.turns}`);
     lines.push(`      wall_s: ${s.wallSeconds}`);
     lines.push(`      cost_usd: ${s.costUsd.toFixed(4)}`);
+    // Version pins (issue #16 WP2): the exact card prompt version the stage
+    // ran with ("name@version", 0 = file-fallback) and the register skills
+    // carried into its prompt. Rendered only when the loop attached them, so
+    // pin-less stages (and every pre-pin caller) stay byte-identical.
+    if (s.card) lines.push(`      card: ${s.card}`);
+    if (s.skills && s.skills.length > 0) lines.push(`      skills: ${JSON.stringify(s.skills.join(" "))}`);
     if (s.error) lines.push(`      error: ${JSON.stringify(s.error.slice(0, 200))}`);
     if (s.degraded) lines.push("      degraded: true");
   }

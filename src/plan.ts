@@ -5,7 +5,8 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
-import { renderPrompt, cardEffort, listRoutableCards } from "./catalog.ts";
+import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
+import type { StagePin } from "./skills.ts";
 import { roleTools } from "./routing.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
@@ -190,9 +191,16 @@ export async function createChildren(
   return created;
 }
 
-function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
+// `pins` (issue #16 WP2): stage label → version pins so run_stage_started
+// records the exact card version each planning stage ran with. Planning stages
+// run outside a repo-facts context, so no skills are carried (skills: []).
+function forwardStage(issueKey: string, pins?: ReadonlyMap<string, StagePin>): (e: AgentStreamEvent) => void {
   return (e) => {
-    if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+    if (e.kind === "stage_started") {
+      const pin = pins?.get(e.stage);
+      bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy,
+        ...(pin ? { card: pin.card, skills: pin.skills } : {}) });
+    }
     else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
     else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
     else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });
@@ -212,7 +220,10 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
   bus.emit({ type: "run_started", issueKey: issue.identifier, title: `[plan] ${issue.title}`, repo, dryRun: config.dryRun });
   const deadline = Date.now() + config.caps.wallMinutesPerIssue * 60_000;
   const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
-  const onEvent = forwardStage(issue.identifier);
+  const onEvent = forwardStage(issue.identifier, new Map<string, StagePin>([
+    ["scout", { card: cardPin("scout"), skills: [] }],
+    ["decomposer", { card: cardPin("decomposer"), skills: [] }],
+  ]));
   const stages: StageResult[] = [];
   // Per-epic model routing (execution-profiles): an epic's `model`/`models:`
   // meta overrides which model the scout/decomposer run on, resolved through

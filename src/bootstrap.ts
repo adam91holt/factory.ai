@@ -4,7 +4,8 @@ import * as linear from "./linear.ts";
 import { repoFromTicket, initScaffoldRepo, ghRepoCreate, commitAll, pushBranch, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
-import { renderPrompt, listRoutableCards } from "./catalog.ts";
+import { renderPrompt, cardPin, listRoutableCards } from "./catalog.ts";
+import type { StagePin } from "./skills.ts";
 import { roleTools } from "./routing.ts";
 import { markNeedsHuman, postStageComment } from "./loop.ts";
 import { withFactoryMeta } from "./meta.ts";
@@ -127,9 +128,15 @@ export function buildBootstrapEpic(plan: BootstrapPlan, issue: linear.Issue): { 
   return { title: `Build ${plan.slug}`, description };
 }
 
-function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
+// `pins` (issue #16 WP2): stage label → version pins so run_stage_started
+// records the scaffolder card version; no skills outside a repo-facts context.
+function forwardStage(issueKey: string, pins?: ReadonlyMap<string, StagePin>): (e: AgentStreamEvent) => void {
   return (e) => {
-    if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+    if (e.kind === "stage_started") {
+      const pin = pins?.get(e.stage);
+      bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy,
+        ...(pin ? { card: pin.card, skills: pin.skills } : {}) });
+    }
     else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
     else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
     else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });
@@ -142,7 +149,9 @@ export async function bootstrapProject(issue: linear.Issue): Promise<void> {
   const plan = parseBootstrapPlan(issue, config.bootstrapOrg);
   const repo = `${plan.org}/${plan.slug}`;
   const stages: StageResult[] = [];
-  const onEvent = forwardStage(issue.identifier);
+  const onEvent = forwardStage(issue.identifier, new Map<string, StagePin>([
+    ["scaffolder", { card: cardPin("scaffolder"), skills: [] }],
+  ]));
 
   const bootstrapFinished = (ok: boolean, r: string | null, reason: string): void => {
     bus.emit({ type: "bootstrap_finished", issueKey: issue.identifier, repo: r, ok, reason: redactSecrets(reason).clean.slice(0, 300) });

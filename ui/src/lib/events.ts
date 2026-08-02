@@ -74,8 +74,16 @@ export type FactoryEventBody =
   | { type: "issue_needs_human"; issueKey: string; reason: string }
   // ---- per-issue run lifecycle ----
   | { type: "run_started"; issueKey: string; title: string; repo: string; dryRun: boolean }
+  // run_stage_started version pins (issue #16 WP2, additive): `card` is the
+  // prompt card the stage runs with as "name@version" (version 0 = the
+  // agents/*.md file fallback — the register never mints version 0), `skills`
+  // the register skills carried into the prompt as ["name@version", ...].
+  // Optional so events persisted before pinning existed replay unchanged, and
+  // stages that render no card at all (verify-repair-N, intake-scout) simply
+  // omit them. This is what makes prompt changes ATTRIBUTABLE: telemetry can
+  // join a run against the exact prompt version that produced it.
   | { type: "run_stage_started"; issueKey: string; stage: string; model: string;
-      viaProxy: boolean }
+      viaProxy: boolean; card?: string; skills?: string[] }
   | { type: "run_tool_use"; issueKey: string; stage: string; tool: string;
       detail: string }                                 // detail: redacted, ≤160 chars
   | { type: "run_assistant_text"; issueKey: string; stage: string;
@@ -115,6 +123,11 @@ export interface StageView {
   stage: string;
   model: string;
   viaProxy: boolean;
+  /** Version pins (issue #16 WP3): the prompt card ("name@version", version 0
+   *  = file fallback) and carried skills this stage ran with. Optional —
+   *  events recorded before pinning existed fold with them absent. */
+  card?: string;
+  skills?: string[];
   startedAt: number;
   finishedAt: number | null;
   costUsd: number;          // 0 until finished

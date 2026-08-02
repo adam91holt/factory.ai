@@ -234,11 +234,25 @@ export function validateAgentCardRouting(
 ): string | null {
   let onDisk: Record<string, string> = {};
   try { onDisk = splitFrontmatter(readFileSync(file, "utf8")).frontmatter; } catch { /* new card */ }
+  return validateAgentRoutingAgainst(name, incoming, onDisk);
+}
+
+/** The pure core of validateAgentCardRouting: compare an incoming frontmatter
+ *  against a trusted BASELINE declaration (the on-disk file for /catalog/save;
+ *  the active register row for the PG register save route — issue #16 WP3).
+ *  Extracted rather than duplicated so the two browser-reachable write paths
+ *  cannot drift: whatever routing edit the file route refuses, the register
+ *  route refuses identically. */
+export function validateAgentRoutingAgainst(
+  name: string,
+  incoming: Record<string, string>,
+  baseline: Record<string, string>,
+): string | null {
   const norm = (v: string | undefined): string => (v ?? "").trim().replace(/^\[/, "").replace(/\]$/, "")
     .split(/[,\s]+/).filter(Boolean).join(" ");
   for (const key of ["role", "match"] as const) {
-    if (norm(incoming[key]) !== norm(onDisk[key])) {
-      return `refusing to change an agent card's \`${key}:\` routing declaration from the UI (on disk it is ${JSON.stringify(onDisk[key] ?? null)}) — routing decides which agent runs a stage, so it is an on-disk, git-committed edit only. The prompt body is freely editable here.`;
+    if (norm(incoming[key]) !== norm(baseline[key])) {
+      return `refusing to change an agent card's \`${key}:\` routing declaration from the UI (the trusted baseline has ${JSON.stringify(baseline[key] ?? null)}) — routing decides which agent runs a stage, so it is an on-disk, git-committed edit only. The prompt body is freely editable here.`;
     }
   }
   // Which ceiling this card's tools are measured against: a specialist's

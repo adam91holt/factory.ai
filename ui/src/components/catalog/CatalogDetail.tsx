@@ -1,4 +1,5 @@
-import { Eye, RotateCcw, Save } from "lucide-react";
+import type { ReactNode } from "react";
+import { Eye, FileDown, RotateCcw, Save } from "lucide-react";
 import type { CatalogKind, UsageStat } from "../../lib/catalog";
 import { usd } from "../../lib/format";
 import { Badge } from "../ui/badge";
@@ -30,10 +31,16 @@ export function CatalogDetail({
   saving,
   saveError,
   showDiff,
+  activeVersion,
+  saveLabel,
+  exporting,
+  beforeEditor,
+  afterEditor,
   onDraftChange,
   onToggleDiff,
   onSave,
   onReset,
+  onExport,
 }: {
   kind: CatalogKind;
   name: string;
@@ -46,16 +53,34 @@ export function CatalogDetail({
   saving: boolean;
   saveError: string | null;
   showDiff: boolean;
+  /** Register mode (issue #16 WP3): the ACTIVE register version, shown as a
+   *  badge. null = registered but nothing active; undefined = file-only. */
+  activeVersion?: number | null;
+  /** Save button label — "Save v3 to register" vs "Save & commit". */
+  saveLabel?: string;
+  exporting?: boolean;
+  /** Extra sections: attach editor above the source, version history below. */
+  beforeEditor?: ReactNode;
+  afterEditor?: ReactNode;
   onDraftChange: (v: string) => void;
   onToggleDiff: () => void;
   onSave: () => void;
   onReset: () => void;
+  /** File + git stays available ONLY as the export action (register mode). */
+  onExport?: () => void;
 }) {
   return (
     <div className="flex min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2.5">
         <h2 className="font-mono text-[15px] font-medium text-fg">{name}</h2>
         <Badge variant="outline" className="tracking-[0.04em]">{KIND_LABEL[kind]}</Badge>
+        {activeVersion !== undefined && (
+          activeVersion === null ? (
+            <Badge variant="parked" className="px-1.5">no active version</Badge>
+          ) : (
+            <Badge variant="claude" className="px-1.5">v{activeVersion}</Badge>
+          )
+        )}
         {usage ? (
           <span className="font-mono text-[10.5px] text-fg-faint">
             {usage.runs} runs · {usd(usage.costUsd)} · {usage.avgTurns.toFixed(1)} avg turns
@@ -69,24 +94,39 @@ export function CatalogDetail({
 
       <Separator />
 
-      <div className="flex items-center gap-2">
+      {beforeEditor}
+      {beforeEditor !== undefined && <Separator />}
+
+      <div className="flex flex-wrap items-center gap-2">
         <span className="section-label mr-auto">{SOURCE_LABEL[kind]}</span>
         {dirty && (
           <button
             type="button"
             onClick={onReset}
             disabled={saving}
-            className="flex items-center gap-1.5 rounded-md border border-line px-2 py-1 font-mono text-[11px] text-fg-dim transition-colors duration-100 hover:border-line2 hover:text-fg disabled:opacity-40"
+            className="flex min-h-11 items-center gap-1.5 rounded-md border border-line px-2 py-1 font-mono text-[11px] text-fg-dim transition-colors duration-100 hover:border-line2 hover:text-fg disabled:opacity-40 md:min-h-0"
           >
             <RotateCcw className="size-3" strokeWidth={1.75} />
             Discard
+          </button>
+        )}
+        {onExport && (
+          <button
+            type="button"
+            onClick={onExport}
+            disabled={exporting === true || dirty}
+            title={dirty ? "save (or discard) the draft first — export writes the ACTIVE register version" : "write the active register version to its file and git-commit it"}
+            className="flex min-h-11 items-center gap-1.5 rounded-md border border-line px-2 py-1 font-mono text-[11px] text-fg-dim transition-colors duration-100 hover:border-line2 hover:text-fg disabled:opacity-40 md:min-h-0"
+          >
+            <FileDown className="size-3" strokeWidth={1.75} />
+            {exporting ? "Exporting…" : "Export file+git"}
           </button>
         )}
         <button
           type="button"
           onClick={onToggleDiff}
           className={cn(
-            "flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[11px] transition-colors duration-100",
+            "flex min-h-11 items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[11px] transition-colors duration-100 md:min-h-0",
             showDiff
               ? "border-claude/40 bg-claude/10 text-claude"
               : "border-line text-fg-dim hover:border-line2 hover:text-fg",
@@ -99,10 +139,10 @@ export function CatalogDetail({
           type="button"
           onClick={onSave}
           disabled={!dirty || saving}
-          className="flex items-center gap-1.5 rounded-md border border-live/40 bg-live/10 px-2.5 py-1 font-mono text-[11px] text-live transition-colors duration-100 hover:bg-live/20 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint"
+          className="flex min-h-11 items-center gap-1.5 rounded-md border border-live/40 bg-live/10 px-2.5 py-1 font-mono text-[11px] text-live transition-colors duration-100 hover:bg-live/20 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-fg-faint md:min-h-0"
         >
           <Save className="size-3" strokeWidth={1.75} />
-          {saving ? "Saving…" : "Save & commit"}
+          {saving ? "Saving…" : saveLabel ?? "Save & commit"}
         </button>
       </div>
 
@@ -120,6 +160,8 @@ export function CatalogDetail({
         spellCheck={false}
         className="min-h-[22rem] w-full flex-1 resize-y rounded-lg border border-line bg-bg0 p-3 font-mono text-[12px] leading-[1.6] text-fg-dim outline-none transition-colors duration-100 focus:border-line2 focus:text-fg"
       />
+
+      {afterEditor}
     </div>
   );
 }
