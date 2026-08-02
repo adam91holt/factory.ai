@@ -1,0 +1,11 @@
+# Large generated graph exports invalidate Claude's prompt cache and are
+# queryable through Graphify instead. Keep the human README/report visible.
+graphify-out/
+docs/architecture/graphify/graph.json
+docs/architecture/graphify/graph.html
+docs/architecture/graphify/graph.svg
+docs/architecture/graphify/graph.graphml
+docs/architecture/graphify/graph-preview.png
+docs/architecture/graphify/GRAPH_TREE.html
+docs/architecture/graphify/factory-callflow.html
+docs/architecture/graphify/manifest.json

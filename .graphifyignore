@@ -1,0 +1,9 @@
+# Generated Graphify artifacts must not be re-ingested into the graph.
+graphify-out/
+docs/architecture/graphify/
+
+# Tracked production bundles duplicate the TypeScript source topology.
+ui/dist/
+
+# Reproducibility tooling is not part of the factory runtime architecture.
+scripts/refresh-graphify.sh

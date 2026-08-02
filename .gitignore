@@ -14,3 +14,6 @@ docker/cliproxy/config.yaml
 docker/cliproxy/auths/
 docker/cliproxy/logs/
 docker/cliproxy/plugins/
+
+# Graphify working state (curated exports live in docs/architecture/graphify/)
+graphify-out/
