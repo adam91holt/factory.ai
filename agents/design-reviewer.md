@@ -1,7 +1,7 @@
 ---
 name: design-reviewer
 model: designReviewer
-tools: [Read, Glob, Grep]
+tools: [Read, Glob, Grep, Bash]
 effort: high
 when: Taste gate — adversarial UI/UX reviewer, runs read-only over the worktree after the fixer when the diff touches UI files.
 ---

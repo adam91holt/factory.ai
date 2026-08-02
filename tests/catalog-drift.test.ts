@@ -123,25 +123,88 @@ function topLevelKeys(objSrc: string): string[] {
  * down fallback leg), the guarantee is the INTERSECTION of what every call
  * site supplies — a token only some call sites pass would still leak as
  * literal "{{token}}" text on the call sites that don't. */
-function scanRenderPromptCallSites(): Map<string, Set<string>> {
-  const perCardKeySets = new Map<string, Set<string>[]>();
-  const callSiteRe = /renderPrompt\(\s*(['"])([\w-]+)\1\s*,/g;
+
+// ---- agent routing (routing.ts) made the FIRST argument of renderPrompt
+// dynamic: loop.ts now calls renderPrompt(implRoute.card, …), where
+// `implRoute` came from route("<stage>", "<role>"). A card name is therefore
+// no longer a literal at the call site, and a scanner that only understood
+// literals would quietly find NO call site for implementer/fixer/tester/… and
+// pass vacuously — the exact failure mode this suite exists to prevent.
+//
+// So resolve the routed form too: map each `const <var> = route("stage",
+// "role")` to its role, then to EVERY card that role can resolve to (the
+// role's default card `agents/<role>.md`, plus any specialist card whose
+// frontmatter declares `role: <role>`). Each of those cards must have its
+// {{token}}s supplied by that call site — a new specialist that references a
+// token the call site doesn't pass fails here, exactly like a drifted default
+// card does.
+
+/** `const implRoute = route("implementer", "implementer");` → var → role. */
+function scanRouteVars(): Map<string, string> {
+  const out = new Map<string, string>();
+  const re = /const\s+([A-Za-z_$][\w$]*)\s*=\s*route\(\s*(['"])[\w-]+\2\s*,\s*(['"])([\w-]+)\3\s*\)/g;
   for (const file of readdirSync(SRC_DIR)) {
     if (!file.endsWith(".ts")) continue;
     const src = readFileSync(join(SRC_DIR, file), "utf8");
     let m: RegExpExecArray | null;
+    while ((m = re.exec(src))) out.set(m[1]!, m[4]!);
+  }
+  return out;
+}
+
+/** Every card a role can resolve to: its default card, plus specialists. */
+function cardsForRole(role: string): string[] {
+  const out = new Set<string>([role]);
+  for (const name of listCards()) {
+    if ((getCard(name)?.frontmatter.role ?? "").trim() === role) out.add(name);
+  }
+  return [...out];
+}
+
+function scanRenderPromptCallSites(): Map<string, Set<string>> {
+  const routeVars = scanRouteVars();
+  const perCardKeySets = new Map<string, Set<string>[]>();
+  // First arg: a string literal, OR a `<var>.card` produced by route(...).
+  const callSiteRe = /renderPrompt\(\s*(?:(['"])([\w-]+)\1|([A-Za-z_$][\w$]*)\.card)\s*,/g;
+  // Every renderPrompt( occurrence must be recognized by the pattern above —
+  // a new call-site idiom must fail loudly, never silently go unscanned.
+  const anyCallRe = /renderPrompt\(/g;
+  for (const file of readdirSync(SRC_DIR)) {
+    if (!file.endsWith(".ts")) continue;
+    if (file === "catalog.ts") continue; // renderPrompt's own definition
+    const src = readFileSync(join(SRC_DIR, file), "utf8");
+    const recognized = new Set<number>();
+    let m: RegExpExecArray | null;
     while ((m = callSiteRe.exec(src))) {
-      const name = m[2]!;
+      recognized.add(m.index);
+      let names: string[];
+      if (m[2] !== undefined) {
+        names = [m[2]];
+      } else {
+        const role = routeVars.get(m[3]!);
+        if (role === undefined) {
+          throw new Error(`catalog-drift scan: renderPrompt(${m[3]}.card, …) in ${file} — no \`const ${m[3]} = route("<stage>", "<role>")\` found; scanner needs updating`);
+        }
+        names = cardsForRole(role);
+      }
       let i = callSiteRe.lastIndex;
       while (i < src.length && /\s/.test(src[i]!)) i++;
       if (src[i] !== "{") {
-        throw new Error(`catalog-drift scan: renderPrompt("${name}", …) in ${file} is not followed by a { vars } object literal — scanner needs updating`);
+        throw new Error(`catalog-drift scan: renderPrompt(${names.join("|")}, …) in ${file} is not followed by a { vars } object literal — scanner needs updating`);
       }
       const close = findMatchingBrace(src, i);
-      if (close < 0) throw new Error(`catalog-drift scan: unbalanced vars object for renderPrompt("${name}") in ${file}`);
+      if (close < 0) throw new Error(`catalog-drift scan: unbalanced vars object for renderPrompt(${names.join("|")}) in ${file}`);
       const keys = topLevelKeys(src.slice(i, close + 1)).filter((k) => k !== "..." && !k.startsWith("???"));
-      if (!perCardKeySets.has(name)) perCardKeySets.set(name, []);
-      perCardKeySets.get(name)!.push(new Set(keys));
+      for (const name of names) {
+        if (!perCardKeySets.has(name)) perCardKeySets.set(name, []);
+        perCardKeySets.get(name)!.push(new Set(keys));
+      }
+    }
+    let a: RegExpExecArray | null;
+    while ((a = anyCallRe.exec(src))) {
+      if (!recognized.has(a.index)) {
+        throw new Error(`catalog-drift scan: unrecognized renderPrompt(...) call form in ${file} at offset ${a.index} — scanner needs updating`);
+      }
     }
   }
   const intersected = new Map<string, Set<string>>();
@@ -163,6 +226,12 @@ test("sanity: the call-site scanner actually found renderPrompt(...) usages", ()
   expect(callSiteVars.size).toBeGreaterThan(5);
   expect(callSiteVars.get("decomposer")).toEqual(new Set(["repo", "spec", "brief"]));
   expect(callSiteVars.get("intake-author")).toEqual(new Set(["spec", "brief", "answers"]));
+  // Routed call sites (renderPrompt(implRoute.card, …)) resolve through
+  // route("implementer", "implementer") to the default card AND every
+  // specialist declaring that role — so a specialist is covered by this guard
+  // the moment it lands, without anyone remembering to add it here.
+  expect(callSiteVars.get("implementer")).toEqual(new Set(["repo", "spec"]));
+  expect(callSiteVars.get("implementer-ui")).toEqual(new Set(["repo", "spec"]));
 });
 
 describe("every {{token}} in an agent card is supplied by its renderPrompt call site(s)", () => {

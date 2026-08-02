@@ -149,8 +149,8 @@ describe("buildMergeEvidence — external browser evidence lifts real → strong
   });
 });
 
-describe("recordShadowDecision — persistence + earning (in-memory sqlite)", () => {
-  afterEach(() => closeTestDatabase());
+describe("recordShadowDecision — persistence + earning (in-process PGlite seam)", () => {
+  afterEach(async () => { await closeTestDatabase(); });
 
   const cleanDecision = decideMerge("shadow", CLEAN, OPTS);
   const dirtyDecision = decideMerge("shadow", { ...CLEAN, green: false }, OPTS);
@@ -165,47 +165,66 @@ describe("recordShadowDecision — persistence + earning (in-memory sqlite)", ()
     config.mergeLadder.enrolled = config.mergeLadder.enrolled.filter((r) => !ENROLLED_TEST_REPOS.includes(r));
   });
 
-  test("N clean decisions promote the persisted tier shadow → auto-low-risk", () => {
-    openTestDatabase();
+  test("CONCURRENT same-repo decisions serialize — no lost update in the streak", async () => {
+    await openTestDatabase();
+    const repo = "acme/ladder-a";
+    // Fire 6 decisions WITHOUT awaiting between them — the exact interleaving
+    // WIP_LIMIT>1 produces when two same-repo issues finish together. Under the
+    // pre-mutex code the read-modify-write raced and updates were lost (streak
+    // < 6, or worse: a dirty run's reset overwritten by a stale clean read —
+    // auto-merge authority earned on a streak containing a failure).
+    const five = Array.from({ length: 5 }, (_, i) => recordShadowDecision(repo, `FAC-c${i}`, cleanDecision, CLEAN));
+    const one = recordShadowDecision(repo, "FAC-dirty", dirtyDecision, { ...CLEAN, green: false });
+    await Promise.all([...five, one]);
+    const final = await getLadderState(repo);
+    // All 6 must have landed (no lost update)…
+    expect(final?.totalShadow).toBe(6);
+    // …and the dirty run must be reflected: with the reset in the sequence the
+    // streak can be at most 5, never 6 (6 = the dirty write was lost).
+    expect(final!.cleanStreak).toBeLessThanOrEqual(5);
+  });
+
+  test("N clean decisions promote the persisted tier shadow → auto-low-risk", async () => {
+    await openTestDatabase();
     const repo = "acme/ladder-a";
     const N = config.mergeLadder.promoteAfter;
     let state: LadderState | null = null;
-    for (let i = 0; i < N; i++) state = recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
+    for (let i = 0; i < N; i++) state = await recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
     expect(state?.tier).toBe("auto-low-risk");
-    expect(getLadderState(repo)?.tier).toBe("auto-low-risk");
+    expect((await getLadderState(repo))?.tier).toBe("auto-low-risk");
   });
 
-  test("one dirty decision resets the streak", () => {
-    openTestDatabase();
+  test("one dirty decision resets the streak", async () => {
+    await openTestDatabase();
     const repo = "acme/ladder-b";
-    recordShadowDecision(repo, "FAC-1", cleanDecision, CLEAN);
-    recordShadowDecision(repo, "FAC-2", cleanDecision, CLEAN);
-    expect(getLadderState(repo)?.cleanStreak).toBe(2);
-    const after = recordShadowDecision(repo, "FAC-3", dirtyDecision, { ...CLEAN, green: false });
+    await recordShadowDecision(repo, "FAC-1", cleanDecision, CLEAN);
+    await recordShadowDecision(repo, "FAC-2", cleanDecision, CLEAN);
+    expect((await getLadderState(repo))?.cleanStreak).toBe(2);
+    const after = await recordShadowDecision(repo, "FAC-3", dirtyDecision, { ...CLEAN, green: false });
     expect(after.cleanStreak).toBe(0);
-    expect(getLadderState(repo)?.cleanStreak).toBe(0);
+    expect((await getLadderState(repo))?.cleanStreak).toBe(0);
   });
 
-  test("a self-repo never leaves human, however many clean decisions it earns", () => {
-    openTestDatabase();
+  test("a self-repo never leaves human, however many clean decisions it earns", async () => {
+    await openTestDatabase();
     const repo = "adam/factory";
     const N = config.mergeLadder.promoteAfter;
-    for (let i = 0; i < N + 2; i++) recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
+    for (let i = 0; i < N + 2; i++) await recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
     // The persisted earned tier may have climbed, but the EFFECTIVE tier the loop
     // uses is pinned to human by isSelfRepo — enrollment/ceiling/earning cannot override it.
-    expect(effectiveMergeTier(repo, getLadderState(repo))).toBe("human");
+    expect(effectiveMergeTier(repo, await getLadderState(repo))).toBe("human");
   });
 
-  test("returns the pure transition even when the store is closed (no throw)", () => {
+  test("returns the pure transition even when the store is closed (no throw)", async () => {
     // no openTestDatabase() — store is closed
-    const s = recordShadowDecision("acme/closed", "FAC-1", cleanDecision, CLEAN);
+    const s = await recordShadowDecision("acme/closed", "FAC-1", cleanDecision, CLEAN);
     expect(s.cleanStreak).toBe(1);
-    expect(getLadderState("acme/closed")).toBeNull();
+    expect(await getLadderState("acme/closed")).toBeNull();
   });
 });
 
 describe("recordShadowDecision — B9: earning is gated on isEnrolled (earn only after opt-in)", () => {
-  afterEach(() => closeTestDatabase());
+  afterEach(async () => { await closeTestDatabase(); });
 
   const cleanDecision = decideMerge("shadow", CLEAN, OPTS);
 
@@ -213,8 +232,8 @@ describe("recordShadowDecision — B9: earning is gated on isEnrolled (earn only
     expect(isEnrolled("acme/never-enrolled")).toBe(false);
   });
 
-  test("decisions on an UN-enrolled repo never advance (or even seed) the persisted ladder", () => {
-    openTestDatabase();
+  test("decisions on an UN-enrolled repo never advance (or even seed) the persisted ladder", async () => {
+    await openTestDatabase();
     const repo = "acme/not-enrolled";
     expect(config.mergeLadder.enrolled.includes(repo)).toBe(false);
     expect(config.autoMergeRepos.includes(repo)).toBe(false);
@@ -223,20 +242,20 @@ describe("recordShadowDecision — B9: earning is gated on isEnrolled (earn only
     // build a streak (and even promote to auto-low-risk) underneath an
     // un-enrolled repo, only surfacing the moment a human later enrolled it.
     let last: LadderState | null = null;
-    for (let i = 0; i < N + 2; i++) last = recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
-    expect(getLadderState(repo)).toBeNull();          // nothing was ever persisted
+    for (let i = 0; i < N + 2; i++) last = await recordShadowDecision(repo, `FAC-${i}`, cleanDecision, CLEAN);
+    expect(await getLadderState(repo)).toBeNull();          // nothing was ever persisted
     expect(last?.tier).toBe("shadow");                // and the returned state never advanced either
     expect(last?.cleanStreak).toBe(0);
-    expect(effectiveMergeTier(repo, getLadderState(repo))).toBe("human");
+    expect(effectiveMergeTier(repo, await getLadderState(repo))).toBe("human");
   });
 
-  test("enrolling AFTER accruing pre-enrollment decisions does not retroactively grant a streak", () => {
-    openTestDatabase();
+  test("enrolling AFTER accruing pre-enrollment decisions does not retroactively grant a streak", async () => {
+    await openTestDatabase();
     const repo = "acme/late-enroll";
     const N = config.mergeLadder.promoteAfter;
     // Pre-enrollment: N-1 clean decisions — a no-op on the persisted ladder.
-    for (let i = 0; i < N - 1; i++) recordShadowDecision(repo, `FAC-pre-${i}`, cleanDecision, CLEAN);
-    expect(getLadderState(repo)).toBeNull();
+    for (let i = 0; i < N - 1; i++) await recordShadowDecision(repo, `FAC-pre-${i}`, cleanDecision, CLEAN);
+    expect(await getLadderState(repo)).toBeNull();
 
     // A human now opts the repo in.
     config.mergeLadder.enrolled.push(repo);
@@ -244,11 +263,11 @@ describe("recordShadowDecision — B9: earning is gated on isEnrolled (earn only
       // If the pre-enrollment decisions HAD counted, this single post-
       // enrollment clean decision would already hit promoteAfter and promote.
       // It must not — earning starts counting from enrollment, at streak 0.
-      const first = recordShadowDecision(repo, "FAC-post-0", cleanDecision, CLEAN);
+      const first = await recordShadowDecision(repo, "FAC-post-0", cleanDecision, CLEAN);
       expect(first.cleanStreak).toBe(1);
       expect(first.tier).toBe("shadow");
       let state: LadderState | null = null;
-      for (let i = 1; i < N; i++) state = recordShadowDecision(repo, `FAC-post-${i}`, cleanDecision, CLEAN);
+      for (let i = 1; i < N; i++) state = await recordShadowDecision(repo, `FAC-post-${i}`, cleanDecision, CLEAN);
       expect(state?.tier).toBe("auto-low-risk");
     } finally {
       config.mergeLadder.enrolled = config.mergeLadder.enrolled.filter((r) => r !== repo);

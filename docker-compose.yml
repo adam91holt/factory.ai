@@ -1,0 +1,50 @@
+# The factory's durable store (replaces the former bun:sqlite factory.db).
+#
+# Postgres is the ONLY production path — there is no SQLite fallback and no
+# env-switchable second driver. The unit suite does NOT need this container:
+# tests run on an in-process @electric-sql/pglite (WASM Postgres) seam, so
+# `bun test` stays fast and hermetic. See src/store.ts.
+#
+#   bun run db:up      # docker compose up -d
+#   bun run db:psql    # psql shell inside the container (host has no psql)
+#   bun run db:down
+#
+# SECURITY: bound to 127.0.0.1 ONLY. This holds the factory's whole durable
+# event log (already redacted at emit, but still forensic data) plus the merge
+# ladder — the thing that grants merge authority. It must never be reachable
+# from the network. Port 5460 was verified free with `ss -ltn` before it was
+# chosen; the pre-existing `factory-postgres` container on this host is a
+# DIFFERENT project's database and is deliberately not reused.
+
+# Explicit project name: docker-compose.cliproxy.yml lives in this same
+# directory, and without this both files would share the directory-derived
+# project — so `bun run db:down` would report (and could remove) the CLIProxyAPI
+# container as an orphan. They are separate concerns; keep them separate.
+name: factory-fac
+
+services:
+  factory-postgres-fac:
+    image: postgres:17-alpine
+    container_name: factory-postgres-fac
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5460:5432"
+    environment:
+      POSTGRES_USER: factory
+      POSTGRES_DB: factory
+      # Local-dev default; override with FACTORY_PG_PASSWORD (and the matching
+      # FACTORY_DATABASE_URL) for anything that is not a loopback dev box.
+      POSTGRES_PASSWORD: ${FACTORY_PG_PASSWORD:-factory-local-dev}
+      # Deterministic collation/encoding so ORDER BY on text columns behaves the
+      # same on every machine that brings this up.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - factory-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  factory-pgdata:

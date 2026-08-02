@@ -5,7 +5,7 @@ import { mergePr as realMergePr, prHeadSha as realPrHeadSha } from "./repos.ts";
 import { postMergeTick } from "./postmerge.ts";
 import { notifyApproval, type ApprovalNotice } from "./notify.ts";
 import {
-  insertApproval, listPendingApprovals, pendingApprovalCount, getApproval,
+  insertApproval, pendingApprovalsPage, getApproval,
   claimApproval, finalizeApproval, recordPushbackFeedback,
   type ApprovalItem, type ApprovalGateTests, type ApprovalStatus,
 } from "./db.ts";
@@ -116,11 +116,11 @@ export interface ApprovalInput {
  *  loop.ts (defence in depth — same posture as post()). `notify` is injectable
  *  (the DeployDeps pattern) so tests can assert what leaves for the desktop
  *  without spawning osascript. */
-export function fileApproval(input: ApprovalInput, notify: (notice: ApprovalNotice) => void = notifyApproval): number | null {
+export async function fileApproval(input: ApprovalInput, notify: (notice: ApprovalNotice) => void = notifyApproval): Promise<number | null> {
   try {
     const clean = (s: string, cap: number): string => redactSecrets(s).clean.slice(0, cap);
     const title = clean(input.title, 300);
-    const id = insertApproval({
+    const id = await insertApproval({
       issueKey: input.issueKey,
       title,
       repo: input.repo,
@@ -152,10 +152,11 @@ export function fileApproval(input: ApprovalInput, notify: (notice: ApprovalNoti
   }
 }
 
-/** GET /approvals payload: full pending cards + the nav-badge count. */
-export function approvalsView(): { pending: ApprovalItem[]; count: number } {
-  const pending = listPendingApprovals();
-  return { pending, count: pendingApprovalCount() };
+/** GET /approvals payload: full pending cards + the nav-badge count. ONE query
+ *  (db.ts pendingApprovalsPage) rather than a list read plus a count read, so
+ *  the badge can never disagree with the rows next to it. */
+export async function approvalsView(): Promise<{ pending: ApprovalItem[]; count: number }> {
+  return pendingApprovalsPage();
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +164,9 @@ export function approvalsView(): { pending: ApprovalItem[]; count: number } {
 // ---------------------------------------------------------------------------
 
 export interface ApproveDeps {
-  getApproval: (id: number) => ApprovalItem | null;
-  claimApproval: (id: number, to: Exclude<ApprovalStatus, "pending">) => boolean;
-  finalizeApproval: (id: number, status: ApprovalStatus, resolution: string) => void;
+  getApproval: (id: number) => Promise<ApprovalItem | null>;
+  claimApproval: (id: number, to: Exclude<ApprovalStatus, "pending">) => Promise<boolean>;
+  finalizeApproval: (id: number, status: ApprovalStatus, resolution: string) => Promise<void>;
   prHeadSha: (repo: string, prUrl: string) => string | null;
   mergePr: (repo: string, prUrl: string, matchHeadSha: string) => { ok: boolean; out: string; headMoved: boolean };
   getIssue: (key: string) => Promise<linear.Issue>;
@@ -175,8 +176,8 @@ export interface ApproveDeps {
   transitionAfterMerge: (issue: linear.Issue) => Promise<void>;
   removeLabel: (issue: linear.Issue, name: string) => Promise<void>;
   /** The normal post-merge handling (deploy/smoke/revert tick) — exactly-once
-   *  guarded internally by deployAttempted, so calling it right after a human
-   *  merge is safe and just makes the deploy prompt instead of next-tick. */
+   *  guarded internally by claimDeploy's atomic INSERT, so calling it right after
+   *  a human merge is safe and just makes the deploy prompt instead of next-tick. */
   postMerge: () => Promise<void>;
 }
 
@@ -234,46 +235,46 @@ const defaultApproveDeps: ApproveDeps = {
  *       post-merge handling. Linear/postmerge failures after the merge are
  *       reported but the action is still a 200 — the merge HAPPENED. */
 export async function approveItem(id: number, requestedHeadSha: unknown, deps: ApproveDeps = defaultApproveDeps): Promise<ApprovalActionResult> {
-  const item = deps.getApproval(id);
+  const item = await deps.getApproval(id);
   if (!item) return { status: 404, json: { error: "no approval item with that id" } };
   if (!approvalEvidenceMatches(requestedHeadSha, item.gatedHeadSha)) {
     return { status: 409, json: { error: CARD_OUT_OF_DATE, item } };
   }
-  if (!deps.claimApproval(id, "approved")) {
+  if (!(await deps.claimApproval(id, "approved"))) {
     // Not pending (already decided, superseded, or a concurrent click won).
-    const now = deps.getApproval(id);
+    const now = await deps.getApproval(id);
     return { status: 409, json: { error: `item is ${now?.status ?? "gone"}, not pending`, item: now } };
   }
 
-  const stale = (reason: string): ApprovalActionResult => {
-    deps.finalizeApproval(id, "stale", reason);
+  const stale = async (reason: string): Promise<ApprovalActionResult> => {
+    await deps.finalizeApproval(id, "stale", reason);
     bus.emit({ type: "approval_stale", issueKey: item.issueKey, approvalId: id, reason });
-    return { status: 409, json: { error: reason, item: deps.getApproval(id) } };
+    return { status: 409, json: { error: reason, item: await deps.getApproval(id) } };
   };
 
   if (!item.gatedHeadSha) {
-    return stale("no gated head SHA was recorded for this run — cannot pin the merge to gated evidence; needs re-gate");
+    return await stale("no gated head SHA was recorded for this run — cannot pin the merge to gated evidence; needs re-gate");
   }
   const head = deps.prHeadSha(item.repo, item.prUrl);
   if (!head) {
     // Can't PROVE freshness — refuse, but keep the item retryable (a gh blip
     // must not permanently strand an approvable PR).
-    deps.finalizeApproval(id, "pending", "could not read the PR head from GitHub — freshness unproven, merge refused; retry");
+    await deps.finalizeApproval(id, "pending", "could not read the PR head from GitHub — freshness unproven, merge refused; retry");
     return { status: 502, json: { error: "could not read the PR head from GitHub — merge refused (retryable)" } };
   }
   if (head.toLowerCase() !== item.gatedHeadSha.toLowerCase()) {
-    return stale(STALE_BRANCH_MOVED);
+    return await stale(STALE_BRANCH_MOVED);
   }
 
   const merged = deps.mergePr(item.repo, item.prUrl, item.gatedHeadSha);
   if (!merged.ok) {
-    if (merged.headMoved) return stale(STALE_BRANCH_MOVED);
+    if (merged.headMoved) return await stale(STALE_BRANCH_MOVED);
     const out = redactSecrets(merged.out).clean.slice(0, 300);
-    deps.finalizeApproval(id, "pending", `merge failed (not a head mismatch): ${out} — retryable`);
+    await deps.finalizeApproval(id, "pending", `merge failed (not a head mismatch): ${out} — retryable`);
     return { status: 502, json: { error: `merge failed: ${out}` } };
   }
 
-  deps.finalizeApproval(id, "approved", `merged by human approval, pinned to ${item.gatedHeadSha.slice(0, 12)}`);
+  await deps.finalizeApproval(id, "approved", `merged by human approval, pinned to ${item.gatedHeadSha.slice(0, 12)}`);
   bus.emit({ type: "approval_granted", issueKey: item.issueKey, approvalId: id, prUrl: item.prUrl, sha: item.gatedHeadSha });
 
   // Linear closeout — mirrors loop.ts's post-mergePr announce/transition
@@ -306,10 +307,10 @@ export async function approveItem(id: number, requestedHeadSha: unknown, deps: A
 // ---------------------------------------------------------------------------
 
 export interface PushbackDeps {
-  getApproval: (id: number) => ApprovalItem | null;
-  claimApproval: (id: number, to: Exclude<ApprovalStatus, "pending">) => boolean;
-  finalizeApproval: (id: number, status: ApprovalStatus, resolution: string) => void;
-  recordFeedback: (issueKey: string, feedback: string) => boolean;
+  getApproval: (id: number) => Promise<ApprovalItem | null>;
+  claimApproval: (id: number, to: Exclude<ApprovalStatus, "pending">) => Promise<boolean>;
+  finalizeApproval: (id: number, status: ApprovalStatus, resolution: string) => Promise<void>;
+  recordFeedback: (issueKey: string, feedback: string) => Promise<boolean>;
   getIssue: (key: string) => Promise<linear.Issue>;
   postComment: (issue: linear.Issue, body: string) => Promise<void>;
   transition: (issue: linear.Issue, kind: linear.StateKind) => Promise<boolean>;
@@ -348,10 +349,10 @@ export async function pushbackItem(id: number, feedbackRaw: unknown, deps: Pushb
   if (feedback === null) {
     return { status: 400, json: { error: `body must be {"feedback": <non-empty string>} (capped at ${FEEDBACK_MAX_CHARS} chars)` } };
   }
-  const item = deps.getApproval(id);
+  const item = await deps.getApproval(id);
   if (!item) return { status: 404, json: { error: "no approval item with that id" } };
-  if (!deps.claimApproval(id, "pushed_back")) {
-    const now = deps.getApproval(id);
+  if (!(await deps.claimApproval(id, "pushed_back"))) {
+    const now = await deps.getApproval(id);
     return { status: 409, json: { error: `item is ${now?.status ?? "gone"}, not pending`, item: now } };
   }
 
@@ -361,18 +362,18 @@ export async function pushbackItem(id: number, feedbackRaw: unknown, deps: Pushb
     // the requeue below fails; the pipeline copy is the DB row, not this text.
     await deps.postComment(issue,
       `${linear.SENTINEL}\n\n**OWNER FEEDBACK** — pushed back from the approvals inbox; the pipeline will run a fix round with this directive:\n\n> ${feedback.split("\n").join("\n> ")}`);
-    deps.recordFeedback(item.issueKey, feedback);
+    await deps.recordFeedback(item.issueKey, feedback);
     await deps.removeLabel(issue, linear.NEEDS_HUMAN_LABEL).catch(() => { /* may not be present */ });
     await deps.removeLabel(issue, linear.PARKED_LABEL).catch(() => { /* may not be present */ });
     const moved = await deps.transition(issue, "queue");
     if (!moved) throw new Error("no queue (unstarted) state reachable on the team");
   } catch (error) {
     const why = redactSecrets(error instanceof Error ? error.message : String(error)).clean.slice(0, 300);
-    deps.finalizeApproval(id, "pending", `pushback failed (${why}) — rolled back to pending; retry`);
+    await deps.finalizeApproval(id, "pending", `pushback failed (${why}) — rolled back to pending; retry`);
     return { status: 502, json: { error: `pushback failed: ${why} (item back to pending — retry)` } };
   }
 
-  deps.finalizeApproval(id, "pushed_back", "owner feedback posted and issue requeued for a fix round");
+  await deps.finalizeApproval(id, "pushed_back", "owner feedback posted and issue requeued for a fix round");
   bus.emit({ type: "approval_pushed_back", issueKey: item.issueKey, approvalId: id, feedback: feedback.slice(0, 500) });
   return { status: 200, json: { ok: true, requeued: true, issueKey: item.issueKey } };
 }

@@ -5,7 +5,8 @@ import type { Issue } from "../src/linear.ts";
 function mkIssue(partial: Partial<Issue>): Issue {
   return {
     id: "id", identifier: "FAC-1", title: "Untitled", description: "", url: "https://x",
-    teamKey: "FAC", teamId: "team", stateName: "Todo", stateType: "unstarted", labels: [],
+    teamKey: "FAC", teamId: "team", stateName: "Todo", stateType: "unstarted",
+    stateDescription: "[factory:queue]", labels: [],
     createdAt: "2026-07-22T00:00:00.000Z", ...partial,
   };
 }

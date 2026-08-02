@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Workspace } from "./repos.ts";
+import type { RepoFacts } from "./routing.ts";
 
 // Capability-detecting, BASELINED verify gate. Hardened per code-review verdict
 // 2026-07-20: dependencies are installed before any gate runs — install failure
@@ -34,7 +35,7 @@ export interface GateResult {
 // Gap-2: browser/e2e scripts are gates too — a passing e2e gate is what lifts a
 // UI repo's verification from "real" (unit tests exist) to "strong" (the actual
 // app was driven). Kept conservative: only these exact script names count as e2e.
-const CANDIDATES = ["typecheck", "check", "build", "lint", "test", "test:ci", "test:unit", "test:e2e", "e2e", "test:browser", "playwright"];
+export const CANDIDATES = ["typecheck", "check", "build", "lint", "test", "test:ci", "test:unit", "test:e2e", "e2e", "test:browser", "playwright"];
 
 /** A gate whose script drives the real app end-to-end (browser/e2e), as opposed
  * to a unit-test gate. START/END-anchored so only the exact script names match —
@@ -298,4 +299,18 @@ export function hasUiSurface(ws: Workspace): boolean {
  * parks). */
 export function requiresBrowserEvidence(ws: Workspace): boolean {
   return hasUiSurface(ws) && hasPlaywright(ws);
+}
+
+/** Agent routing (routing.ts): the repo's own observable facts, and the ONLY
+ *  input a specialist card may be selected on. Everything here is read from
+ *  the WORKTREE — no ticket text reaches it, which is what makes card
+ *  selection immune to a description that asks for a different agent. Reuses
+ *  the existing detectors verbatim so a fact can never disagree with the gate
+ *  logic that already depends on it. */
+export function repoFacts(ws: Workspace, gates?: readonly string[]): RepoFacts {
+  return {
+    ui: hasUiSurface(ws),
+    playwright: hasPlaywright(ws),
+    gates: gates ?? detectGates(ws),
+  };
 }

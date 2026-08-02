@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { config } from "./config.ts";
 import { loadProjects, type ProjectCard } from "./registry.ts";
-import { deployAttempted, recordDeploy } from "./db.ts";
+import { claimDeploy, recordDeploy } from "./db.ts";
 import { ensureWorkspace, revertMerge as realRevertMerge, createRevertPr as realCreateRevertPr, type Workspace } from "./repos.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
@@ -16,7 +16,7 @@ import { bus } from "./events.ts";
 //     deployEnabled must both hold (the groundskeeper double-gate). Ships OFF.
 //   - TRUSTED COMMANDS ONLY: deploy/smoke come from the human-gated registry
 //     card (registry.ts), NEVER from ticket text (safety envelope d).
-//   - EXACTLY-ONCE: deployAttempted() guards against a second tick (or a
+//   - EXACTLY-ONCE: claimDeploy()'s atomic INSERT guards against a second tick (or a
 //     reconcile racing the merge→Done transition) re-deploying the same SHA.
 //   - FRESHNESS (Gap-4 interaction): deployAndVerify re-validates the SHA is
 //     still main's head before acting — a human who already reverted must not be
@@ -151,14 +151,15 @@ export async function postMergeTick(): Promise<void> {
     for (const repo of card.repos) {
       const sha = remoteHead(repo, "main");
       if (!sha) continue;
-      if (deployAttempted(repo, sha)) continue; // exactly-once — nothing to do
-      // Mark BEFORE acting (groundskeeper discipline): a crash mid-deploy must
-      // never re-fire the same SHA.
-      recordDeploy(repo, sha, "started");
+      // Atomic claim: the INSERT either lands (ours to deploy) or conflicts
+      // (already attempted — by a prior tick or a crash mid-deploy, which must
+      // never re-fire the same SHA). One statement, so there is no
+      // check-then-act window for a future concurrent caller to slip through.
+      if (!(await claimDeploy(repo, sha))) continue;
       const outcome = await deployAndVerify(repo, card, sha, "main").catch((error): DeployOutcome => ({
         ok: false, stage: "deploy", detail: error instanceof Error ? error.message : String(error), reverted: false,
       }));
-      recordDeploy(repo, sha, outcome.stage === "skipped" ? "skipped" : outcome.ok ? "ok" : outcome.reverted ? "reverted" : "failed");
+      await recordDeploy(repo, sha, outcome.stage === "skipped" ? "skipped" : outcome.ok ? "ok" : outcome.reverted ? "reverted" : "failed");
       bus.emit({ type: "deploy_finished", repo, sha, ok: outcome.ok, stage: outcome.stage, reverted: outcome.reverted, detail: redactSecrets(outcome.detail).clean.slice(0, 300) });
       if (outcome.stage !== "skipped") {
         console.log(`[postmerge] ${repo}@${sha.slice(0, 12)} → ${outcome.ok ? "ok" : outcome.reverted ? "reverted" : "failed"} (${outcome.stage})`);

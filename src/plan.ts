@@ -5,7 +5,8 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
-import { renderPrompt, cardEffort } from "./catalog.ts";
+import { renderPrompt, cardEffort, listRoutableCards } from "./catalog.ts";
+import { roleTools } from "./routing.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -233,7 +234,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     const scout = await runStage("scout",
       renderPrompt("scout", { spec },
         `You are the research scout in a software factory's planning stage. Investigate everything needed to break the epic below into parallel implementation tickets: read the repo in the current directory (structure, stack, conventions, reference/ material if present), and use WebSearch/WebFetch for anything external the epic depends on. Return a dense research brief: what exists, what must be built, data sources/APIs with concrete endpoints or file paths, risks, and a suggested split into independent work areas.\n\n${spec}`),
-      { model: resolveModel("scout", epicMeta), effort: resolveEffort("scout", epicMeta, cardEffort("scout")), cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("scout", epicMeta), effort: resolveEffort("scout", epicMeta, cardEffort("scout")), cwd: ws.dir, allowedTools: roleTools("scout", listRoutableCards()).tools, maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
     await postStageComment(issue, scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
@@ -254,7 +255,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
           "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
         ].join("\n")),
-      { model: resolveModel("planner", epicMeta), effort: resolveEffort("planner", epicMeta, cardEffort("decomposer")), cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("planner", epicMeta), effort: resolveEffort("planner", epicMeta, cardEffort("decomposer")), cwd: scratch, allowedTools: roleTools("decomposer", listRoutableCards()).tools, maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
     await postStageComment(issue, decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
@@ -293,7 +294,14 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // Error strings can interpolate HTTP bodies — redact at the outbound seam
     // (§2.2) so the ticket comment carries the WHY without carrying a secret.
     await linear.postComment(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — planner failed: ${redactSecrets(reason).clean.slice(0, 300)}`).catch(() => {});
-    if (!config.dryRun) await linear.addLabel(issue, linear.PARKED_LABEL).catch(() => {});
+    if (!config.dryRun) {
+      await linear.addLabel(issue, linear.PARKED_LABEL).catch(() => {});
+      // WP3 board stage: a failed decomposition is paused-and-retryable, so it
+      // lands in the Blocked column (unstarted — the Factory-Parked label is
+      // still what holds it out of the queue; degrades to the queue state on a
+      // board without the column).
+      await linear.transition(issue, "blocked").catch(() => {});
+    }
     // Pass the FULL reason — finish() redacts before its own truncation, and
     // pre-slicing here would cut a secret in half, defeating the exact-value
     // scrub (redactSecrets matches whole values only).

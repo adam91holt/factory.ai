@@ -114,6 +114,24 @@ export const config = {
 
   workRoot: expandHome(process.env.FACTORY_WORK_ROOT ?? "~/FactoryWork"),
 
+  // Durable store connection string (src/db.ts → src/store.ts). Postgres is the
+  // ONLY production path; the checked-in docker-compose.yml brings up the
+  // matching loopback instance on 127.0.0.1:5460 (`bun run db:up`).
+  //
+  // This is an env var and NOT an in-code constant on purpose, and it does not
+  // contradict "safety caps are in-code constants": a connection string is
+  // deployment topology, not a cap — there is no value of it that widens the
+  // factory's authority or removes a bound. It is also a SECRET (it carries the
+  // password), so it is scrubbed out of every worker env in agents.ts and is
+  // never emitted. Tests set it to "" (tests/setup.ts) and run on the in-process
+  // PGlite seam instead, so no test can ever reach a real database.
+  // UNSET falls back to the compose default. Explicitly EMPTY means "no
+  // database configured" and startEventStore() refuses to open one — that is
+  // what tests/setup.ts sets, so no unit test can ever reach a real Postgres.
+  databaseUrl: process.env.FACTORY_DATABASE_URL === undefined
+    ? "postgres://factory:factory-local-dev@127.0.0.1:5460/factory"
+    : process.env.FACTORY_DATABASE_URL.trim(),
+
   caps: {
     turnsImplementer: num("MAX_TURNS_IMPLEMENTER", 40),
     turnsReviewer: num("MAX_TURNS_REVIEWER", 8),

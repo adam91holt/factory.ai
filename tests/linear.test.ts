@@ -12,7 +12,7 @@ import type { Issue } from "../src/linear.ts";
 const mk = (identifier: string): Issue => ({
   id: `id-${identifier}`, identifier, title: "t", description: "", url: "https://linear.app/x",
   teamKey: "FAC", teamId: "team-1", stateName: "In Progress", stateType: "started",
-  labels: ["Factory-Executing"], createdAt: "2026-07-01T00:00:00.000Z",
+  stateDescription: "[factory:working]", labels: ["Factory-Executing"], createdAt: "2026-07-01T00:00:00.000Z",
 });
 
 describe("filterOrphanedIssues", () => {

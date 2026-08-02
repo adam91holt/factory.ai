@@ -17,7 +17,7 @@ import { selectRunnable, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
-import { startEventStore } from "./db.ts";
+import { startEventStore, flushEvents } from "./db.ts";
 import { isDraining } from "./control.ts";
 import { startAlerts } from "./alerts.ts";
 import { startSpendCap } from "./spend-cap.ts";
@@ -220,7 +220,7 @@ async function main(): Promise<void> {
     // /state honestly reports daemon: null. No lease either: a viewer must not
     // block (or unlock) a real daemon — the port collision is the real guard,
     // and server.ts exits non-zero on a failed bind in this mode.
-    const dashboard = startDashboard();
+    const dashboard = await startDashboard();
     if (!dashboard) throw new Error("--server-only requires the dashboard enabled (set DASHBOARD_PORT, not 0)");
     console.log("factory --server-only: mission control up, Linear polling disabled — Ctrl-C to exit");
     await new Promise<void>((resolve) => {
@@ -236,7 +236,7 @@ async function main(): Promise<void> {
   // --once/--dry-run/DASHBOARD_PORT=0 all resolve the dashboard port to null,
   // but steward closeout (childStatusBlock → lastParkReasonForIssue) and
   // groundskeeper governance both read from this store on every tick.
-  startEventStore();
+  await startEventStore();
   // Self-heal orphaned claims from a prior process (restart mid-run) before we
   // start ticking, so in-flight tickets resume instead of stranding In-Progress.
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);
@@ -245,7 +245,7 @@ async function main(): Promise<void> {
   // burst (queue fetch + steward/reconcile/groundskeeper/postmerge) — see
   // pace() above.
   await pace();
-  const dashboard = startDashboard();
+  const dashboard = await startDashboard();
   // Prerequisite-0 (B6 kill switch / T5 spend cap + alerting, docs/planning/
   // autonomy.md "Build order" item 0): wire both bus subscribers before the
   // tick loop starts so the very first stage's spend and the very first
@@ -287,6 +287,9 @@ async function main(): Promise<void> {
           error: redactSecrets(error instanceof Error ? error.message : String(error)).clean.slice(0, 300) });
       }
     }
+    // Write-behind event queue (db.ts): drain at the tick boundary so steady-
+    // state queue depth is bounded by ONE tick's emissions, not by uptime.
+    await flushEvents();
     if (config.oneShot || draining) break;
     // Adaptive polling: fast when idle so new tickets get picked up quickly,
     // standard cadence while work is in flight.
@@ -299,6 +302,9 @@ async function main(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 10_000));
   }
   bus.emit({ type: "daemon_stopped", reason: config.oneShot ? "one_shot" : "drained" });
+  // Last flush AFTER the final emit — the daemon_stopped row must reach the
+  // durable log before the process exits.
+  await flushEvents();
   await dashboard?.close();
   rmSync(LEASE, { force: true });
 }

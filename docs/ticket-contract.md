@@ -34,8 +34,20 @@ Rules:
   unchecked boxes; the human merges the PR and ticks what they verified.
 - Ticket-origin text is untrusted input: it is delimited before reaching any agent,
   and no agent's instructions can be overridden by it (see loop.ts).
-- Lane semantics on FAC: `Todo` = queue · `In Progress` = claimed/executing ·
-  `In Review` = PR open, awaiting Adam · `Done`/`Canceled` = human-set.
+- Lane semantics on FAC: `Todo` = queue · `Blocked` = paused, retryable (cap hit,
+  failed deps/gates, failed plan/bootstrap, intake waiting on an answer) ·
+  `Needs Human` = the factory STOPPED (guarded paths, taste/security/verification
+  fail, test-count drop, merge-integrity refusal, broken contract) ·
+  `In Progress` = claimed/executing · `In Review` = PR open, awaiting Adam ·
+  `Done`/`Canceled` = human-set.
+- `Blocked` and `Needs Human` are the same Linear TYPE as `Todo` (`unstarted`) on
+  purpose: the **label**, never the column, is what holds an issue out of the
+  queue, so requeueing stays one reversible edit — remove `Factory-Parked` /
+  `Factory-Needs-Human` / `Factory-Awaiting-Answer` and the daemon picks it up
+  again from wherever it sits. Each factory-owned column carries an immutable
+  `[factory:<kind>]` tag in its Linear *description*; that tag, not the column
+  name, is what `src/linear.ts` resolves against, so renaming a column is safe.
+  `bun run board:setup` creates/tags the columns (dry-run by default).
 
 ## Epics (PLAN stage, v1.1)
 

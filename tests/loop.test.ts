@@ -8,7 +8,7 @@ import type { Workspace } from "../src/repos.ts";
 const issue = (description: string): Issue => ({
   id: "id-1", identifier: "FAC-1", title: "t", description, url: "https://linear.app/x",
   teamKey: "FAC", teamId: "team-1", stateName: "Todo", stateType: "unstarted",
-  labels: [], createdAt: "2026-07-01T00:00:00.000Z",
+  stateDescription: "[factory:queue]", labels: [], createdAt: "2026-07-01T00:00:00.000Z",
 });
 
 const FULL_CONTRACT = [

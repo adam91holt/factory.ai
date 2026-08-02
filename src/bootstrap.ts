@@ -4,7 +4,8 @@ import * as linear from "./linear.ts";
 import { repoFromTicket, initScaffoldRepo, ghRepoCreate, commitAll, pushBranch, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline } from "./verify.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
-import { renderPrompt } from "./catalog.ts";
+import { renderPrompt, listRoutableCards } from "./catalog.ts";
+import { roleTools } from "./routing.ts";
 import { markNeedsHuman, postStageComment } from "./loop.ts";
 import { withFactoryMeta } from "./meta.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -170,6 +171,10 @@ export async function bootstrapProject(issue: linear.Issue): Promise<void> {
   const park = async (reason: string): Promise<void> => {
     await linear.postComment(issue, `${linear.SENTINEL}\n\n**Outcome:** parked — bootstrap of ${repo} failed: ${redactSecrets(reason).clean.slice(0, 300)}`).catch(() => {});
     await linear.addLabel(issue, linear.PARKED_LABEL).catch(() => {});
+    // WP3 board stage: a failed bootstrap is paused-and-retryable → Blocked
+    // column (same unstarted type, label still owns queue exclusion; degrades to
+    // the queue state on a board without the column).
+    await linear.transition(issue, "blocked").catch(() => {});
     bootstrapFinished(false, repo, reason);
     console.error(`[${issue.identifier}] bootstrap parked: ${reason}`);
   };
@@ -194,7 +199,7 @@ export async function bootstrapProject(issue: linear.Issue): Promise<void> {
           "Do NOT add heavy dependencies; keep it minimal so `install` is fast. Do NOT write any secrets. When done, reply with a one-paragraph summary.",
           "", spec,
         ].join("\n")),
-      { model: config.models.implementer, cwd: ws.dir, allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "Bash(bun:*)", "Bash(bunx:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(git status:*)", "Bash(ls:*)", "Bash(cat:*)"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: config.models.implementer, cwd: ws.dir, allowedTools: roleTools("scaffolder", listRoutableCards()).tools, maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scaffolder);
     await postStageComment(issue, scaffolder);
     if (scaffolder.error) { await park(`scaffolder: ${scaffolder.error}`); return; }

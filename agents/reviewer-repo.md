@@ -1,7 +1,7 @@
 ---
 name: reviewer-repo
 model: reviewerCodex
-tools: [Read, Glob, Grep]
+tools: [Read, Glob, Grep, Bash]
 effort: high
 when: Adversarial reviewer B — blast radius and integration with read-only repo access; falls back to a Claude reviewer when the Codex leg is down.
 ---

@@ -5,7 +5,8 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
-import { renderPrompt } from "./catalog.ts";
+import { renderPrompt, listRoutableCards } from "./catalog.ts";
+import { roleTools } from "./routing.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
@@ -133,7 +134,7 @@ export async function runIntake(issue: linear.Issue): Promise<void> {
     const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
     const scout = await runStage("intake-scout",
       `You are the research scout for a software factory's INTAKE stage. A human filed a rough idea (below). Research what it would take to specify it as a buildable epic: if a repo is in the current directory, read its stack/conventions; use WebSearch/WebFetch for external context. Return a dense brief: what exists, what is ambiguous, and what a complete contract needs.\n\n${spec}`,
-      { model: config.models.scout, cwd: scoutCwd, allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"], maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: config.models.scout, cwd: scoutCwd, allowedTools: roleTools("scout", listRoutableCards()).tools, maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
     await postStageComment(issue, scout);
 
@@ -149,7 +150,7 @@ export async function runIntake(issue: linear.Issue): Promise<void> {
           `  (B) If genuinely blocked: reply with a line "QUESTIONS:" followed by a bullet list of the specific questions (each "- <question>"). Do NOT write a contract file when you have real questions.`,
           "", spec, "", untrusted(`SCOUT BRIEF:\n${scout.text}`), answersBlock,
         ].join("\n")),
-      { model: config.models.planner, cwd: scratch, allowedTools: ["Write", "Read"], maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: config.models.planner, cwd: scratch, allowedTools: roleTools("intake-author", listRoutableCards()).tools, maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(author);
     await postStageComment(issue, author);
     if (author.error) { await markNeedsHuman(issue, `intake author failed: ${author.error}`, repo ?? undefined); finish("needs_human", `author error: ${author.error}`); return; }
@@ -172,6 +173,11 @@ export async function runIntake(issue: linear.Issue): Promise<void> {
       ].join("\n");
       await linear.postComment(issue, body).catch((e) => console.error(`[${issue.identifier}] intake questions comment failed: ${e}`));
       await linear.addLabel(issue, linear.AWAITING_ANSWER_LABEL).catch((e) => console.error(`[${issue.identifier}] awaiting label failed: ${e}`));
+      // WP3 board stage: intake asked a question and is waiting on the human —
+      // paused and retryable, so it shows in the Blocked column. The
+      // Factory-Awaiting-Answer label still owns queue exclusion, so answering
+      // + removing the label remains a single reversible edit.
+      await linear.transition(issue, "blocked").catch((e) => console.error(`[${issue.identifier}] blocked transition failed: ${e}`));
       finish("awaiting_answer", `asked ${decision.questions.length} question(s)`);
       console.log(`[${issue.identifier}] intake awaiting answers (${decision.questions.length} question(s))`);
       return;

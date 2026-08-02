@@ -406,8 +406,8 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   // (a) Weekly budget envelope — this card's own run_stage_finished spend, AND
   // a pessimistic runs × perRun bound: aborted/crashed stages record costUsd 0
   // despite real API spend, so recorded dollars alone would under-count.
-  const spent = stageSpendForIssueSince(issueKey, Date.now() - WEEK_MS);
-  const runCount = stageRunCountForIssueSince(issueKey, Date.now() - WEEK_MS);
+  const spent = await stageSpendForIssueSince(issueKey, Date.now() - WEEK_MS);
+  const runCount = await stageRunCountForIssueSince(issueKey, Date.now() - WEEK_MS);
   if (spent >= card.budget.weekly || runCount * card.budget.perRun >= card.budget.weekly) {
     console.log(`[gk:${card.name}] weekly budget exhausted ($${spent.toFixed(2)} recorded, ${runCount} run(s) × $${card.budget.perRun} of $${card.budget.weekly}) — sleeping`);
     return false;
@@ -441,7 +441,7 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   }
 
   // (d) Parks-spike — a struggling factory files repair tickets, not ambitions.
-  const parksLast24h = parkedRunsSince(Date.now() - DAY_MS);
+  const parksLast24h = await parkedRunsSince(Date.now() - DAY_MS);
   const parkSpike = parksLast24h > 3;
 
   const repo = card.repos[0] ?? "";
@@ -473,7 +473,7 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   // file, or factory src — output files only, no Bash ever.
   const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), `Write(/${outDir}/**)`])];
 
-  const tel = getTelemetry();
+  const tel = await getTelemetry();
   const telSummary = [
     `Spend to date: $${tel.totals.costUsd.toFixed(2)} over ${tel.totals.runs} runs (${tel.totals.degradedRuns} degraded).`,
     `Outcomes: pr_open ${tel.outcomes.pr_open}, planned ${tel.outcomes.planned}, parked ${tel.outcomes.parked}, needs_human ${tel.outcomes.needs_human}, aborted ${tel.outcomes.aborted}.`,

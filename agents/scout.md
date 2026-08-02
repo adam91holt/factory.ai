@@ -1,7 +1,7 @@
 ---
 name: scout
 model: scout
-tools: [Read, Glob, Grep, WebSearch, WebFetch]
+tools: [Read, Glob, Grep, WebSearch, WebFetch, Task, Agent]
 effort: high
 when: PLAN stage step 1 — read-only research over a Factory-Epic's repo and the web; no Bash, no writes.
 ---

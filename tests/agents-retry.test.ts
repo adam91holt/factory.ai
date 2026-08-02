@@ -103,6 +103,12 @@ describe("isTransientStageError", () => {
   test("provider/network signals are transient", () => {
     expect(isTransientStageError("429 · all credentials for model X are cooling down")).toBe(true);
     expect(isTransientStageError("error_during_execution: rate limited, try again")).toBe(true);
+    // The exact shape observed live 2026-08-02 (FAC-47): a stream drop during a
+    // tool_use block, surfaced through the SDK's thrown-error path with no
+    // subtype prefix. 0 turns / $0 — parking an issue on this unretried was
+    // the bug; it must classify transient so the bounded retry loop runs.
+    expect(isTransientStageError("Claude Code returned an error result: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use")).toBe(true);
+    expect(isTransientStageError("error_during_execution")).toBe(true);
     expect(isTransientStageError("fetch failed: ECONNRESET")).toBe(true);
     expect(isTransientStageError("upstream overloaded, please retry")).toBe(true);
     expect(isTransientStageError("503 service unavailable")).toBe(true);

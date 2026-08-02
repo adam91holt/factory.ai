@@ -7,7 +7,7 @@ import { eventStoreOpen, insertLessonRow, activeLessonRowsForRepo, allLessonRows
 // intervention ends in a remediation... or it recurs"). Every failure the loop
 // records — park, needs-human, taste-fail — is distilled AT THE MOMENT IT
 // HAPPENS into a one-line "when X, do Y" lesson and stored durably in
-// factory.db, so the next run on the same repo doesn't start naive.
+// Postgres, so the next run on the same repo doesn't start naive.
 //
 // This module owns ALL lesson SQL access (via the db.ts row helpers on the
 // shared handle — never a second writer against a running daemon) and the full
@@ -77,7 +77,7 @@ function startOfLocalDayMs(now: Date): number {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
 }
 
-function distillerCallsToday(): number {
+async function distillerCallsToday(): Promise<number> {
   const now = new Date();
   const today = localDayKey(now);
   if (attemptDay !== today) {
@@ -90,9 +90,9 @@ function distillerCallsToday(): number {
     // for the floor to see. Seeding from the persisted count closes that gap:
     // the in-memory counter picks up where today's spend actually left off.
     attemptDay = today;
-    attemptsToday = lessonRowCountSince(startOfLocalDayMs(now));
+    attemptsToday = await lessonRowCountSince(startOfLocalDayMs(now));
   }
-  return Math.max(attemptsToday, lessonRowCountSince(startOfLocalDayMs(now)));
+  return Math.max(attemptsToday, await lessonRowCountSince(startOfLocalDayMs(now)));
 }
 
 /** Reduce distiller output to one clean lesson line, or null when unusable.
@@ -111,12 +111,12 @@ function extractLessonLine(text: string): string | null {
 /** Raw write path — redacts and length-caps at write time, then inserts via
  *  the shared handle. Called only by captureLesson (and tests). Returns false
  *  (never throws) when the store is closed or inputs are unusable. */
-export function recordLesson(input: { repo: string; stage: string; issueKey: string;
-  lesson: string; sourceReason: string }): boolean {
+export async function recordLesson(input: { repo: string; stage: string; issueKey: string;
+  lesson: string; sourceReason: string }): Promise<boolean> {
   try {
     const lesson = redactSecrets(input.lesson).clean.trim().slice(0, MAX_LESSON_LENGTH);
     if (lesson === "") return false;
-    return insertLessonRow({
+    return await insertLessonRow({
       createdAt: Date.now(),
       repo: redactSecrets(input.repo).clean.slice(0, 200),
       stage: redactSecrets(input.stage).clean.slice(0, 100),
@@ -143,7 +143,7 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
       console.log(`[lessons] event store closed — skipping capture for ${input.issueKey} (${input.outcome})`);
       return;
     }
-    if (distillerCallsToday() >= MAX_DISTILLER_CALLS_PER_DAY) {
+    if ((await distillerCallsToday()) >= MAX_DISTILLER_CALLS_PER_DAY) {
       console.error(`[lessons] daily distiller cap (${MAX_DISTILLER_CALLS_PER_DAY}) reached — skipping capture for ${input.issueKey}`);
       return;
     }
@@ -199,7 +199,7 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
       console.log(`[lessons] no reusable lesson distilled for ${input.issueKey} (${input.outcome})`);
       return;
     }
-    const wrote = recordLesson({ repo: input.repo, stage: input.stage,
+    const wrote = await recordLesson({ repo: input.repo, stage: input.stage,
       issueKey: input.issueKey, lesson, sourceReason: `${input.outcome}: ${input.reason}` });
     if (wrote) console.log(`[lessons] ${input.issueKey} (${input.outcome}) → ${lesson.slice(0, 120)}`);
   } catch (error) {
@@ -211,7 +211,7 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
 /** Active lessons for one repo, newest first — the injection read (child 02).
  *  Hard-capped by count AND cumulative chars via the in-code constants above;
  *  opts may only narrow the caps, never exceed them. */
-export function lessonsForRepo(repo: string, opts?: { maxLessons?: number; maxChars?: number }): LessonRow[] {
+export async function lessonsForRepo(repo: string, opts?: { maxLessons?: number; maxChars?: number }): Promise<LessonRow[]> {
   // Non-finite opts (NaN, +/-Infinity from a bad caller) must fall back to the
   // constant rather than silently disabling the cap: NaN propagates through
   // Math.min/Math.max and every `> maxChars` comparison is then false.
@@ -219,7 +219,7 @@ export function lessonsForRepo(repo: string, opts?: { maxLessons?: number; maxCh
   const rawMaxChars = opts?.maxChars;
   const maxLessons = Math.max(0, Math.min(Number.isFinite(rawMaxLessons) ? rawMaxLessons! : MAX_LESSONS_PER_REPO, MAX_LESSONS_PER_REPO));
   const maxChars = Math.max(0, Math.min(Number.isFinite(rawMaxChars) ? rawMaxChars! : MAX_LESSON_CHARS_PER_REPO, MAX_LESSON_CHARS_PER_REPO));
-  const rows = activeLessonRowsForRepo(repo, maxLessons);
+  const rows = await activeLessonRowsForRepo(repo, maxLessons);
   const out: LessonRow[] = [];
   let chars = 0;
   for (const row of rows) {
@@ -232,13 +232,13 @@ export function lessonsForRepo(repo: string, opts?: { maxLessons?: number; maxCh
 
 /** Every lesson (archived included), newest first, bounded — the UI read
  *  (child 04). */
-export function listLessons(): LessonRow[] {
+export async function listLessons(): Promise<LessonRow[]> {
   return allLessonRows(LIST_LESSONS_LIMIT);
 }
 
 /** Human-initiated archive: sets archived = 1, never deletes silently.
  *  Returns true when a row actually changed (child 04). */
-export function archiveLesson(id: number): boolean {
+export async function archiveLesson(id: number): Promise<boolean> {
   if (!Number.isInteger(id) || id <= 0) return false;
   return archiveLessonRow(id);
 }

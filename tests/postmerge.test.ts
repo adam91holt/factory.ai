@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config.ts";
-import { openTestDatabase, closeTestDatabase, deployAttempted, recordDeploy } from "../src/db.ts";
+import { openTestDatabase, closeTestDatabase, claimDeploy, deployAttempted, recordDeploy } from "../src/db.ts";
 import { deployAndVerify, runShellGate, type DeployDeps } from "../src/postmerge.ts";
 import type { ProjectCard } from "../src/registry.ts";
 import type { Workspace } from "../src/repos.ts";
@@ -37,20 +37,48 @@ beforeEach(() => { config.deployEnabled = true; });
 afterEach(() => { config.deployEnabled = originalDeployEnabled; });
 
 describe("deployAttempted — exactly-once idempotency guard", () => {
-  beforeEach(() => openTestDatabase());
-  afterEach(() => closeTestDatabase());
+  beforeEach(async () => { await openTestDatabase(); });
+  afterEach(async () => { await closeTestDatabase(); });
 
-  test("false before, true after recordDeploy (a second tick short-circuits)", () => {
-    expect(deployAttempted("acme/kiwi", SHA)).toBe(false);
-    recordDeploy("acme/kiwi", SHA, "started");
-    expect(deployAttempted("acme/kiwi", SHA)).toBe(true);
+  test("false before, true after recordDeploy (a second tick short-circuits)", async () => {
+    expect(await deployAttempted("acme/kiwi", SHA)).toBe(false);
+    await recordDeploy("acme/kiwi", SHA, "started");
+    expect(await deployAttempted("acme/kiwi", SHA)).toBe(true);
     // A different sha is independent.
-    expect(deployAttempted("acme/kiwi", "b".repeat(40))).toBe(false);
+    expect(await deployAttempted("acme/kiwi", "b".repeat(40))).toBe(false);
   });
 
-  test("closed store → false (deploy is OFF there anyway; never double-deploys blind)", () => {
-    closeTestDatabase();
-    expect(deployAttempted("acme/kiwi", SHA)).toBe(false);
+  test("closed store → false (deploy is OFF there anyway; never double-deploys blind)", async () => {
+    await closeTestDatabase();
+    expect(await deployAttempted("acme/kiwi", SHA)).toBe(false);
+  });
+});
+
+describe("claimDeploy — the atomic claim postMergeTick now runs on", () => {
+  beforeEach(async () => { await openTestDatabase(); });
+  afterEach(async () => { await closeTestDatabase(); });
+
+  test("exactly one winner: first claim true, every subsequent claim false", async () => {
+    expect(await claimDeploy("acme/kiwi", SHA)).toBe(true);
+    expect(await claimDeploy("acme/kiwi", SHA)).toBe(false);   // second tick
+    expect(await deployAttempted("acme/kiwi", SHA)).toBe(true); // and the row is the guard
+    expect(await claimDeploy("acme/kiwi", "b".repeat(40))).toBe(true); // other SHA independent
+  });
+
+  test("CONCURRENT claims for the same (repo, sha) yield exactly one true", async () => {
+    const results = await Promise.all(Array.from({ length: 5 }, () => claimDeploy("acme/kiwi", SHA)));
+    expect(results.filter(Boolean).length).toBe(1);
+  });
+
+  test("recordDeploy still upserts the outcome over a claim's 'started'", async () => {
+    await claimDeploy("acme/kiwi", SHA);
+    await recordDeploy("acme/kiwi", SHA, "ok"); // outcome update, not a re-claim
+    expect(await claimDeploy("acme/kiwi", SHA)).toBe(false); // still claimed
+  });
+
+  test("closed store → false: an unclaimable SHA is never deployed (fail closed)", async () => {
+    await closeTestDatabase();
+    expect(await claimDeploy("acme/kiwi", SHA)).toBe(false);
   });
 });
 

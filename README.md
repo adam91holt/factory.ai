@@ -19,13 +19,18 @@ Planning docs live in `docs/planning/` (`level-4-roadmap.md`, `autonomy.md`).
 - **Linear GraphQL** — polling, no webhooks. Personal API key stays in the daemon;
   workers get a scrubbed env and never see it.
 - **git worktrees** under `~/FactoryWork`, branches `factory/<issue-key>`, PRs via `gh`.
-- **SQLite** (`factory.db`) — durable event log, telemetry, lessons store.
+- **Postgres** (loopback, `docker-compose.yml` → 127.0.0.1:5460) — durable event
+  log, telemetry, lessons, merge ladder, approvals. The ONLY production store;
+  the daemon talks to it through Bun's built-in client, so there is still no
+  runtime dependency to install. `bun test` needs no container — the unit suite
+  runs on an in-process PGlite (WASM Postgres) seam.
 
 ## Run
 
 ```bash
 cp .env.example .env   # fill LINEAR_API_KEY + PROXY_AUTH_TOKEN
 bun install
+bun run db:up          # Postgres on 127.0.0.1:5460 (docker compose up -d)
 bun run typecheck
 bun run factory:dry    # one tick, no Linear writes, no PRs
 bun run factory:once   # one live tick
@@ -37,6 +42,11 @@ Mission control (live runs, telemetry, lessons, agent catalog) is served on
 
 ## How an issue flows
 
+0. One-time per team: `bun run board:setup` (dry-run; `-- --apply` to mutate) adds
+   the **Blocked** and **Needs Human** columns and stamps every factory-owned
+   column with an immutable `[factory:<kind>]` tag in its Linear description.
+   `src/linear.ts` resolves columns by state TYPE first and that tag second, so
+   renaming a column is safe and an un-migrated board still works unchanged.
 1. Create an issue in **Todo** following `docs/ticket-contract.md`
    (Goal / Why / Outcomes / Repo / Verifications). Missing sections → "needs human"
    comment, never a guess.
@@ -50,8 +60,14 @@ Mission control (live runs, telemetry, lessons, agent catalog) is served on
 5. **Merge**: human by default (ADR-0001). The merge ladder
    (`src/merge-ladder.ts`) lets a repo earn `human → shadow → auto-low-risk → auto`
    on verification evidence only — ticket text can never confer merge authority.
-   Caps/failures park the issue back to Todo with the worktree kept and the report
-   saying exactly where it stopped.
+6. **Where it stops is visible on the board.** Caps and failures move the issue to
+   **Blocked** (paused, retryable — worktree kept, report says exactly where it
+   stopped); guarded paths, a failed taste/security/verification gate, a drop in
+   passing tests, or a merge-integrity refusal move it to **Needs Human**. Both
+   columns are the same Linear type as Todo (`unstarted`) on purpose: the
+   `Factory-*` **label**, never the column, is what holds an issue out of the
+   queue, so requeueing is one reversible edit — remove the label and the daemon
+   picks it up again from wherever it sits.
 
 ## The self-improvement loops
 
