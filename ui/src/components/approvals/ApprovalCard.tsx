@@ -234,7 +234,7 @@ export function ApprovalCard({
         >
           {item.issueKey}
         </Link>
-        <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg-dim">{item.title}</span>
+        <span className="min-w-0 flex-1 text-[12.5px] text-fg-dim max-md:line-clamp-2 md:truncate">{item.title}</span>
         <Badge variant="outline">{item.repo}</Badge>
         <span className="font-mono text-[10.5px] text-fg-faint" title={new Date(item.parkedAt).toISOString()}>
           parked {relTime(item.parkedAt, now)}

@@ -15,7 +15,7 @@ export function BoardLane({
 }) {
   const [listRef] = useAutoAnimate({ duration: 220, easing: "ease-out" });
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-xl border border-line bg-bg0">
+    <section className="flex min-w-0 flex-col rounded-xl border border-line bg-bg0 md:min-h-0 md:flex-1">
       <header className="flex items-center gap-2 border-b border-line px-3 py-2.5">
         <span className={cn("size-1.5 rounded-full", accent)} />
         <span className="text-[11.5px] font-medium tracking-wide text-fg-dim">{title}</span>
@@ -23,7 +23,7 @@ export function BoardLane({
           {count}
         </span>
       </header>
-      <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
+      <div ref={listRef} className="flex flex-col gap-2 p-2 md:min-h-0 md:flex-1 md:overflow-y-auto">
         {children}
       </div>
     </section>

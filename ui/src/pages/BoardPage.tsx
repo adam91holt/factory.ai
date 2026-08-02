@@ -117,8 +117,11 @@ export function BoardPage() {
       </div>
       {/* Lanes get a floor width; narrow windows scroll horizontally inside
           this wrapper (body itself is overflow: hidden). */}
-      <div className="min-h-0 flex-1 overflow-x-auto">
-        <div className={cn("grid h-full min-w-[1080px] grid-cols-5 gap-3", stale && "opacity-90")}>
+      {/* Mobile: lanes stack vertically and the PAGE scrolls — at 390px the
+          5-col 1080px grid showed 1.5 columns and blind side-scroll (live
+          review 2026-08-02). Desktop keeps the full kanban. */}
+      <div className="min-h-0 flex-1 overflow-y-auto md:overflow-y-visible md:overflow-x-auto">
+        <div className={cn("flex flex-col gap-3 md:grid md:h-full md:min-w-[1080px] md:grid-cols-5", stale && "opacity-90")}>
           <BoardLane title="Todo" accent="bg-fg-faint" count={todo.length}>
             {todo.map((i) => <IssueCard key={i.id} issue={i} now={now} />)}
           </BoardLane>

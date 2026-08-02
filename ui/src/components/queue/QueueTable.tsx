@@ -42,6 +42,30 @@ export function QueueTable({
     );
   }
   return (
+    <>
+    {/* Mobile (<md): the 4-column table squeezed titles to two characters at
+        390px (live review 2026-08-02) — stacked cards instead: full title,
+        clamped reason, one meta row. Desktop keeps the dense table. */}
+    <div className="flex flex-col gap-2 md:hidden">
+      {issues.map((issue) => (
+        <div key={issue.id} className="rounded-lg border border-line bg-bg1 p-3">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[12px] text-fg">{issue.identifier}</span>
+            <span className="min-w-0 flex-1" />
+            <AgeBar createdAt={issue.createdAt} now={now} />
+            <a href={issue.url} target="_blank" rel="noreferrer" aria-label="Open in Linear"
+               className="-m-2 flex size-9 items-center justify-center text-fg-faint transition-colors duration-100 hover:text-fg">
+              <ExternalLink className="size-3.5" strokeWidth={1.75} />
+            </a>
+          </div>
+          <div className="mt-1 text-[13px] leading-snug text-fg-dim">{issue.title}</div>
+          <div className="mt-1 line-clamp-3 font-mono text-[11px] leading-relaxed text-fg-faint">
+            {reasons.get(issue.identifier) ?? "— set before this session"}
+          </div>
+        </div>
+      ))}
+    </div>
+    <div className="hidden md:block">
     <Table>
       <TableHeader>
         <TableRow className="hover:bg-transparent">
@@ -80,5 +104,7 @@ export function QueueTable({
         ))}
       </TableBody>
     </Table>
+    </div>
+    </>
   );
 }
