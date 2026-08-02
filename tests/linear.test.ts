@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { filterOrphanedIssues } from "../src/linear.ts";
+import { filterOrphanedIssues, orphanShouldRequeue } from "../src/linear.ts";
 import type { Issue } from "../src/linear.ts";
 
 // B3/B5 audit improvement #5 — the runtime orphan sweep (index.ts) re-runs
@@ -98,5 +98,18 @@ describe("buildEpicDagPayload — one query serves the whole Epic DAG panel", ()
     const body = fn.slice(0, fn.indexOf("\n}") + 2);
     expect((body.match(/gql[<(]/g) ?? []).length).toBe(1);
     expect(typeof getEpicDag).toBe("function");
+  });
+});
+
+describe("orphanShouldRequeue — recovery never resurrects human-terminal tickets", () => {
+  test("THE PIN (live 2026-08-02): Done/Canceled orphans keep their state — label strip only", () => {
+    // Restarts resurrected Done FAC-64 and Canceled FAC-58, twice each,
+    // burning implementer budget on work the human had ended.
+    expect(orphanShouldRequeue("completed")).toBe(false);
+    expect(orphanShouldRequeue("canceled")).toBe(false);
+  });
+  test("genuinely interrupted work requeues", () => {
+    expect(orphanShouldRequeue("started")).toBe(true);
+    expect(orphanShouldRequeue("unstarted")).toBe(true);
   });
 });

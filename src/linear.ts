@@ -841,13 +841,26 @@ export function filterOrphanedIssues(issues: Issue[], excludeIdentifiers: Readon
  * every Executing-labeled issue found IS an orphan); index.ts's periodic
  * runtime sweep passes its live `inFlight` keys so genuinely-running claims
  * are never reset out from under themselves. */
+/** Pure requeue decision for one orphaned claim (tests pin it): an orphan
+ *  still in a started-type state goes back to the queue; completed/canceled
+ *  are HUMAN terminal decisions and stay exactly where the human put them. */
+export function orphanShouldRequeue(stateType: string): boolean {
+  return stateType === "started" || stateType === "unstarted";
+}
+
 export async function recoverOrphanedClaims(excludeIdentifiers: ReadonlySet<string> = new Set()): Promise<string[]> {
   const orphans = filterOrphanedIssues(await fetchByLabel(EXECUTING_LABEL).catch(() => [] as Issue[]), excludeIdentifiers);
   const recovered: string[] = [];
   for (const issue of orphans) {
     try {
       await removeLabel(issue, EXECUTING_LABEL);
-      await transition(issue, "queue");
+      // A ticket a HUMAN already finished or killed must not come back to
+      // Todo — live 2026-08-02: restarts resurrected Done FAC-64 and
+      // Canceled FAC-58 (twice each) because this requeue was unconditional,
+      // and each resurrection burned an implementer until the claim-loss
+      // sweep or a stillOurs check caught it. For terminal states the stale
+      // label strip IS the whole recovery; only still-started orphans requeue.
+      if (orphanShouldRequeue(issue.stateType)) await transition(issue, "queue");
       recovered.push(issue.identifier);
     } catch (error) {
       console.error(`[recover] ${issue.identifier} reset failed: ${error instanceof Error ? error.message : error}`);
