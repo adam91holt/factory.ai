@@ -58,6 +58,8 @@ const ESCALATED_MARKERS = [
   "auto-merge failed",                 // mergePr ran and failed (loop.ts B16 path)
   "security review returned a fail",   // security FAIL verdict
   "security review did not complete",  // warranted-but-absent security pass
+  "returned uncertain",                // structured gate verdict "uncertain" (security/design)
+  "no machine-readable verdict",       // reviewer leg unresolvable (structured-gate fold)
   "design taste gate failed",
   "design review did not complete",
   "explicit fail verdict",             // tester VERDICT: fail

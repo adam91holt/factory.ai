@@ -61,6 +61,96 @@ export interface Schedulable {
   touches: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Implicit depends_on (issue #6 Part 2): when the decomposer declared which
+// files two siblings touch but FORGOT the edge between them, the file mutex
+// alone gives serialization without ORDERING — whichever sibling is claimed
+// first wins, and the other builds against a base that is about to change.
+// Derive the missing edge here, in code, from the same `touches` globs the
+// mutex already trusts: the LATER child (by ticket number — the decomposer
+// files children in dependency-ish order, and any deterministic order beats
+// none) waits for the EARLIER one to complete. Purely additive:
+//   - an explicit depends_on entry is NEVER removed or reordered — implicit
+//     edges are unioned on top;
+//   - a child with no `touches`, or no overlap, is returned UNCHANGED (same
+//     object, same behavior as today);
+//   - an implicit edge that would create a cycle with the existing graph is
+//     skipped (fail-open to today's mutex-only behavior — a wedged DAG is
+//     strictly worse than an unordered one);
+//   - every addition is reported in `added` so the caller can log it loudly.
+// ---------------------------------------------------------------------------
+
+/** In-code cap (CLAUDE.md): more implicit edges than this per child means the
+ *  decomposer emitted a hairball — extra edges add ordering constraints with
+ *  rapidly diminishing value, and the mutex still serializes what they'd
+ *  have covered. */
+const MAX_IMPLICIT_DEPS_PER_CHILD = 8;
+
+export interface ImplicitDepAddition {
+  /** The child that gained the edge (waits). */
+  identifier: string;
+  /** The earlier sibling it now waits for. */
+  dependsOn: string;
+  /** The first overlapping glob pair, for the log line. */
+  overlap: string;
+}
+
+/** TEAM-123 → 123; anything unparseable sorts last (never treated as early —
+ *  a malformed identifier must not silently become everyone's prerequisite). */
+function ticketNumber(identifier: string): number {
+  const m = identifier.match(/-(\d+)$/);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+export function deriveImplicitDeps(candidates: Schedulable[]): { augmented: Schedulable[]; added: ImplicitDepAddition[] } {
+  // Working dependency graph: explicit edges plus implicit edges as they are
+  // accepted, so the cycle check sees the REAL graph being built, not just the
+  // explicit slice of it (implicit edges alone cannot cycle — they always
+  // point later→earlier — but mixed with explicit edges they could).
+  const deps = new Map<string, Set<string>>(candidates.map((c) => [c.identifier, new Set(c.dependsOn)]));
+  const reaches = (from: string, to: string): boolean => {
+    const seen = new Set<string>();
+    const stack = [from];
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      if (cur === to) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const d of deps.get(cur) ?? []) stack.push(d);
+    }
+    return false;
+  };
+
+  const order = [...candidates].sort((a, b) => ticketNumber(a.identifier) - ticketNumber(b.identifier) || a.identifier.localeCompare(b.identifier));
+  const added: ImplicitDepAddition[] = [];
+  for (let j = 1; j < order.length; j++) {
+    const later = order[j]!;
+    if (later.touches.length === 0) continue;
+    let addedForChild = 0;
+    for (let i = 0; i < j && addedForChild < MAX_IMPLICIT_DEPS_PER_CHILD; i++) {
+      const earlier = order[i]!;
+      if (earlier.touches.length === 0) continue;
+      if (!globsOverlap(later.touches, earlier.touches)) continue;
+      if (deps.get(later.identifier)!.has(earlier.identifier)) continue; // explicit (or already added) — nothing to derive
+      if (reaches(earlier.identifier, later.identifier)) continue;       // earlier already (transitively) waits on later — adding the reverse edge would wedge both forever
+      deps.get(later.identifier)!.add(earlier.identifier);
+      const pair = later.touches.flatMap((x) => earlier.touches.map((y) => [x, y] as const)).find(([x, y]) => globsOverlap([x], [y]));
+      added.push({ identifier: later.identifier, dependsOn: earlier.identifier, overlap: pair ? `${pair[0]} ∩ ${pair[1]}` : "" });
+      addedForChild += 1;
+    }
+  }
+
+  // Original array order and object identity preserved for untouched children —
+  // selectRunnable admits FIFO in candidate order, and the additive guarantee
+  // is easiest to see when "no overlap" means "the same object out".
+  const augmented = candidates.map((c) => {
+    const set = deps.get(c.identifier)!;
+    if (set.size === c.dependsOn.length) return c;
+    return { ...c, dependsOn: [...c.dependsOn, ...[...set].filter((d) => !c.dependsOn.includes(d))] };
+  });
+  return { augmented, added };
+}
+
 /** Split candidates into run / blocked / deferred for one scheduler tick.
  *
  *   blocked  — has a dependency whose live Linear state TYPE is neither

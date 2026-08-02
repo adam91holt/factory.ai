@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation, pushOnPark } from "../src/loop.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { isEligible, missingSections, wantsBrowserVerification, mapBrowserEvidence, parseSecurityVerdict, securityReviewOutstanding, parseTasteVerdict, countDiffLines, budgetExpired, budgetExpiredReason, retryMutation, pushOnPark,
+  securityTokenVerdict, tasteTokenVerdict, testerTokenVerdict, reviewerTokenVerdict, securityVerdictFromGate, browserEvidenceFromGate, reviewerGateHolds, tasteFixRoundWarranted, gateStageText, toGateVerdictEntry, GATE_STAGE_OUTPUT_FORMAT } from "../src/loop.ts";
+import { resolveGateOutput, GATE_OUTPUT_SCHEMA, type GateOutput } from "../src/gate.ts";
 import { decideFreshness, parsePrecondition, type PerCheck } from "../src/precondition.ts";
 import { buildMergeEvidence, decideMerge } from "../src/merge-ladder.ts";
 import type { Issue } from "../src/linear.ts";
@@ -387,5 +391,169 @@ describe("merge decision is evidence-derived, never ticket-derived", () => {
     // A clean strong bundle would-merge at auto; the input had no ticket text.
     expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(true);
     expect(decideMerge.length).toBe(3); // (tier, evidence, opts) — no description slot
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured gate outputs (issue #6 Part 1). One fail-closed test per gate
+// stage: malformed/absent structured output routes to needs-human (or the
+// evidence-missing merge block), NEVER an implicit pass. Plus the two
+// non-negotiables: uncertain ≠ fail (only a genuine fail buys a fixer round),
+// and recommendedAction is advisory-only (merge-ladder.ts untouched).
+// ---------------------------------------------------------------------------
+
+const gate = (over: Partial<GateOutput> = {}): GateOutput => ({
+  verdict: "pass", findings: [], evidence: [], recommendedAction: "continue",
+  prose: "clean", source: "structured", dropped: 0, ...over,
+});
+
+describe("gate stage token adapters (the documented legacy fallback)", () => {
+  test("security: SECURITY: pass/fail map, anything else null (fail-closed)", () => {
+    expect(securityTokenVerdict("…\nSECURITY: pass")).toBe("pass");
+    expect(securityTokenVerdict("…\nSECURITY: fail")).toBe("fail");
+    expect(securityTokenVerdict("no verdict emitted")).toBeNull();
+  });
+  test("taste: TASTE tokens map, fail wins on both, none is null", () => {
+    expect(tasteTokenVerdict("TASTE: pass")).toBe("pass");
+    expect(tasteTokenVerdict("TASTE: pass\nTASTE: fail")).toBe("fail");
+    expect(tasteTokenVerdict("nothing")).toBeNull();
+  });
+  test("tester: VERDICT: partial is the token spelling of 'uncertain'", () => {
+    expect(testerTokenVerdict("VERDICT: pass")).toBe("pass");
+    expect(testerTokenVerdict("VERDICT: partial")).toBe("uncertain");
+    expect(testerTokenVerdict("VERDICT: fail")).toBe("fail");
+    expect(testerTokenVerdict("ran stuff")).toBeNull();
+  });
+  test("reviewers: NO-FINDINGS is a pass, prose findings are a fail (fixer's job, same as today), empty is null", () => {
+    expect(reviewerTokenVerdict("Checked everything. NO-FINDINGS")).toBe("pass");
+    expect(reviewerTokenVerdict("1. off-by-one in x.ts")).toBe("fail");
+    expect(reviewerTokenVerdict("   ")).toBeNull();
+  });
+});
+
+describe("security-reviewer: schema violation/absence fails CLOSED to needs-human", () => {
+  test("malformed structured output + no token → null verdict → outstanding → decideMerge cannot act", () => {
+    // The stage completed but its structured output is garbage and its text
+    // carries no legacy token — exactly the shape a steered/truncated review has.
+    const resolved = resolveGateOutput({ text: "review that drifted off-script", structured: { verdict: "approved" } }, securityTokenVerdict);
+    expect(resolved).toBeNull();
+    const verdict = securityVerdictFromGate(resolved);
+    expect(verdict).toBeNull();
+    expect(securityReviewOutstanding(50, verdict)).toBe(true);
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: true, security: verdict, browser: "not-required", diffLines: 50 });
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(false);
+  });
+  test("uncertain ≠ fail: an UNCERTAIN security verdict never reads as pass OR fail — it holds as null", () => {
+    expect(securityVerdictFromGate(gate({ verdict: "uncertain" }))).toBeNull();
+    expect(securityVerdictFromGate(gate({ verdict: "fail" }))).toBe("fail");
+    expect(securityVerdictFromGate(gate({ verdict: "pass" }))).toBe("pass");
+    expect(securityVerdictFromGate(null)).toBeNull();
+  });
+});
+
+describe("design-reviewer: schema violation/absence fails CLOSED; only genuine fail buys a fixer round", () => {
+  test("an unresolvable design review (error/garbage) is the B22 outstanding fold, not a pass and not a fixer round", () => {
+    const resolved = resolveGateOutput({ error: "stage deadline reached", text: "" }, tasteTokenVerdict);
+    expect(resolved).toBeNull();
+    expect(tasteFixRoundWarranted(resolved)).toBe(false); // nothing to fix in an empty review
+    // The loop folds null → designReviewOutstanding → needsHuman: assert that
+    // hold blocks the merge exactly like the pre-structured path did.
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: true, security: "pass", browser: "not-required", diffLines: 10 });
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(false);
+  });
+  test("only a genuine 'fail' buys a design-fixer round — uncertain routes to a human instead", () => {
+    expect(tasteFixRoundWarranted(gate({ verdict: "fail" }))).toBe(true);
+    expect(tasteFixRoundWarranted(gate({ verdict: "uncertain" }))).toBe(false);
+    expect(tasteFixRoundWarranted(gate({ verdict: "pass" }))).toBe(false);
+    expect(tasteFixRoundWarranted(null)).toBe(false);
+  });
+});
+
+describe("tester: schema violation/absence counts as not-run — missing evidence, never a pass", () => {
+  test("null gate → 'missing' where the repo requires browser evidence (blocks auto-merge), 'not-required' otherwise", () => {
+    expect(browserEvidenceFromGate(true, null)).toBe("missing");
+    expect(browserEvidenceFromGate(false, null)).toBe("not-required");
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: false, security: "pass", browser: browserEvidenceFromGate(true, null), diffLines: 10 });
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(false);
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).reasons).toContain("required browser evidence missing");
+  });
+  test("uncertain ≠ fail: structured 'uncertain' maps to 'partial' (the old VERDICT: partial), not 'fail'", () => {
+    expect(browserEvidenceFromGate(true, gate({ verdict: "uncertain" }))).toBe("partial");
+    expect(browserEvidenceFromGate(true, gate({ verdict: "fail" }))).toBe("fail");
+    expect(browserEvidenceFromGate(true, gate({ verdict: "pass" }))).toBe("pass");
+  });
+});
+
+describe("reviewer legs: an unresolvable review can no longer be waved through to auto-merge", () => {
+  test("null gate on either leg produces a hold reason → needsHuman → decideMerge cannot act", () => {
+    const holds = reviewerGateHolds(null, gate());
+    expect(holds).toHaveLength(1);
+    expect(holds[0]).toContain("spec-lens");
+    expect(reviewerGateHolds(gate(), null)[0]).toContain("repo-lens");
+    expect(reviewerGateHolds(null, null)).toHaveLength(2);
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: holds.length > 0, security: "pass", browser: "not-required", diffLines: 10 });
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(false);
+  });
+  test("a resolved review — even verdict 'fail' (findings exist) — is NOT a hold: findings are the fixer round's job, same as today", () => {
+    expect(reviewerGateHolds(gate({ verdict: "fail" }), gate({ verdict: "uncertain" }))).toHaveLength(0);
+  });
+});
+
+describe("recommendedAction is ADVISORY ONLY — a stage cannot recommend its way to a merge", () => {
+  test("merge-ladder.ts never mentions recommendedAction (signature/inputs unchanged — source pin)", () => {
+    const src = readFileSync(join(import.meta.dir, "../src/merge-ladder.ts"), "utf8");
+    expect(src.includes("recommendedAction")).toBe(false);
+    expect(src.includes("GateOutput")).toBe(false); // the structured type never crosses into merge policy
+    expect(decideMerge.length).toBe(3); // (tier, evidence, opts) — unchanged arity
+  });
+  test("buildMergeEvidence's input has no recommendedAction slot (compile-time pin)", () => {
+    buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [], needsHuman: false,
+      security: "pass", browser: "pass", diffLines: 1,
+      // @ts-expect-error — recommendedAction must never become an evidence input;
+      // if someone adds it, this directive stops erroring and the typecheck gate fails.
+      recommendedAction: "continue" });
+  });
+  test("a failing gate that recommends 'continue' still blocks: the verdict gates, the recommendation is ignored", () => {
+    const g = gate({ verdict: "fail", recommendedAction: "continue" });
+    expect(securityVerdictFromGate(g)).toBe("fail");
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: false, security: securityVerdictFromGate(g), browser: "not-required", diffLines: 10 });
+    const d = decideMerge("auto", ev, { lowRiskMaxDiff: 40 });
+    expect(d.wouldMerge).toBe(false);
+    expect(d.reasons).toContain("security review failed");
+  });
+  test("a passing gate that recommends 'escalate' cannot force a merge either way — the recommendation simply is not an input", () => {
+    const g = gate({ verdict: "pass", recommendedAction: "escalate" });
+    const ev = buildMergeEvidence({ summary: { green: true, strength: "strong" }, guarded: [],
+      needsHuman: false, security: securityVerdictFromGate(g), browser: "pass", diffLines: 10 });
+    // Identical evidence → identical decision, whatever the stage "recommended".
+    expect(decideMerge("auto", ev, { lowRiskMaxDiff: 40 }).wouldMerge).toBe(true);
+  });
+});
+
+describe("gate stage plumbing (report + prompts stay human-readable)", () => {
+  test("GATE_STAGE_OUTPUT_FORMAT is the json_schema outputFormat over gate.ts's schema", () => {
+    expect(GATE_STAGE_OUTPUT_FORMAT.type).toBe("json_schema");
+    expect(GATE_STAGE_OUTPUT_FORMAT.schema).toBe(GATE_OUTPUT_SCHEMA);
+  });
+  test("gateStageText renders prose + findings digest for structured results, raw text otherwise — never a JSON dump", () => {
+    const g = gate({ verdict: "fail", prose: "Two problems.", evidence: ["ran bun test"],
+      findings: [{ severity: "high", file: "src/x.ts", line: 7, summary: "boom", failureScenario: "", fix: "" }] });
+    const text = gateStageText(g, { text: '{"verdict":"fail"}' });
+    expect(text).toContain("Two problems.");
+    expect(text).toContain("- [high] src/x.ts:7 boom");
+    expect(text).toContain("ran bun test");
+    expect(text).not.toContain('{"verdict"');
+    expect(gateStageText(null, { text: "plain prose review" })).toBe("plain prose review");
+  });
+  test("toGateVerdictEntry records verdict/source/findings; null becomes 'unresolved' (visible in telemetry, routed to a human by the folds)", () => {
+    expect(toGateVerdictEntry("security-reviewer", gate({ verdict: "uncertain", source: "fenced-json" })))
+      .toEqual({ stage: "security-reviewer", verdict: "uncertain", source: "fenced-json", findings: 0, action: "continue" });
+    expect(toGateVerdictEntry("tester", null))
+      .toEqual({ stage: "tester", verdict: "unresolved", source: "none", findings: 0, action: "none" });
   });
 });

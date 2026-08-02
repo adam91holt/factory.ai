@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, resolveModel, resolveEffort, isKnownEffort, type FactoryMeta } from "../src/meta.ts";
+import { parseFactoryMeta, renderFactoryMeta, withFactoryMeta, resolveTicketRoute, resolveModel, resolveModelForRisk, metaPinsModel, resolveEffort, isKnownEffort, type FactoryMeta } from "../src/meta.ts";
 import { config } from "../src/config.ts";
 
 // A model guaranteed to be in the configured roster — parseFactoryMeta's allowlist
@@ -597,5 +597,88 @@ describe("injection safety: an untrusted description cannot force an unlisted/ov
     expect(meta.effort).toEqual({ securityReviewer: "low" });
     // resolveEffort is the sole enforcement point for the gate pin.
     expect(resolveEffort("securityReviewer", meta, "medium")).toBe("medium");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveModelForRisk (issue #6 Part 2): risk-tier layer under the existing
+// precedence chain. Tests mutate config.modelTiers with save/restore because
+// the suite env deliberately declares no tier vars.
+// ---------------------------------------------------------------------------
+
+describe("resolveModelForRisk / metaPinsModel", () => {
+  const withTiers = (tiers: Record<string, { cheap?: string; strong?: string }>, fn: () => void) => {
+    const saved = structuredClone(config.modelTiers);
+    Object.assign(config.modelTiers, tiers);
+    try { fn(); } finally {
+      for (const k of Object.keys(config.modelTiers)) delete (config.modelTiers as Record<string, unknown>)[k];
+      Object.assign(config.modelTiers, saved);
+    }
+  };
+
+  test("risk === undefined → identical to resolveModel for every risk-routed stage (the additive path)", () => {
+    for (const stage of ["fixer", "reviewerClaude", "reviewerCodex", "securityReviewer", "designReviewer", "tester"] as const) {
+      expect(resolveModelForRisk(stage, {}, undefined)).toBe(resolveModel(stage, {}));
+    }
+  });
+
+  test("with NO tier vars declared (this suite's env), every risk class resolves to today's model", () => {
+    for (const risk of ["low", "medium", "high", "critical"] as const) {
+      expect(resolveModelForRisk("fixer", {}, risk)).toBe(config.models.fixer);
+      expect(resolveModelForRisk("securityReviewer", {}, risk)).toBe(config.models.securityReviewer);
+    }
+  });
+
+  test("declared tiers route by risk: cheap at low, standard at medium, strong at critical", () => {
+    withTiers({ fixer: { cheap: "tier-only-cheap", strong: "tier-only-strong" } }, () => {
+      expect(resolveModelForRisk("fixer", {}, "low")).toBe("tier-only-cheap");
+      expect(resolveModelForRisk("fixer", {}, "medium")).toBe(config.models.fixer);
+      expect(resolveModelForRisk("fixer", {}, "critical")).toBe("tier-only-strong");
+    });
+  });
+
+  test("an explicit, validated TICKET pin outranks the risk tier for non-gate stages (narrowing stays a right)", () => {
+    withTiers({ fixer: { strong: "tier-only-strong" } }, () => {
+      const meta = parseFactoryMeta(`<!-- factory\nmodels: fixer=${ROSTER_MODEL}\n-->`);
+      expect(resolveModelForRisk("fixer", meta, "critical")).toBe(ROSTER_MODEL);
+    });
+  });
+
+  test("ticket text CANNOT select a tier-only model — isKnownModel is not widened by modelTiers", () => {
+    withTiers({ fixer: { strong: "tier-only-strong" } }, () => {
+      const meta = parseFactoryMeta("<!-- factory\nmodels: fixer=tier-only-strong\n-->");
+      expect(meta.models).toBeUndefined(); // dropped at parse — not in the roster
+      // …and therefore the tier (evidence-driven) applies, not the ticket:
+      expect(resolveModelForRisk("fixer", meta, "critical")).toBe("tier-only-strong");
+      expect(resolveModelForRisk("fixer", meta, "medium")).toBe(config.models.fixer);
+    });
+  });
+
+  test("gate stages: meta can never pin (models/*/legacy all ignored), but the OPERATOR's strong tier still applies at high/critical", () => {
+    withTiers({ securityReviewer: { strong: "tier-only-sec-strong" } }, () => {
+      const meta = parseFactoryMeta(`<!-- factory\nmodel: ${ROSTER_MODEL}\nmodels: securityReviewer=${ROSTER_MODEL} *=${ROSTER_MODEL_2}\n-->`);
+      expect(metaPinsModel("securityReviewer", meta)).toBe(false);
+      expect(resolveModelForRisk("securityReviewer", meta, "medium")).toBe(config.models.securityReviewer);
+      expect(resolveModelForRisk("securityReviewer", meta, "high")).toBe("tier-only-sec-strong");
+      expect(resolveModelForRisk("securityReviewer", meta, "critical")).toBe("tier-only-sec-strong");
+    });
+  });
+
+  test("a ticket cannot RAISE or LOWER its own risk class: risk is a caller argument derived from evidence, and no meta key feeds it", () => {
+    // The FactoryMeta type carries no risk field, and parseFactoryMeta drops
+    // an injected `risk:` line silently — nothing downstream ever reads one.
+    const meta = parseFactoryMeta("<!-- factory\nrisk: low\nriskclass: low\n-->");
+    expect(meta).toEqual({});
+  });
+
+  test("metaPinsModel: scalar, wildcard, and stage-specific all count for non-gate stages; nothing counts for gate stages", () => {
+    expect(metaPinsModel("fixer", {})).toBe(false);
+    expect(metaPinsModel("fixer", { model: ROSTER_MODEL })).toBe(true);
+    expect(metaPinsModel("fixer", { models: { "*": ROSTER_MODEL } })).toBe(true);
+    expect(metaPinsModel("fixer", { models: { fixer: ROSTER_MODEL } })).toBe(true);
+    expect(metaPinsModel("fixer", { models: { tester: ROSTER_MODEL } })).toBe(false);
+    for (const gate of ["reviewerClaude", "reviewerCodex", "securityReviewer"] as const) {
+      expect(metaPinsModel(gate, { model: ROSTER_MODEL, models: { "*": ROSTER_MODEL, [gate]: ROSTER_MODEL } })).toBe(false);
+    }
   });
 });

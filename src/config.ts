@@ -1,5 +1,8 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+// risk.ts is pure and import-free (routing.ts precedent), so this creates no
+// cycle even though meta.ts value-imports config from this module.
+import { gateTiersDeclared, vendorDiversityPolicy, vendorDiversityViolations, type TierConfig } from "./risk.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -35,6 +38,23 @@ function parsePairs(raw: string | undefined): Record<string, string> {
 
 function expandHome(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
+}
+
+// A tier model env value: same plain-identifier shape every model id in this
+// file has (see fallbackModel below). Malformed/empty → undefined, i.e. "that
+// tier is not configured" — never a garbage id handed to the SDK.
+function tierModel(name: string): string | undefined {
+  const value = (process.env[name] ?? "").trim();
+  return /^[A-Za-z0-9._-]{1,80}$/.test(value) ? value : undefined;
+}
+// Both tier slots for one stage, from `<PREFIX>_CHEAP` / `<PREFIX>_STRONG`
+// (e.g. FIXER_MODEL_CHEAP). Unset slots are omitted so an empty declaration
+// object means exactly "standard model at every tier" (risk.ts resolveTierModel
+// falls back), keeping pre-tier configs byte-identical in behavior.
+function tierPair(prefix: string): { cheap?: string; strong?: string } {
+  const cheap = tierModel(`${prefix}_CHEAP`);
+  const strong = tierModel(`${prefix}_STRONG`);
+  return { ...(cheap !== undefined ? { cheap } : {}), ...(strong !== undefined ? { strong } : {}) };
 }
 
 // Dashboard-only mode: serve the mission-control UI, never poll Linear.
@@ -73,6 +93,28 @@ export const config = {
     // taste-fail) that turns the event into a one-line reusable lesson (lessons.ts).
     distiller: process.env.DISTILLER_MODEL ?? "haiku",
   },
+
+  // Risk-based model tiers (issue #6 Part 2, src/risk.ts). OPTIONAL per-stage
+  // cheap/strong models layered over config.models above: the existing
+  // per-stage env var IS the "standard" tier, and any tier left undeclared
+  // resolves to it — so a config that sets none of these behaves EXACTLY as
+  // today at every risk class (additive-only). Operator-set only, via env
+  // vars, like every model in this file: ticket text cannot reach these (the
+  // meta.ts isKnownModel allowlist is deliberately NOT widened to include
+  // tier models — a ticket may request only roster models, and risk class
+  // itself is evidence-derived in code, never parsed from a description).
+  // WHICH tier serves a stage at a given risk class is the in-code
+  // RISK_MODEL_TIERS table in risk.ts, not a knob. The implementer has no
+  // tier pair on purpose: risk is derived from its own diff, which does not
+  // exist yet when it starts (see risk.ts RiskRoutedStage).
+  modelTiers: {
+    fixer: tierPair("FIXER_MODEL"),
+    reviewerClaude: tierPair("REVIEWER_CLAUDE_MODEL"),
+    reviewerCodex: tierPair("REVIEWER_CODEX_MODEL"),
+    securityReviewer: tierPair("SECURITY_REVIEWER_MODEL"),
+    designReviewer: tierPair("DESIGN_REVIEWER_MODEL"),
+    tester: tierPair("TESTER_MODEL"),
+  } satisfies TierConfig as TierConfig,
 
   // #14/#11 resilience: optional GLOBAL fallback model agents.ts's runStage
   // fails a stage over to once its primary model exhausts bounded retries on a
@@ -219,4 +261,28 @@ export const config = {
 
 if (config.proxyBaseUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(config.proxyBaseUrl)) {
   throw new Error("PROXY_BASE_URL must be loopback (see codexProxyTest security notes)");
+}
+
+// Vendor-diversity assertion (issue #6 Part 2): for high/critical risk, the
+// security reviewer must not resolve to the same vendor as BOTH adversarial
+// code-review legs — one vendor holding every judgment is the silent collapse
+// the .env comments used to be the only defense against. Enforced HERE, at
+// config load, so a collapsed config fails before any ticket is claimed —
+// but only ONCE the operator has declared gate-stage tier models (adopted the
+// feature); a pre-tier config that declares none of the new vars must keep
+// booting exactly as today (additive-only), so it gets a loud per-start
+// warning instead of a crash. The decision itself is pure and pinned by
+// tests/risk.test.ts (vendorDiversityPolicy).
+{
+  const violations = vendorDiversityViolations(
+    { reviewerClaude: config.models.reviewerClaude, reviewerCodex: config.models.reviewerCodex, securityReviewer: config.models.securityReviewer },
+    config.modelTiers,
+  );
+  const policy = vendorDiversityPolicy(violations, gateTiersDeclared(config.modelTiers));
+  if (policy === "throw") {
+    throw new Error(`vendor-diversity: ${violations.join("; ")} — point REVIEWER_CLAUDE_MODEL(_STRONG), REVIEWER_CODEX_MODEL(_STRONG) or SECURITY_REVIEWER_MODEL(_STRONG) at a different model family`);
+  }
+  if (policy === "warn") {
+    console.error(`[config] vendor-diversity WARNING (not fatal — no gate-stage tier vars declared): ${violations.join("; ")}`);
+  }
 }

@@ -35,6 +35,21 @@ export interface ReportInput {
   // its default card with the full ceiling, so an unrouted run's report is
   // byte-identical to what it was before routing existed.
   routing?: RoutingEntry[];
+  // Structured gate outputs (issue #6 Part 1): how each gate stage's verdict
+  // was recovered — schema-validated structured output, a fenced json block,
+  // the legacy in-band token, or not at all ("unresolved", which the loop
+  // routes fail-closed). `action` is the stage's recommendedAction: ADVISORY
+  // ONLY, surfaced here for humans/telemetry — it is never an input to
+  // merge-ladder.ts. Omitted entirely on runs where no gate stage ran.
+  gateVerdicts?: GateVerdictEntry[];
+}
+
+export interface GateVerdictEntry {
+  stage: string;
+  verdict: "pass" | "fail" | "uncertain" | "unresolved";
+  source: "structured" | "fenced-json" | "token" | "none";
+  findings: number;
+  action: "continue" | "repair" | "escalate" | "none";
 }
 
 export interface RoutingEntry {
@@ -102,6 +117,11 @@ export function buildReport(input: ReportInput): string {
     }
     lines.push("");
   }
+  const gateVerdicts = input.gateVerdicts ?? [];
+  if (gateVerdicts.length > 0) {
+    lines.push(`**Gate verdicts:** ${gateVerdicts.map((g) =>
+      `${g.stage} ${g.verdict === "unresolved" ? "UNRESOLVED" : g.verdict} (${g.source}${g.findings > 0 ? `, ${g.findings} finding${g.findings === 1 ? "" : "s"}` : ""})`).join(" · ")}`, "");
+  }
   const gateLines = input.gates.map((g) =>
     `- ${g.name}: ${g.passed === null ? "no-gate (fails on baseline)" : g.passed ? "pass" : "FAIL"}`);
   if (gateLines.length > 0) lines.push("**Gates:**", ...gateLines, "");
@@ -132,6 +152,16 @@ export function buildReport(input: ReportInput): string {
       lines.push(`      tools: ${r.toolCount}`);
       if (r.narrowed) lines.push("      narrowed: true");
       if (r.unknownTools.length > 0) lines.push(`      unknown_tools: ${JSON.stringify(r.unknownTools.join(" "))}`);
+    }
+  }
+  if (gateVerdicts.length > 0) {
+    lines.push("  gate_verdicts:");
+    for (const g of gateVerdicts) {
+      lines.push(`    - stage: ${g.stage}`);
+      lines.push(`      verdict: ${g.verdict}`);
+      lines.push(`      source: ${g.source}`);
+      lines.push(`      findings: ${g.findings}`);
+      lines.push(`      action: ${g.action}`);
     }
   }
   lines.push(`  guarded_paths: ${input.guardedPaths.length}`);
