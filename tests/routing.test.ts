@@ -10,6 +10,7 @@ import {
   type RepoFacts, type RoutableCard,
 } from "../src/routing.ts";
 import { forbiddenToolViolations } from "../src/agents.ts";
+import { delegateTools } from "../src/discovery.ts";
 import { cardTools, listRoutableCards, getCard, listCards } from "../src/catalog.ts";
 import { CANDIDATES } from "../src/verify.ts";
 import { parseFactoryMeta, resolveModel } from "../src/meta.ts";
@@ -649,4 +650,76 @@ describe("invariant 1, PG-sourced: a register card's declaration can only SUBTRA
       expect(forbiddenToolViolations(tools)).toEqual([]);
     }
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #17 part 2 — delegation triple intersection. delegateTools() is
+// parent allowlist ∩ entry tools: selection ∩ role ceiling, and the theorem
+// to fuzz is ⊆-parent for ARBITRARY register declarations: no delegable row —
+// whatever its role:, tools:, or garbage therein — can mint a delegate
+// holding a tool its parent stage lacks (no privilege escalation via
+// delegation), nor Task/Agent (depth 1), nor any forbidden matcher.
+// ---------------------------------------------------------------------------
+describe("delegation triple intersection (issue #17 part 2)", () => {
+  const roles = ["implementer", "fixer", "tester", "scout", "steward", "reviewer-repo",
+    "scaffolder", "decomposer", "", "no-such-role", "worker", "migration-writer"];
+
+  test("fuzz: arbitrary register declarations — every delegate allowlist ⊆ parent ∩ ceiling, never Task/Agent", () => {
+    const alphabet = "ReadWriteEditBashGlobGrepTaskAgent()[]*:,git push -force gh pr merge sh rm/\\'\"\n\t{}$;|&";
+    let seed = 0x17de1e6;
+    const rand = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const randString = (max: number): string => {
+      let s = "";
+      const len = Math.floor(rand() * max);
+      for (let j = 0; j < len; j++) s += alphabet[Math.floor(rand() * alphabet.length)];
+      return s;
+    };
+    const parents = [IMPLEMENTER_TOOLS, FIXER_TOOLS, TESTER_TOOLS, SCOUT_TOOLS];
+    for (let i = 0; i < 2000; i++) {
+      // Arbitrary parent: a random subset of a real orchestrator ceiling —
+      // exactly what resolveTools can hand a stage (⊆ ceiling always holds).
+      const full = parents[Math.floor(rand() * parents.length)]!;
+      const parent = full.filter(() => rand() < 0.7);
+      // Arbitrary declaration: role from a grab-bag (real, unknown, empty,
+      // judge) or pure noise; tools pure noise; extra junk keys ignored.
+      const role = rand() < 0.5 ? roles[Math.floor(rand() * roles.length)]! : randString(20);
+      const frontmatter: Record<string, string> = { delegable: "true", tools: randString(60) };
+      if (rand() < 0.8) frontmatter.role = role;
+      const name = rand() < 0.5 ? "some-specialist" : role;
+      const tools = delegateTools(parent, name, frontmatter);
+      expect(new Set(tools).size).toBe(tools.length);            // no duplicates
+      for (const t of tools) {
+        expect(parent, `delegate for role "${role}" holds "${t}" its parent lacks`).toContain(t);
+        expect(["Task", "Agent"]).not.toContain(t.replace(/\(.*$/, ""));   // depth 1
+      }
+      const ceiling = ceilingForRole((frontmatter.role ?? "").trim() || name) ?? [];
+      for (const t of tools) expect(ceiling).toContain(t);       // ⊆ role ceiling
+      expect(forbiddenToolViolations(tools)).toEqual([]);
+    }
+  });
+
+  test("no tools: declaration → the full parent ∩ ceiling (minus Task/Agent), never more", () => {
+    const tools = delegateTools(IMPLEMENTER_TOOLS, "helper", { role: "fixer" });
+    // fixer ceiling ∩ implementer allowlist = FIXER_TOOLS minus Write, minus Task/Agent.
+    expect(tools).toEqual(FIXER_TOOLS.filter((t) => IMPLEMENTER_TOOLS.includes(t) && t !== "Task" && t !== "Agent"));
+    expect(tools).not.toContain("Write"); // fixer's ceiling never held it
+  });
+
+  test("a delegate can never hold a tool its parent lacks — even when its own ceiling grants it", () => {
+    // Parent is a narrowed implementer without Bash; the entry's role ceiling
+    // (implementer) grants Bash — the intersection must drop it.
+    const parent = IMPLEMENTER_TOOLS.filter((t) => !t.startsWith("Bash("));
+    const tools = delegateTools(parent, "helper", { role: "implementer", tools: "Bash, Read" });
+    expect(tools).toEqual(["Read"]);
+  });
+
+  test("unknown or absent role fails CLOSED: no ceiling, no tools", () => {
+    expect(delegateTools(IMPLEMENTER_TOOLS, "mystery-agent", {})).toEqual([]);
+    expect(delegateTools(IMPLEMENTER_TOOLS, "mystery-agent", { role: "not-a-role", tools: "Read" })).toEqual([]);
+  });
+
+  test("an entry named after a wired role gets that role's ceiling (roles are named after their card)", () => {
+    const tools = delegateTools(IMPLEMENTER_TOOLS, "tester", {});
+    expect(tools).toEqual(TESTER_TOOLS.filter((t) => IMPLEMENTER_TOOLS.includes(t) && t !== "Task" && t !== "Agent"));
+  });
 });

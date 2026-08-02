@@ -771,6 +771,25 @@ export async function createIssue(teamKey: string, title: string, description: s
   return data.issueCreate.issue.identifier;
 }
 
+/** Link an already-created issue under a parent, by identifier. Bootstrap
+ * files its build epic via createIssue (which cannot set parentId without the
+ * child landing as a sub-issue pre-registration) and then links it here, so
+ * the steward/reconcile "children all terminal → close parent" lifecycle can
+ * ever fire for the bootstrap ticket. Live-found 2026-08-02: FAC-54 sat In
+ * Progress forever because its build epic had no child link — the closeout
+ * pass requires children and saw none. Best-effort by design: a failed link
+ * degrades to exactly the old behaviour (human closes the ticket). */
+export async function setIssueParent(childIdentifier: string, parent: Issue): Promise<boolean> {
+  const child = await gql<{ issue: { id: string } | null }>(
+    `query($id: String!) { issue(id: $id) { id } }`, { id: childIdentifier });
+  if (!child.issue) return false;
+  const data = await gql<{ issueUpdate: { success: boolean } }>(
+    `mutation($id: String!, $parentId: String!) {
+      issueUpdate(id: $id, input: { parentId: $parentId }) { success } }`,
+    { id: child.issue.id, parentId: parent.id });
+  return data.issueUpdate.success;
+}
+
 export async function postComment(issue: Issue, body: string): Promise<void> {
   await gql(`mutation($issueId: String!, $body: String!) {
     commentCreate(input: { issueId: $issueId, body: $body }) { success } }`, { issueId: issue.id, body });

@@ -113,8 +113,39 @@ export function hasCommitsAheadOfBase(ws: Workspace): boolean {
   return r.ok && parseInt(r.stdout.trim() || "0", 10) > 0;
 }
 
+// Factory-owned scratch INSIDE the worktree (issue #17): materialized register
+// skills live under <worktree>/.factory/ so workers can Read them on demand.
+// That content is prompt material, not repo work — it must NEVER reach a
+// commit, a diff, or a PR. Two independent legs enforce it: commitAll's
+// pathspec exclusion below (so `git add -A` cannot sweep it in), and the
+// classifier exclusion in classifyPaths (so even a leaked path never enters
+// guarded-path output). Note .factory/skills/ would otherwise match the
+// skills/ guard regex — the exclusion must run FIRST.
+//
+// ROOT-ANCHORED by design: git pathspecs are rooted, so commitAll's
+// ":(exclude).factory" excludes ONLY the top-level .factory/ — a NESTED
+// `anything/.factory/…` path commits like any other file. The classifier's
+// blind spot must therefore be EXACTLY the set commitAll refuses to stage, and
+// nothing more: an any-depth exclusion here would let a committed
+// `web/.factory/CLAUDE.md` (or a nested workflow/test) reach the PR while
+// staying invisible to guardedPathsTouched — and thus to MergeEvidence.guarded,
+// silently bypassing the human review the guard exists to force. Materialization
+// only ever writes the root `.factory/`, so root-anchored loses nothing.
+export const FACTORY_SCRATCH_RE = /^\.factory\//;
+
+/** True when `file` is factory-owned worktree scratch (top-level .factory/ —
+ *  the exact set commitAll's rooted pathspec exclusion keeps out of commits).
+ *  A nested `x/.factory/…` path is NOT scratch: it commits, so it must stay
+ *  classifiable as guarded. */
+export function isFactoryScratchPath(file: string): boolean {
+  return FACTORY_SCRATCH_RE.test(file);
+}
+
 export function commitAll(ws: Workspace, message: string): boolean {
-  git(ws.dir, ["add", "-A"]);
+  // ":(exclude).factory": the worktree-scratch dir (materialized skills) is
+  // never committed — see FACTORY_SCRATCH_RE above. The "." pathspec keeps
+  // -A's full-tree coverage for everything else.
+  git(ws.dir, ["add", "-A", "--", ".", ":(exclude).factory"]);
   // --no-verify: repo-committed hooks are repo-controlled code execution in the
   // worker, and a failing hook masquerades as "no changes" (M2).
   return git(ws.dir, ["commit", "--no-verify", "-m", message]).ok;
@@ -169,7 +200,7 @@ const GUARDED_PATH_RES = [...NON_TEST_GUARDED_RES, TEST_PATH_RE];
  * add-vs-modify doesn't matter, e.g. testFilesRemoved's own deletion filter);
  * classifyStatusPaths below is the status-aware variant guardedPathsTouched uses. */
 export function classifyPaths(files: string[]): string[] {
-  return files.filter((f) => GUARDED_PATH_RES.some((g) => g.test(f)));
+  return files.filter((f) => !isFactoryScratchPath(f) && GUARDED_PATH_RES.some((g) => g.test(f)));
 }
 
 /** One `git diff --name-status` entry. For renames git emits `R100\told\tnew`;
