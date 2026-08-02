@@ -77,6 +77,39 @@ function startOfLocalDayMs(now: Date): number {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
 }
 
+// Single-flight gate for the cap's read-check-increment (issue #8 F3): the
+// check awaits a DB round-trip between reading the count and bumping the
+// in-memory counter, so concurrent captures could ALL pass the check and
+// overshoot the cap. Same promise-chain mutex shape as db.ts's ladderLocks —
+// one global chain (the cap is global, not keyed), held only across the
+// check+increment, never across the distiller call itself.
+let capGate: Promise<unknown> = Promise.resolve();
+
+/** Atomically reserve one distiller call against today's budget. True = the
+ *  caller may spend one call (the attempt is already counted); false = the cap
+ *  is exhausted. Exported for tests (the race pin in tests/lessons-cap.test.ts);
+ *  production's only caller is captureLesson below. */
+export async function reserveDistillerCall(): Promise<boolean> {
+  const previous = capGate;
+  let release!: () => void;
+  capGate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await previous.catch(() => { /* a failed predecessor still releases the gate */ });
+    if ((await distillerCallsToday()) >= MAX_DISTILLER_CALLS_PER_DAY) return false;
+    attemptsToday += 1;
+    return true;
+  } finally {
+    release();
+  }
+}
+
+/** Test-only: forget the in-memory day counter so a test can simulate a fresh
+ *  process (the persisted-row floor in distillerCallsToday then re-baselines). */
+export function resetDistillerBudgetForTests(): void {
+  attemptDay = "";
+  attemptsToday = 0;
+}
+
 async function distillerCallsToday(): Promise<number> {
   const now = new Date();
   const today = localDayKey(now);
@@ -143,11 +176,10 @@ export async function captureLesson(input: LessonCaptureInput): Promise<void> {
       console.log(`[lessons] event store closed — skipping capture for ${input.issueKey} (${input.outcome})`);
       return;
     }
-    if ((await distillerCallsToday()) >= MAX_DISTILLER_CALLS_PER_DAY) {
+    if (!(await reserveDistillerCall())) {
       console.error(`[lessons] daily distiller cap (${MAX_DISTILLER_CALLS_PER_DAY}) reached — skipping capture for ${input.issueKey}`);
       return;
     }
-    attemptsToday += 1;
 
     // The distiller sees ONLY redacted event text, inside an untrusted frame,
     // with no tools — lesson content is data distilled from data.

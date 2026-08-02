@@ -135,6 +135,18 @@ const DDL: string[] = [
   // idempotent outright rather than idempotent-by-failing like the SQLite era.
   "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS regate_failed BOOLEAN NOT NULL DEFAULT FALSE",
   "CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, id)",
+  // issue #8 F6: "at most one PENDING item per issue" used to be application
+  // discipline (insertApproval's supersede-then-insert is two statements with
+  // no transaction around them); the partial unique index makes it STRUCTURAL —
+  // a concurrent double-insert now conflicts instead of yielding two pending
+  // rows. The UPDATE first resolves any duplicates a pre-index build already
+  // let in, exactly the way the supersede leg would have: newest pending row
+  // per issue survives, older ones go stale. Idempotent (no dupes → no rows),
+  // and it must precede the index or CREATE UNIQUE INDEX would fail on the
+  // very duplicates it exists to prevent.
+  `UPDATE approvals SET status = 'stale', resolution = 'superseded by a newer run', updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
+     WHERE status = 'pending' AND id NOT IN (SELECT MAX(id) FROM approvals WHERE status = 'pending' GROUP BY issue_key)`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_one_pending ON approvals(issue_key) WHERE status = 'pending'",
   // Push-back feedback handoff: the owner's directive travels from the
   // pushback endpoint to the NEXT run of the same issue via this one-row-per-
   // issue table. Consumed exactly once (takePushbackFeedback = a single
@@ -173,6 +185,24 @@ let draining: Promise<void> | null = null;
 let inFlightEvents = 0;
 let droppedEvents = 0;
 let lastWriteError: string | null = null;
+/** Monotone count of event batches DURABLY WRITTEN — the flush watermark.
+ *  getTelemetry keys its single-flight sharing on this (issue #8 F7): a caller
+ *  may only adopt an in-flight aggregate that started at or after the caller's
+ *  own flush, so nobody ever receives numbers older than events they just saw
+ *  land. Deliberately NOT bumped on dropped batches: dropped rows never reach
+ *  the table, so an aggregate computed without them is not stale — it is
+ *  exactly what any fresh computation would also see. */
+let flushGeneration = 0;
+/** False after a PERSISTENT write failure (a batch was dropped even after its
+ *  retry), true again the moment a later batch lands. Feeds eventStoreOpen()
+ *  so the governance gates that key on it (groundskeeper budget/parks,
+ *  captureLesson) fail CLOSED during a mid-run Postgres outage instead of
+ *  consulting a store that is silently dropping the very events they meter
+ *  (issue #8 F2 — eventStoreOpen used to be a one-way latch set at startup).
+ *  Deliberately NOT flipped by queue-overflow drops: those prove the writer is
+ *  behind, not that the store is unreachable — and a real outage flips this
+ *  anyway the moment the drain reaches the store. */
+let writeHealthy = true;
 let subscribed: (() => void) | null = null;
 
 /** Sync, never throws — the bus subscriber's whole body. */
@@ -215,6 +245,8 @@ function drain(): Promise<void> {
         inFlightEvents = batch.length;
         try {
           await writeBatch(batch);
+          writeHealthy = true;
+          flushGeneration += 1;
         } catch (error) {
           lastWriteError = String(error instanceof Error ? error.message : error);
           // One retry, then drop LOUDLY. The SQLITE_BUSY catch this replaces
@@ -222,9 +254,17 @@ function drain(): Promise<void> {
           // MVCC a write failure is strictly rarer than it was.
           try {
             await writeBatch(batch);
+            writeHealthy = true;
+            flushGeneration += 1;
           } catch {
             droppedEvents += batch.length;
-            console.error(`[db] event batch dropped (${batch.length} rows): ${lastWriteError}`);
+            // Both attempts failed — the store is unreachable RIGHT NOW, and
+            // rows were lost. Flip the governance gate closed until a later
+            // batch proves recovery (conservative: unhealthy sticks while no
+            // writes flow, and the daemon emits events constantly, so a real
+            // recovery clears it within one drain).
+            writeHealthy = false;
+            console.error(`[db] event batch dropped (${batch.length} rows): ${lastWriteError} — eventStoreOpen() now false until a write lands (governance gates fail closed)`);
           }
         } finally {
           inFlightEvents = 0;
@@ -258,7 +298,7 @@ export function pendingEventWrites(): number {
 /** Operability snapshot: how far behind the writer is and what last broke.
  *  Sync (module state, not a query). */
 export function storeHealth(): { open: boolean; pending: number; dropped: number; lastError: string | null } {
-  return { open: state === "open", pending: pendingEventWrites(), dropped: droppedEvents, lastError: lastWriteError };
+  return { open: state === "open" && writeHealthy, pending: pendingEventWrites(), dropped: droppedEvents, lastError: lastWriteError };
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +343,7 @@ export async function startEventStore(): Promise<void> {
     }
     store = s;
     state = "open";
+    writeHealthy = true;
     if (!subscribed) subscribed = bus.subscribe(enqueue);
   })().catch((error) => {
     opening = null;
@@ -311,13 +352,18 @@ export async function startEventStore(): Promise<void> {
   return opening;
 }
 
-/** True when the durable event store is open. Budget/parks governance is only
- *  enforceable with the store open — callers must fail CLOSED when it isn't.
+/** True when the durable event store is open AND its writes are landing.
+ *  Budget/parks governance is only enforceable with a store that is actually
+ *  recording spend — callers must fail CLOSED when it isn't. "Open" alone was
+ *  a one-way latch set at startup (issue #8 F2): a mid-run Postgres outage
+ *  left the gates consulting a store that was silently dropping the events
+ *  they meter. Now a persistent write failure (a dropped batch — see drain())
+ *  reads as closed until a later write proves recovery.
  *  Deliberately SYNCHRONOUS: it reads module state, never the database, so the
  *  fail-closed gates in groundskeeperTick / captureLesson keep working exactly
  *  as they did (no await, no chance of a rejected promise reading as "open"). */
 export function eventStoreOpen(): boolean {
-  return state === "open";
+  return state === "open" && writeHealthy;
 }
 
 /** Full historical event stream for one issue (all sessions). */
@@ -537,17 +583,26 @@ let telemetryCache: { watermark: number; day: string; value: Telemetry } | null 
 // Single-flight guard. Now that this is async, two simultaneous dashboard polls
 // would BOTH miss the watermark and BOTH run the double full scan; sharing one
 // in-flight computation removes a stampede the synchronous version could not
-// have had.
-let telemetryInFlight: Promise<Telemetry> | null = null;
+// have had. KEYED on the flush watermark (issue #8 F7): an in-flight compute
+// that started at generation G may be adopted only by callers whose own flush
+// left the generation at ≤ G — a caller whose events landed AFTER the compute
+// began would otherwise receive an aggregate older than what it just wrote.
+let telemetryInFlight: { gen: number; promise: Promise<Telemetry> } | null = null;
 
 /** Aggregate GET /telemetry from the durable event log. Returns a zeroed shape
- *  when the store is not open or holds no events. */
+ *  when the store is not open or holds no events. Guarantee: the result is
+ *  never older than the caller's own flushed events. */
 export async function getTelemetry(): Promise<Telemetry> {
   await flushEvents();
   if (!store) return emptyTelemetry();
-  if (telemetryInFlight) return telemetryInFlight;
-  telemetryInFlight = computeTelemetry().finally(() => { telemetryInFlight = null; });
-  return telemetryInFlight;
+  const gen = flushGeneration;
+  if (telemetryInFlight && telemetryInFlight.gen >= gen) return telemetryInFlight.promise;
+  const promise = computeTelemetry().finally(() => {
+    // Clear only if a fresher compute has not already replaced this slot.
+    if (telemetryInFlight?.promise === promise) telemetryInFlight = null;
+  });
+  telemetryInFlight = { gen, promise };
+  return promise;
 }
 
 async function computeTelemetry(): Promise<Telemetry> {
@@ -666,7 +721,12 @@ async function computeTelemetry(): Promise<Telemetry> {
     .map(([issueKey, v]) => ({ issueKey, costUsd: v.costUsd, runs: v.runs }))
     .sort((a, b) => b.costUsd - a.costUsd)
     .slice(0, 10);
-  telemetryCache = { watermark, day: today, value: t };
+  // Never let a slow, stale compute overwrite a fresher cache entry: with the
+  // watermark-keyed single-flight (issue #8 F7) two computes CAN overlap, and
+  // the older one may finish last.
+  if (!telemetryCache || telemetryCache.day !== today || watermark >= telemetryCache.watermark) {
+    telemetryCache = { watermark, day: today, value: t };
+  }
   return t;
 }
 
@@ -967,11 +1027,23 @@ function toApprovalItem(r: RawApprovalRow): ApprovalItem {
   };
 }
 
+/** Attempts insertApproval makes when its INSERT keeps losing the one-pending-
+ *  row-per-issue index to a concurrent filer. IN-CODE CONSTANT, not an env knob
+ *  (CLAUDE.md). Two contenders resolve in at most two rounds; three is margin. */
+const MAX_APPROVAL_INSERT_ATTEMPTS = 3;
+
 /** Insert a new approval item, superseding any still-pending item for the same
  *  issue (a re-run's fresh evidence makes the old card unreliable — its gated
  *  SHA no longer matches the branch, so it could only ever refuse). Returns the
  *  new row id, or null when the store is closed. Caller (approvals.ts) has
- *  already redacted/capped every string. */
+ *  already redacted/capped every string.
+ *
+ *  issue #8 F6: supersede-then-insert is two statements, so two concurrent
+ *  filers used to be able to interleave into TWO pending rows. The partial
+ *  unique index (idx_approvals_one_pending, WHERE status='pending') now makes
+ *  that impossible structurally; this function handles the resulting conflict
+ *  by superseding again and retrying — the newest evidence wins, exactly the
+ *  semantic the two-statement version was reaching for. */
 export async function insertApproval(row: {
   issueKey: string; title: string; repo: string; prUrl: string;
   gatedHeadSha: string | null; holdReasons: string;
@@ -981,19 +1053,28 @@ export async function insertApproval(row: {
 }): Promise<number | null> {
   if (!store) return null;
   const now = Date.now();
-  await store.exec(
-    "UPDATE approvals SET status = 'stale', resolution = 'superseded by a newer run', updated_at = $1 WHERE issue_key = $2 AND status = 'pending'",
-    [now, row.issueKey]);
-  const rows = await store.query<{ id: unknown }>(
-    `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, regate_failed, status, resolution)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', '')
-     RETURNING id::float8 AS id`,
-    [now, now, row.issueKey, row.title, row.repo, row.prUrl, row.gatedHeadSha, row.holdReasons,
-      row.gateSummary ? JSON.stringify(row.gateSummary) : null,
-      row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns,
-      row.regateFailed]);
-  const id = num(rows[0]?.id);
-  return id > 0 ? id : null;
+  for (let attempt = 0; attempt < MAX_APPROVAL_INSERT_ATTEMPTS; attempt++) {
+    await store.exec(
+      "UPDATE approvals SET status = 'stale', resolution = 'superseded by a newer run', updated_at = $1 WHERE issue_key = $2 AND status = 'pending'",
+      [now, row.issueKey]);
+    // ON CONFLICT is inferred against idx_approvals_one_pending (the partial
+    // unique index above). DO NOTHING + RETURNING means a lost race comes back
+    // as ZERO rows instead of an exception — loop back to supersede the row
+    // that beat us and insert again.
+    const rows = await store.query<{ id: unknown }>(
+      `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, regate_failed, status, resolution)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', '')
+       ON CONFLICT (issue_key) WHERE status = 'pending' DO NOTHING
+       RETURNING id::float8 AS id`,
+      [now, now, row.issueKey, row.title, row.repo, row.prUrl, row.gatedHeadSha, row.holdReasons,
+        row.gateSummary ? JSON.stringify(row.gateSummary) : null,
+        row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns,
+        row.regateFailed]);
+    const id = num(rows[0]?.id);
+    if (id > 0) return id;
+  }
+  console.error(`[db] insertApproval lost the pending-row race ${MAX_APPROVAL_INSERT_ATTEMPTS} times for ${row.issueKey} — a concurrent filer's item stands`);
+  return null;
 }
 
 /** Pending items, newest first — the GET /approvals payload. */
@@ -1131,6 +1212,21 @@ export interface TestStoreOptions {
    *  enqueue → drain → flushEvents contract itself — turns it on, and
    *  closeTestDatabase() always detaches it again. */
   subscribeBus?: boolean;
+  /** Test-only outage simulation: make the FIRST N event-batch INSERTs reject,
+   *  exactly as an unreachable Postgres would. N = 2 exercises the persistent-
+   *  failure path (first attempt + its retry both fail → batch dropped →
+   *  eventStoreOpen() flips false); N = 1 exercises the transient path (the
+   *  retry lands, the gate stays open). Everything else — reads, other writes —
+   *  hits the real engine, so only the drain's failure handling is simulated. */
+  failEventWrites?: number;
+  /** Test-only interleaving control (issue #8 F7): after the FIRST query whose
+   *  SQL contains `contains` has EXECUTED (rows already fetched from the
+   *  engine), hold those rows back from the caller until `release` resolves;
+   *  `onHeld` fires the moment the hold begins. One-shot — every later query
+   *  passes straight through. This is what lets the telemetry staleness test
+   *  park one compute mid-flight DETERMINISTICALLY, land newer events, and
+   *  prove a second caller does not adopt the stale in-flight aggregate. */
+  holdQueryResult?: { contains: string; release: Promise<void>; onHeld?: () => void };
 }
 
 /** Test seam. First call boots the WASM engine + schema; every later call is
@@ -1142,9 +1238,44 @@ export async function openTestDatabase(opts: TestStoreOptions = {}): Promise<voi
   }
   await testEngine.exec(`TRUNCATE ${TEST_TABLES} RESTART IDENTITY`);
   store = testEngine;
+  if (opts.failEventWrites && opts.failEventWrites > 0) {
+    const inner = testEngine;
+    let remaining = opts.failEventWrites;
+    store = {
+      query: (text, params) => inner.query(text, params),
+      exec: (text, params) => {
+        if (remaining > 0 && text.startsWith("INSERT INTO events")) {
+          remaining -= 1;
+          return Promise.reject(new Error("simulated postgres outage (failEventWrites)"));
+        }
+        return inner.exec(text, params);
+      },
+      close: () => inner.close(),
+    };
+  }
+  if (opts.holdQueryResult) {
+    const inner = store;
+    const hold = opts.holdQueryResult;
+    let armed = true;
+    store = {
+      query: async <T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<T[]> => {
+        const rows = await inner.query<T>(text, params);
+        if (armed && text.includes(hold.contains)) {
+          armed = false;
+          hold.onHeld?.();
+          await hold.release;
+        }
+        return rows;
+      },
+      exec: (text, params) => inner.exec(text, params),
+      close: () => inner.close(),
+    };
+  }
   state = "open";
+  writeHealthy = true;
   telemetryCache = null;
   telemetryInFlight = null;
+  flushGeneration = 0;
   queue.length = 0;
   draining = null;
   inFlightEvents = 0;
@@ -1169,8 +1300,10 @@ export async function closeTestDatabase(): Promise<void> {
   const inFlight = draining;
   if (inFlight) await inFlight.catch(() => { /* drain never rejects, but be safe */ });
   state = "closed";
+  writeHealthy = true;
   telemetryCache = null;
   telemetryInFlight = null;
+  flushGeneration = 0;
   queue.length = 0;
   draining = null;
   inFlightEvents = 0;

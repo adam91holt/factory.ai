@@ -1,12 +1,16 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test } from "bun:test";
-import { saveCatalogEntry, validateAgentCardRouting, type SaveResult } from "../src/catalog-manager.ts";
+import { commitBlockers, saveCatalogEntry, validateAgentCardRouting, type SaveResult } from "../src/catalog-manager.ts";
 
-// ONLY the rejection legs are exercised: every case below returns before
-// saveCatalogEntry reaches its writeFileSync/git section, so the suite never
-// touches the working tree, never commits, never needs cleanup.
+// Almost every case below is a rejection leg that returns before
+// saveCatalogEntry reaches its writeFileSync/git section, so it touches
+// nothing and needs no cleanup. The exceptions are clearly marked: the
+// FACTORY_CATALOG_NO_COMMIT write-path test (tests/setup.ts sets that var for
+// the whole suite, so a successful save writes its file but NEVER touches git)
+// and the commit-guard test (which deletes the var locally but injects the
+// porcelain text, so no git process runs and the guard 409s before any write).
 
 const err = (r: SaveResult): string => String((r.json as { error?: unknown }).error ?? "");
 
@@ -217,5 +221,103 @@ describe("saveCatalogEntry — agent-card routing ceiling", () => {
     expect(validateAgentCardRouting("implementer-ui",
       { name: "implementer-ui", role: "implementer", match: "ui playwright", tools: "[Read, Bash(gh pr view:*)]" },
       IMPLEMENTER_UI_MD)).toMatch(/not in this stage's ceiling/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Commit guard + FACTORY_CATALOG_NO_COMMIT (issue #8 F8). /catalog/save used
+// to git-commit unconditionally, which let a subagent exercising the endpoint
+// mint REAL commits on main. Two defenses now exist and both are pinned here:
+// the save refuses (409, before writing anything) when the repo tree has
+// unrelated staged/modified files, and FACTORY_CATALOG_NO_COMMIT=1 (set for
+// this whole suite by tests/setup.ts) makes a successful save write its file
+// without ever touching git.
+// ---------------------------------------------------------------------------
+
+describe("commitBlockers — pure porcelain classification", () => {
+  const rel = "agents/zz-any.md";
+
+  test("a clean tree blocks nothing", () => {
+    expect(commitBlockers("", rel)).toEqual([]);
+    expect(commitBlockers("\n", rel)).toEqual([]);
+  });
+
+  test("untracked files never block — a pathspec-scoped commit cannot sweep them in", () => {
+    expect(commitBlockers("?? scratch.txt\n?? tmp/notes.md\n", rel)).toEqual([]);
+  });
+
+  test("the card file's own staged/modified entry is exempt (it IS the audit trail)", () => {
+    expect(commitBlockers(`M  ${rel}\n`, rel)).toEqual([]);
+    expect(commitBlockers(` M ${rel}\n`, rel)).toEqual([]);
+  });
+
+  test("any other staged or modified tracked file blocks", () => {
+    expect(commitBlockers(" M src/loop.ts\n", rel)).toEqual(["src/loop.ts"]);
+    expect(commitBlockers("M  src/db.ts\n", rel)).toEqual(["src/db.ts"]);
+    expect(commitBlockers("A  src/new.ts\nD  src/old.ts\n", rel)).toEqual(["src/new.ts", "src/old.ts"]);
+  });
+
+  test("a RENAME blocks even when it involves the card file — that is never a plain content edit", () => {
+    expect(commitBlockers(`R  ${rel} -> agents/renamed.md\n`, rel)).toEqual([`${rel} -> agents/renamed.md`]);
+  });
+
+  test("mixed tree: only the real blockers are reported, in order", () => {
+    const porcelain = `?? scratch.txt\nM  ${rel}\n M src/loop.ts\n?? tmp/x\nA  docs/adr/new.md\n`;
+    expect(commitBlockers(porcelain, rel)).toEqual(["src/loop.ts", "docs/adr/new.md"]);
+  });
+});
+
+describe("saveCatalogEntry — commit guard + no-commit mode (issue #8 F8)", () => {
+  const AGENTS_DIR = join(fileURLToPath(new URL("..", import.meta.url)), "agents");
+  const WRITE_CARD = join(AGENTS_DIR, "zz-nc-write-agent.md");
+  const GUARD_CARD = join(AGENTS_DIR, "zz-nc-guard-agent.md");
+  for (const f of [WRITE_CARD, GUARD_CARD]) {
+    if (existsSync(f)) throw new Error(`fixture collision: ${f} already exists — this suite owns that name`);
+  }
+  afterEach(() => {
+    rmSync(WRITE_CARD, { force: true });
+    rmSync(`${WRITE_CARD}.tmp`, { force: true });
+    expect(existsSync(GUARD_CARD), "the commit-guard 409 leg WROTE its card file — the refusal must precede the write").toBe(false);
+  });
+
+  test("with FACTORY_CATALOG_NO_COMMIT=1 a valid save writes the file and NEVER touches git", () => {
+    // tests/setup.ts sets the var for the whole suite; assert that rather than
+    // assume it, because this test writing a file is only safe under it.
+    expect(process.env.FACTORY_CATALOG_NO_COMMIT).toBe("1");
+    const r = saveCatalogEntry({ kind: "agent", name: "zz-nc-write-agent", content: "---\nname: zz-nc-write-agent\n---\nprompt body" });
+    expect(r.status).toBe(200);
+    const json = r.json as { ok?: unknown; commit?: unknown; note?: unknown };
+    expect(json.ok).toBe(true);
+    expect(json.commit).toBeNull();
+    expect(String(json.note)).toMatch(/FACTORY_CATALOG_NO_COMMIT/);
+    expect(readFileSync(WRITE_CARD, "utf8")).toBe("---\nname: zz-nc-write-agent\n---\nprompt body\n");
+  });
+
+  test("without the env var, unrelated staged/modified files 409 BEFORE anything is written", () => {
+    const saved = process.env.FACTORY_CATALOG_NO_COMMIT;
+    delete process.env.FACTORY_CATALOG_NO_COMMIT;
+    try {
+      // Injected porcelain (test seam) — no git process runs, and the guard
+      // refuses before the write, so nothing on disk can change either way.
+      const r = saveCatalogEntry(
+        { kind: "agent", name: "zz-nc-guard-agent", content: "---\nname: zz-nc-guard-agent\n---\nbody" },
+        { gitStatusPorcelain: " M src/loop.ts\nM  src/db.ts\n?? scratch.txt\n" },
+      );
+      expect(r.status).toBe(409);
+      expect(err(r)).toMatch(/unrelated staged\/modified/);
+      expect(err(r)).toMatch(/nothing was written/);
+      expect(err(r)).toContain("src/loop.ts");
+      expect(existsSync(GUARD_CARD)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.FACTORY_CATALOG_NO_COMMIT;
+      else process.env.FACTORY_CATALOG_NO_COMMIT = saved;
+    }
+  });
+
+  test("without the env var, a tree whose only dirt is untracked files passes the guard", () => {
+    // Deliberately verified at the commitBlockers level (nothing blocks), NOT
+    // by letting saveCatalogEntry fall through — past the guard it would run a
+    // REAL `git add`/`git commit`, which a test must never do.
+    expect(commitBlockers("?? scratch.txt\n?? .env.local\n", "agents/zz-nc-guard-agent.md")).toEqual([]);
   });
 });

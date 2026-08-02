@@ -122,6 +122,35 @@ describe("approval rows (db)", () => {
     expect(await takePushbackFeedback("FAC-43")).toBe("tighten the null handling");
     expect(await takePushbackFeedback("FAC-43")).toBeNull(); // consumed
   });
+
+  test("a CONCURRENT double-insert cannot yield two pending rows (issue #8 F6)", async () => {
+    // Two filers race the supersede-then-insert pair. Before the partial
+    // unique index (idx_approvals_one_pending, WHERE status='pending') their
+    // statements could interleave into TWO pending rows; now the second INSERT
+    // conflicts and insertApproval retries the supersede — whatever the
+    // interleaving, exactly one pending row survives and it is the newest.
+    const [a, b] = await Promise.all([
+      seedItem({ title: "first filer" }),
+      seedItem({ title: "second filer" }),
+    ]);
+    expect(a).not.toBe(b);
+    expect(await pendingApprovalCount()).toBe(1);
+    const pending = await listPendingApprovals();
+    expect(pending.length).toBe(1);
+    expect(pending[0]?.id).toBe(Math.max(a, b));
+    // The loser was resolved the supersede way, never deleted: audit trail intact.
+    expect((await getApproval(Math.min(a, b)))?.status).toBe("stale");
+    expect((await getApproval(Math.min(a, b)))?.resolution).toContain("superseded");
+  });
+
+  test("the one-pending-per-issue constraint is STRUCTURAL, not application discipline", async () => {
+    // Different issues coexist; the same issue cannot hold two pendings even
+    // across many sequential filings.
+    const other = await seedItem({ issueKey: "FAC-99" });
+    for (let i = 0; i < 3; i++) await seedItem();
+    expect((await getApproval(other))?.status).toBe("pending"); // untouched — constraint is per-issue
+    expect(await pendingApprovalCount()).toBe(2);               // FAC-43 + FAC-99, one each
+  });
 });
 
 describe("approve — the human merge authority", () => {

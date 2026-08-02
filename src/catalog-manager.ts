@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "./agents.ts";
 import { invalidateCard } from "./catalog.ts";
@@ -16,9 +16,13 @@ import { ceilingForRole, resolveTools, SPECIALIST_ROLES } from "./routing.ts";
 //   name charset-locked → path built ONLY as <fixed-dir>/<name>.md (+ resolve
 //   prefix-check) → 64KB cap → frontmatter must parse (GK cards run the full
 //   loader validation incl. validateCron) → redactSecrets rejects on any hit so
-//   a secret can never land in a tracked file → write → git add + commit (no
-//   push; a human pushes — the commit is the audit trail). Everything here runs
-//   inside the loopback-only dashboard process (src/server.ts).
+//   a secret can never land in a tracked file → commit guard (refuse, BEFORE
+//   writing, when the factory repo has unrelated staged/modified files — issue
+//   #8 F8) → write → git add + commit (no push; a human pushes — the commit is
+//   the audit trail). FACTORY_CATALOG_NO_COMMIT=1 (test environments) skips
+//   both the guard and the commit: the file is written, nothing touches git.
+//   Everything here runs inside the loopback-only dashboard process
+//   (src/server.ts).
 
 const FACTORY_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const AGENTS_DIR = join(FACTORY_ROOT, "agents");
@@ -255,9 +259,49 @@ export function validateAgentCardRouting(
   return null;
 }
 
+/** Which `git status --porcelain` entries block a catalog-save commit (issue
+ *  #8 F8). Pure over the porcelain text so the classification is testable
+ *  without a git repo. Blocking = any staged or modified TRACKED file that is
+ *  not the card file being saved:
+ *   - the card file itself is exempt — the commit is pathspec-scoped to exactly
+ *    that file, and committing it is precisely the audit trail this route
+ *    exists to produce (e.g. re-saving after a FACTORY_CATALOG_NO_COMMIT save);
+ *   - untracked files (`??`) never block — a pathspec-scoped commit cannot
+ *    sweep them in, and a dev working tree legitimately carries scratch files;
+ *   - renames (`R old -> new`) always block, even when they involve the card
+ *    file: a rename is never the simple content edit this route performs.
+ *  Returns the repo-relative paths of the blockers (empty = safe to commit). */
+export function commitBlockers(porcelain: string, relFile: string): string[] {
+  const blockers: string[] = [];
+  for (const line of porcelain.split("\n")) {
+    if (line.trim() === "") continue;
+    const status = line.slice(0, 2);
+    const path = line.slice(3);
+    if (status === "??") continue;                    // untracked — cannot be swept in
+    if (path === relFile && !path.includes(" -> ")) continue; // the card file itself
+    blockers.push(path);
+  }
+  return blockers;
+}
+
+/** `git status --porcelain` for the factory repo, or null when git is
+ *  unavailable / this is not a repo (the caller then proceeds exactly as the
+ *  pre-guard code did: the write happens, `git add` fails, the response carries
+ *  a warning instead of a commit hash). */
+function readGitPorcelain(): string | null {
+  const st = spawnSync("git", ["status", "--porcelain"], { cwd: FACTORY_ROOT, encoding: "utf8" });
+  return st.status === 0 ? (st.stdout ?? "") : null;
+}
+
 /** Validate an untrusted POST /catalog/save body, then write + commit one file.
- *  `input` is the parsed JSON body; every field is treated as untrusted. */
-export function saveCatalogEntry(input: unknown): SaveResult {
+ *  `input` is the parsed JSON body; every field is treated as untrusted.
+ *  `testSeams.gitStatusPorcelain` substitutes the porcelain text the commit
+ *  guard classifies (tests only — the guard's spawn is otherwise unmockable
+ *  because FACTORY_ROOT is baked from import.meta.url). */
+export function saveCatalogEntry(
+  input: unknown,
+  testSeams: { gitStatusPorcelain?: string | null } = {},
+): SaveResult {
   if (typeof input !== "object" || input === null) return bad(400, "body must be a JSON object");
   const { kind, name, content } = input as Record<string, unknown>;
 
@@ -346,6 +390,25 @@ export function saveCatalogEntry(input: unknown): SaveResult {
   const scan = redactSecrets(content);
   if (scan.found > 0) return bad(422, `refusing to write: content contains ${scan.found} secret-like string(s)`);
 
+  // Commit guard (issue #8 F8) — BEFORE the write, so a refusal is atomic: no
+  // file changed, no commit made. A dirty tree means a human (or another
+  // process) is mid-edit in the factory repo; a save that commits from under
+  // them turns "commit-as-audit-trail" into "commit-as-side-effect" — exactly
+  // how a subagent once minted real commits on main during verification.
+  // FACTORY_CATALOG_NO_COMMIT=1 (test environments) skips the guard because it
+  // also skips the commit the guard protects — with no commit coming, unrelated
+  // dirt is irrelevant and the write is side-effect-free beyond the file.
+  const noCommit = process.env.FACTORY_CATALOG_NO_COMMIT === "1";
+  if (!noCommit) {
+    const porcelain = testSeams.gitStatusPorcelain !== undefined ? testSeams.gitStatusPorcelain : readGitPorcelain();
+    if (porcelain !== null) {
+      const blockers = commitBlockers(porcelain, relative(FACTORY_ROOT, resolvedFile));
+      if (blockers.length > 0) {
+        return bad(409, `refusing to save: the factory repo working tree has ${blockers.length} unrelated staged/modified file(s) (e.g. ${blockers.slice(0, 3).join(", ")}) and a catalog save git-commits its file as the audit trail — it must never commit from a tree someone is mid-edit in. Commit or stash those changes and retry; nothing was written.`);
+      }
+    }
+  }
+
   const toWrite = content.endsWith("\n") ? content : `${content}\n`;
   try {
     if (kind === "skill") mkdirSync(dirname(file), { recursive: true });
@@ -366,6 +429,13 @@ export function saveCatalogEntry(input: unknown): SaveResult {
   // committed edit is a silent no-op until restart). GK cards re-read disk each
   // tick and skills are not cached, so only agent cards need this.
   if (kind === "agent") invalidateCard(name);
+
+  // Test environments: the file is written and the card cache invalidated, but
+  // git is never touched — no add, no commit (issue #8 F8). `commit: null`
+  // plus the note keeps the response shape a strict superset of the normal one.
+  if (noCommit) {
+    return { status: 200, json: { ok: true, commit: null, note: "commit skipped (FACTORY_CATALOG_NO_COMMIT=1)" } };
+  }
 
   // git add + commit (NO push). spawnSync with array args — never a shell — so
   // `name`/`kind` (already charset-locked) cannot inject. Commit scoped to this
