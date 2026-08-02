@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
+import { activePoliciesByProjectName } from "./db.ts";
 
 // Project registry (Gap 5). A projects/<name>.md card makes "project" literal:
 // it names the team a project files into, the repos it owns, the merge policy a
@@ -126,6 +127,78 @@ export function loadProjects(): ProjectCard[] {
 export function projectForRepo(repo: string): ProjectCard | null {
   if (!repo) return null;
   for (const card of loadProjects()) {
+    if (card.repos.includes(repo)) return card;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7: PG-first effective config. The daemon reads Postgres-approved
+// AUTHORITY overrides (project_policy rows a human approved through the
+// approvals-inbox pattern) layered over the card, and falls back to the card
+// alone when a project has no rows / the store is closed — a fresh checkout
+// with no DB behaves EXACTLY as today (additive-only).
+//
+// applyPolicyOverlay is PURE and I/O-free (CLAUDE.md: decision logic stays
+// pure) and deliberately conservative:
+//   - merge: only the three known values are accepted; anything else keeps the
+//     card's value — a corrupt row can never widen merge authority.
+//   - repos: INTERSECTION with the card's repos — a DB row can only NARROW the
+//     repo set, never widen it (the projection in project_repos is likewise
+//     reconciled one-way FROM cards by project-config.ts).
+//   - deployEnabled: only a bare boolean true arms it (fail-closed), and the
+//     global DEPLOY_ENABLED kill-switch in postmerge.ts still sits above it.
+//   - deploy/smoke are DELIBERATELY NOT overlaid: those strings reach `sh -c`
+//     (postmerge.ts runShellGate), so until typed deploy actions land
+//     (deferred by the owner), the shell command comes ONLY from the
+//     human-reviewed card file — a DB row must never become a code-execution
+//     surface. An approved deploy/smoke policy row is stored but inert.
+// ---------------------------------------------------------------------------
+
+export function applyPolicyOverlay(card: ProjectCard, policies: Record<string, unknown>): ProjectCard {
+  const out: ProjectCard = { ...card, repos: [...card.repos] };
+  const merge = policies.merge;
+  if (merge === "review" || merge === "shadow" || merge === "auto") out.merge = merge;
+  const repos = policies.repos;
+  if (Array.isArray(repos)) {
+    const allowed = new Set(repos.filter((r): r is string => typeof r === "string"));
+    out.repos = card.repos.filter((r) => allowed.has(r)); // narrow-only: ∩ card repos
+  }
+  if (Object.hasOwn(policies, "deployEnabled")) out.deployEnabled = policies.deployEnabled === true;
+  // deploy / smoke intentionally untouched — see header note.
+  return out;
+}
+
+/** Cards with any APPROVED authority overrides applied. Store closed / no rows
+ *  → byte-equivalent to loadProjects(). Never throws (a failed read falls back
+ *  to cards — the safe baseline). */
+export async function effectiveProjects(): Promise<ProjectCard[]> {
+  const cards = loadProjects();
+  let active: Array<{ name: string; key: string; value: unknown }>;
+  try {
+    active = await activePoliciesByProjectName();
+  } catch (error) {
+    console.error(`[registry] active-policy read failed — using cards alone: ${error instanceof Error ? error.message : error}`);
+    return cards;
+  }
+  if (active.length === 0) return cards;
+  const byName = new Map<string, Record<string, unknown>>();
+  for (const p of active) {
+    const bucket = byName.get(p.name) ?? {};
+    bucket[p.key] = p.value;
+    byName.set(p.name, bucket);
+  }
+  return cards.map((card) => {
+    const overlay = byName.get(card.name);
+    return overlay ? applyPolicyOverlay(card, overlay) : card;
+  });
+}
+
+/** effectiveProjects()'s answer to projectForRepo — same first-match-wins
+ *  determinism over the overlaid cards. */
+export async function effectiveProjectForRepo(repo: string): Promise<ProjectCard | null> {
+  if (!repo) return null;
+  for (const card of await effectiveProjects()) {
     if (card.repos.includes(repo)) return card;
   }
   return null;

@@ -3,6 +3,10 @@ import { startEventStore, issueEvents, getTelemetry, flushEvents } from "./db.ts
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
 import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
+import {
+  projectsView, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
+  proposeProjectPolicy, approvePolicyItem, rejectPolicyItem,
+} from "./project-config.ts";
 import { getIssueDetail, type IssueDetail } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
@@ -321,7 +325,7 @@ function readBoundedBody(req: IncomingMessage, capBytes: number): Promise<string
 // refusal response itself (wrapped so a legitimate JSON body of `null` can't
 // be mistaken for a refusal and leave the request hanging).
 // ---------------------------------------------------------------------------
-async function guardedJsonBody(req: IncomingMessage, res: ServerResponse): Promise<{ body: unknown } | null> {
+export async function guardedJsonBody(req: IncomingMessage, res: ServerResponse): Promise<{ body: unknown } | null> {
   if (req.method !== "POST") {
     res.writeHead(405, { "content-type": "application/json" });
     res.end('{"error":"method not allowed"}');
@@ -357,6 +361,68 @@ async function guardedJsonBody(req: IncomingMessage, res: ServerResponse): Promi
     res.end('{"error":"invalid JSON body"}');
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Project-config routes (issue #7). Extracted from the createServer callback so
+// tests can mount them on an ephemeral server and exercise the REAL gate:
+// every mutation goes through guardedJsonBody — the SAME function as
+// /catalog/save, /lessons/archive, /stop and the approvals actions. No new
+// gate, no copy. Returns true when the request was handled (or refused) here.
+// ---------------------------------------------------------------------------
+export function handleProjectRoutes(url: URL, req: IncomingMessage, res: ServerResponse): boolean {
+  const respond = (p: Promise<{ status: number; json: unknown }>, label: string): void => {
+    void p.then((result) => {
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.json));
+    }).catch((error: unknown) => {
+      console.error(`[dashboard] ${label} failed: ${error instanceof Error ? error.message : error}`);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `${label} failed` }));
+    });
+  };
+
+  if (url.pathname === "/projects") {
+    if (req.method !== "GET") {
+      res.writeHead(405, { "content-type": "application/json" });
+      res.end('{"error":"method not allowed"}');
+      return true;
+    }
+    // Same SPA/API split as /catalog, /lessons, /approvals: browser navigations
+    // get the app shell, fetch() clients get JSON.
+    if ((req.headers.accept ?? "").includes("text/html") && serveIndex(res)) return true;
+    respond(projectsView().then((view) => ({ status: 200, json: view })), "projects view");
+    return true;
+  }
+
+  const writes: Record<string, (body: unknown) => Promise<{ status: number; json: unknown }>> = {
+    "/projects/save": saveProjectDescriptive,
+    "/projects/model": setProjectModel,
+    "/projects/groundskeeper": setProjectGroundskeeper,
+    "/projects/policy/propose": proposeProjectPolicy,
+  };
+  const write = writes[url.pathname];
+  if (write) {
+    void guardedJsonBody(req, res).then((guarded) => {
+      if (guarded === null) return; // refusal already written
+      respond(write(guarded.body), url.pathname);
+    });
+    return true;
+  }
+
+  // Authority approve/reject — the pending→active claim. Mirrors the approvals
+  // action route shape; the atomicity itself lives in db.ts.
+  const policyAction = url.pathname.match(/^\/projects\/policy\/(\d{1,12})\/(approve|reject)$/);
+  if (policyAction) {
+    void guardedJsonBody(req, res).then((guarded) => {
+      if (guarded === null) return; // refusal already written
+      const id = Number(policyAction[1]);
+      respond(policyAction[2] === "approve" ? approvePolicyItem(id) : rejectPolicyItem(id), `policy ${policyAction[2]}`);
+    });
+    return true;
+  }
+
+  return false;
 }
 
 /** Serve ui/dist/index.html if built. Returns false (nothing written) otherwise. */
@@ -521,6 +587,10 @@ export async function startDashboard(): Promise<{
       });
       return;
     }
+
+    // Project-config routes (issue #7): GET /projects plus the guarded write
+    // routes — all mutations behind the same guardedJsonBody gate as above.
+    if (handleProjectRoutes(url, req, res)) return;
 
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain" });

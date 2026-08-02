@@ -155,6 +155,88 @@ const DDL: string[] = [
   // approvals.ts posts.
   `CREATE TABLE IF NOT EXISTS pushback_feedback (
     issue_key TEXT PRIMARY KEY, feedback TEXT NOT NULL, created_at BIGINT NOT NULL)`,
+  // ---------------------------------------------------------------------------
+  // Issue #7: Postgres-driven project config. `projects` is the entity that owns
+  // everything already keyed by repo. Two-tier writes (see the row helpers):
+  // descriptive fields apply immediately with an audit row; AUTHORITY fields
+  // (repos/deploy/smoke/deployEnabled/merge) land as PENDING project_policy rows
+  // and take force only through the approvals-inbox claim pattern. Value columns
+  // are TEXT holding JSON, NOT jsonb — same deliberate driver-parity decision as
+  // the events table (see the DDL header note); the issue sketch said JSONB, but
+  // the two drivers disagree on jsonb (string vs parsed object), which is
+  // exactly the divergence this schema exists to avoid.
+  `CREATE TABLE IF NOT EXISTS projects (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    goal TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    team TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL)`,
+  // ONE-WAY projection reconciled FROM projects/<name>.md cards (registry.ts
+  // loadProjects) by replaceProjectRepos — a DB edit can never WIDEN the repo
+  // set the factory acts on, because effective repos are always intersected
+  // with the card's list (registry.ts applyPolicyOverlay) and the projection is
+  // overwritten from cards on every sync.
+  `CREATE TABLE IF NOT EXISTS project_repos (
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    repo TEXT NOT NULL,
+    PRIMARY KEY (project_id, repo))`,
+  // Per-project per-role model config. Validated against config.models ON READ
+  // (project-config.ts validateProjectModels — unknown model dropped with a
+  // warning, meta.ts discipline), so a roster change can never resurrect a
+  // stale model id into an SDK call.
+  `CREATE TABLE IF NOT EXISTS project_models (
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    model TEXT NOT NULL,
+    effort TEXT,
+    PRIMARY KEY (project_id, role))`,
+  // Per-project groundskeeper wiring — a THIRD gate AND-ed with the two
+  // existing ones (global GROUNDSKEEPERS_ENABLED env gate AND the card's own
+  // enabled: true). enabled=true here alone arms NOTHING; enabled=false blocks
+  // a card that both existing gates would run. Never a bypass.
+  `CREATE TABLE IF NOT EXISTS project_groundskeepers (
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    card TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    cadence TEXT,
+    PRIMARY KEY (project_id, card))`,
+  // Authority-bearing config, versioned: pending → active | superseded |
+  // rejected. A proposed change is INSERTed as 'pending' and the config in
+  // force is unchanged until a human approves it (atomic claim, mirroring
+  // claimApproval).
+  `CREATE TABLE IF NOT EXISTS project_policy (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    approved_by TEXT, approved_at BIGINT,
+    created_at BIGINT NOT NULL)`,
+  // The partial unique index is what makes "exactly one active policy per
+  // (project, key)" a DATABASE invariant rather than application discipline —
+  // same structural upgrade idx_approvals_one_pending made for approvals.
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_policy_one_active ON project_policy(project_id, key) WHERE state = 'active'",
+  "CREATE INDEX IF NOT EXISTS idx_project_policy_project ON project_policy(project_id, key, id)",
+  // Append-only config audit: every change writes old/new/actor. The trigger
+  // below makes append-only STRUCTURAL — an UPDATE or DELETE raises, so the
+  // record cannot be rewritten even by a bug in this file.
+  `CREATE TABLE IF NOT EXISTS project_config_audit (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    field TEXT NOT NULL,
+    old_value TEXT, new_value TEXT,
+    actor TEXT NOT NULL,
+    at BIGINT NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS idx_project_audit_project ON project_config_audit(project_id, id)",
+  `CREATE OR REPLACE FUNCTION project_config_audit_guard() RETURNS trigger AS $guard$
+     BEGIN RAISE EXCEPTION 'project_config_audit is append-only (no UPDATE, no DELETE)'; END
+   $guard$ LANGUAGE plpgsql`,
+  `CREATE OR REPLACE TRIGGER trg_project_config_audit_guard
+     BEFORE UPDATE OR DELETE ON project_config_audit
+     FOR EACH ROW EXECUTE FUNCTION project_config_audit_guard()`,
 ];
 
 /** Create the full schema on `s`. Idempotent. */
@@ -1176,6 +1258,369 @@ export async function takePushbackFeedback(issueKey: string): Promise<string | n
 }
 
 // ---------------------------------------------------------------------------
+// Project config rows (issue #7) — persistence ONLY, same split as the merge
+// ladder and approvals sections above: every DECISION (which fields are
+// descriptive vs authority, what a policy value may contain, how an overlay
+// applies to a card) lives in project-config.ts / registry.ts; these helpers
+// just read/write rows through the daemon's single shared handle.
+//
+// AUDIT COUPLING IS STRUCTURAL where it matters: every mutation helper here is
+// a SINGLE statement whose data-modifying CTEs write the config change AND its
+// project_config_audit row together — there is no code path that edits config
+// without auditing it, and the append-only trigger stops the audit from ever
+// being rewritten. (The one exception is replaceProjectRepos — the daemon's
+// own card-projection sync — which is multi-statement but still writes an
+// audit row whenever the projection actually changes.)
+//
+// Closed-store behavior mirrors the rest of this file: reads return empty/
+// null, writes return null/false, nothing throws into a request.
+// ---------------------------------------------------------------------------
+
+export type ProjectPolicyState = "pending" | "active" | "superseded" | "rejected";
+
+export interface ProjectRow {
+  id: number; name: string; goal: string; description: string;
+  team: string; status: string; createdAt: number; updatedAt: number;
+}
+export interface ProjectPolicyRow {
+  id: number; projectId: number; key: string;
+  /** JSON.parsed stored value; null when the stored text is unparseable. */
+  value: unknown;
+  state: ProjectPolicyState; approvedBy: string | null; approvedAt: number | null; createdAt: number;
+}
+export interface ProjectAuditRow {
+  id: number; projectId: number; field: string;
+  oldValue: string | null; newValue: string | null; actor: string; at: number;
+}
+export interface ProjectModelRow { role: string; model: string; effort: string | null }
+export interface ProjectGroundskeeperRow { card: string; enabled: boolean; cadence: string | null }
+
+const PROJECT_COLUMNS = "id::float8 AS id, name, goal, description, team, status, created_at::float8 AS created_at, updated_at::float8 AS updated_at";
+const POLICY_COLUMNS = "id::float8 AS id, project_id::float8 AS project_id, key, value, state, approved_by, approved_at::float8 AS approved_at, created_at::float8 AS created_at";
+const PROJECT_AUDIT_COLUMNS = "id::float8 AS id, project_id::float8 AS project_id, field, old_value, new_value, actor, at::float8 AS at";
+
+interface RawProjectRow { id: unknown; name: string; goal: string; description: string; team: string; status: string; created_at: unknown; updated_at: unknown }
+interface RawPolicyRow { id: unknown; project_id: unknown; key: string; value: string; state: string; approved_by: string | null; approved_at: unknown; created_at: unknown }
+interface RawProjectAuditRow { id: unknown; project_id: unknown; field: string; old_value: string | null; new_value: string | null; actor: string; at: unknown }
+
+function toProjectRow(r: RawProjectRow): ProjectRow {
+  return { id: num(r.id), name: r.name, goal: r.goal, description: r.description,
+    team: r.team, status: r.status, createdAt: num(r.created_at), updatedAt: num(r.updated_at) };
+}
+
+function toPolicyRow(r: RawPolicyRow): ProjectPolicyRow {
+  let value: unknown = null;
+  try { value = JSON.parse(r.value) as unknown; } catch { /* unparseable stored value degrades to null */ }
+  return {
+    id: num(r.id), projectId: num(r.project_id), key: r.key, value,
+    state: (["pending", "active", "superseded", "rejected"].includes(r.state) ? r.state : "rejected") as ProjectPolicyState,
+    approvedBy: r.approved_by, approvedAt: r.approved_at === null ? null : num(r.approved_at), createdAt: num(r.created_at),
+  };
+}
+
+function toProjectAuditRow(r: RawProjectAuditRow): ProjectAuditRow {
+  return { id: num(r.id), projectId: num(r.project_id), field: r.field,
+    oldValue: r.old_value, newValue: r.new_value, actor: r.actor, at: num(r.at) };
+}
+
+/** Ensure a projects row exists for a registry card (bootstrap/import path —
+ *  cards seed PG, PG is then the descriptive source of truth). Creation writes
+ *  an audit row; an existing row is left untouched (a human's PG edits to
+ *  goal/team/etc. must not be clobbered by every sync). Returns the row id, or
+ *  null when the store is closed. */
+export async function ensureProjectRow(name: string, team: string, actor: string): Promise<number | null> {
+  if (!store) return null;
+  const now = Date.now();
+  const rows = await store.query<{ id: unknown }>(
+    `WITH ins AS (
+       INSERT INTO projects (name, goal, description, team, status, created_at, updated_at)
+       VALUES ($1, '', '', $2, 'active', $3, $3)
+       ON CONFLICT (name) DO NOTHING
+       RETURNING id
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT i.id::bigint, 'project:created', NULL, to_json($1::text)::text, $4, $3 FROM ins i
+     RETURNING project_id::float8 AS id`,
+    [name, team, now, actor]);
+  const created = num(rows[0]?.id);
+  if (created > 0) return created;
+  const existing = await store.query<{ id: unknown }>("SELECT id::float8 AS id FROM projects WHERE name = $1", [name]);
+  return existing[0] ? num(existing[0].id) : null;
+}
+
+export async function getProjectRowByName(name: string): Promise<ProjectRow | null> {
+  if (!store) return null;
+  const rows = await store.query<RawProjectRow>(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE name = $1`, [name]);
+  return rows[0] ? toProjectRow(rows[0]) : null;
+}
+
+export async function listProjectRows(): Promise<ProjectRow[]> {
+  if (!store) return [];
+  const rows = await store.query<RawProjectRow>(`SELECT ${PROJECT_COLUMNS} FROM projects ORDER BY name`);
+  return rows.map(toProjectRow);
+}
+
+/** DESCRIPTIVE-tier write: apply immediately + audit row, in ONE statement (the
+ *  audit INSERT only lands when the UPDATE actually changed the row, and both
+ *  see the same pre-statement snapshot, so old_value is honest). `field` is
+ *  validated against an in-code allowlist and routed to a fixed COALESCE slot —
+ *  column names are never caller-interpolated into SQL, keeping every literal
+ *  static for the cast-discipline lint. Returns true when a row changed. */
+const PROJECT_DESCRIPTIVE_FIELDS = ["goal", "description", "status", "team"] as const;
+export type ProjectDescriptiveField = (typeof PROJECT_DESCRIPTIVE_FIELDS)[number];
+
+export function isProjectDescriptiveField(field: string): field is ProjectDescriptiveField {
+  return (PROJECT_DESCRIPTIVE_FIELDS as readonly string[]).includes(field);
+}
+
+export async function updateProjectDescriptive(projectId: number, field: ProjectDescriptiveField, value: string, actor: string): Promise<boolean> {
+  if (!store) return false;
+  if (!isProjectDescriptiveField(field)) return false; // decision layer already rejects; belt & braces
+  const slot = (f: ProjectDescriptiveField): string | null => (f === field ? value : null);
+  const now = Date.now();
+  const changed = await store.exec(
+    `WITH before AS (SELECT id, goal, description, status, team FROM projects WHERE id = $1),
+     changed AS (
+       UPDATE projects SET goal = COALESCE($2, goal), description = COALESCE($3, description),
+                           status = COALESCE($4, status), team = COALESCE($5, team), updated_at = $6
+       WHERE id = $1 AND (goal IS DISTINCT FROM COALESCE($2, goal)
+                       OR description IS DISTINCT FROM COALESCE($3, description)
+                       OR status IS DISTINCT FROM COALESCE($4, status)
+                       OR team IS DISTINCT FROM COALESCE($5, team))
+       RETURNING id
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT c.id::bigint, $7,
+            to_json(CASE $7 WHEN 'goal' THEN b.goal WHEN 'description' THEN b.description WHEN 'status' THEN b.status ELSE b.team END)::text,
+            to_json(COALESCE($2, $3, $4, $5))::text, $8, $6
+     FROM changed c JOIN before b ON b.id = c.id`,
+    [projectId, slot("goal"), slot("description"), slot("status"), slot("team"), now, field, actor]);
+  return changed > 0;
+}
+
+/** Reconcile the ONE-WAY repos projection from a registry card. Overwrites the
+ *  DB set with the card's set whenever they differ (so a DB edit can never
+ *  widen — the card always wins) and writes an audit row for the change.
+ *  Multi-statement, but the daemon is the single writer of this table. */
+export async function replaceProjectRepos(projectId: number, repos: string[], actor: string): Promise<boolean> {
+  if (!store) return false;
+  const current = await listProjectRepos(projectId);
+  const next = [...new Set(repos)].sort();
+  if (JSON.stringify(current) === JSON.stringify(next)) return false;
+  await store.exec("DELETE FROM project_repos WHERE project_id = $1", [projectId]);
+  for (const repo of next) {
+    await store.exec("INSERT INTO project_repos (project_id, repo) VALUES ($1, $2) ON CONFLICT DO NOTHING", [projectId, repo]);
+  }
+  await store.exec(
+    "INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at) VALUES ($1, 'repos:projection', $2, $3, $4, $5)",
+    [projectId, JSON.stringify(current), JSON.stringify(next), actor, Date.now()]);
+  return true;
+}
+
+export async function listProjectRepos(projectId: number): Promise<string[]> {
+  if (!store) return [];
+  const rows = await store.query<{ repo: string }>(
+    "SELECT repo FROM project_repos WHERE project_id = $1 ORDER BY repo", [projectId]);
+  return rows.map((r) => r.repo);
+}
+
+/** Set (or update) one role's model config — descriptive tier: immediate +
+ *  audit in one statement. Validation against config.models happens in
+ *  project-config.ts BEFORE this is called, and again on read. */
+export async function upsertProjectModel(projectId: number, role: string, model: string, effort: string | null, actor: string): Promise<boolean> {
+  if (!store) return false;
+  const changed = await store.exec(
+    `WITH before AS (SELECT model, effort FROM project_models WHERE project_id = $1 AND role = $2),
+     up AS (
+       INSERT INTO project_models (project_id, role, model, effort) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (project_id, role) DO UPDATE SET model = EXCLUDED.model, effort = EXCLUDED.effort
+       RETURNING role
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT $1, 'model:' || $2, (SELECT to_json(b)::text FROM before b), json_build_object('model', $3::text, 'effort', $4::text)::text, $5, $6 FROM up`,
+    [projectId, role, model, effort, actor, Date.now()]);
+  return changed > 0;
+}
+
+export async function deleteProjectModel(projectId: number, role: string, actor: string): Promise<boolean> {
+  if (!store) return false;
+  const changed = await store.exec(
+    `WITH del AS (DELETE FROM project_models WHERE project_id = $1 AND role = $2 RETURNING model, effort)
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT $1, 'model:' || $2, to_json(d)::text, NULL, $3, $4 FROM del d`,
+    [projectId, role, actor, Date.now()]);
+  return changed > 0;
+}
+
+export async function listProjectModels(projectId: number): Promise<ProjectModelRow[]> {
+  if (!store) return [];
+  const rows = await store.query<{ role: string; model: string; effort: string | null }>(
+    "SELECT role, model, effort FROM project_models WHERE project_id = $1 ORDER BY role", [projectId]);
+  return rows.map((r) => ({ role: r.role, model: r.model, effort: r.effort }));
+}
+
+/** Per-project groundskeeper row (the THIRD gate) — descriptive tier because it
+ *  is restrictive-or-neutral by construction: enabled=true alone arms nothing
+ *  (both existing gates must still hold), enabled=false only blocks. */
+export async function upsertProjectGroundskeeper(projectId: number, card: string, enabled: boolean, cadence: string | null, actor: string): Promise<boolean> {
+  if (!store) return false;
+  const changed = await store.exec(
+    `WITH before AS (SELECT enabled, cadence FROM project_groundskeepers WHERE project_id = $1 AND card = $2),
+     up AS (
+       INSERT INTO project_groundskeepers (project_id, card, enabled, cadence) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (project_id, card) DO UPDATE SET enabled = EXCLUDED.enabled, cadence = EXCLUDED.cadence
+       RETURNING card
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT $1, 'groundskeeper:' || $2, (SELECT to_json(b)::text FROM before b), json_build_object('enabled', $3::boolean, 'cadence', $4::text)::text, $5, $6 FROM up`,
+    [projectId, card, enabled, cadence, actor, Date.now()]);
+  return changed > 0;
+}
+
+export async function listProjectGroundskeepers(projectId: number): Promise<ProjectGroundskeeperRow[]> {
+  if (!store) return [];
+  const rows = await store.query<{ card: string; enabled: boolean; cadence: string | null }>(
+    "SELECT card, enabled, cadence FROM project_groundskeepers WHERE project_id = $1 ORDER BY card", [projectId]);
+  return rows.map((r) => ({ card: r.card, enabled: r.enabled === true, cadence: r.cadence }));
+}
+
+/** Every project row governing one groundskeeper card name, across all
+ *  projects — the third gate's input (groundskeepers.ts). Empty when the store
+ *  is closed, which the gate treats as "no third-gate rows" (today's behavior);
+ *  groundskeeperTick already refuses to run at all when eventStoreOpen() is
+ *  false, so a closed store cannot fail-open here. */
+export async function projectGroundskeeperRowsForCard(card: string): Promise<Array<{ enabled: boolean }>> {
+  if (!store) return [];
+  const rows = await store.query<{ enabled: boolean }>(
+    "SELECT enabled FROM project_groundskeepers WHERE card = $1", [card]);
+  return rows.map((r) => ({ enabled: r.enabled === true }));
+}
+
+/** AUTHORITY-tier write: land a PENDING policy revision + its audit row in one
+ *  statement. The config in force is unchanged until approveProjectPolicy
+ *  claims and activates this row. Returns the new policy id, or null. */
+export async function insertPendingPolicy(projectId: number, key: string, valueJson: string, actor: string): Promise<number | null> {
+  if (!store) return null;
+  const now = Date.now();
+  const rows = await store.query<{ id: unknown }>(
+    `WITH audit AS (
+       INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+       SELECT $1, 'policy:' || $2 || ':proposed',
+              (SELECT pol.value FROM project_policy pol WHERE pol.project_id = $1 AND pol.key = $2 AND pol.state = 'active'),
+              $3, $4, $5
+     )
+     INSERT INTO project_policy (project_id, key, value, state, created_at)
+     VALUES ($1, $2, $3, 'pending', $5)
+     RETURNING id::float8 AS id`,
+    [projectId, key, valueJson, actor, now]);
+  const id = num(rows[0]?.id);
+  return id > 0 ? id : null;
+}
+
+export async function getProjectPolicy(id: number): Promise<ProjectPolicyRow | null> {
+  if (!store) return null;
+  const rows = await store.query<RawPolicyRow>(`SELECT ${POLICY_COLUMNS} FROM project_policy WHERE id = $1`, [id]);
+  return rows[0] ? toPolicyRow(rows[0]) : null;
+}
+
+export async function listProjectPolicies(projectId: number, limit = 200): Promise<ProjectPolicyRow[]> {
+  if (!store) return [];
+  const rows = await store.query<RawPolicyRow>(
+    `SELECT ${POLICY_COLUMNS} FROM project_policy WHERE project_id = $1 ORDER BY id DESC LIMIT $2`, [projectId, limit]);
+  return rows.map(toPolicyRow);
+}
+
+/** Every ACTIVE policy joined to its project name — the registry overlay's one
+ *  read (registry.ts effectiveProjects). Empty when the store is closed, so a
+ *  fresh checkout behaves exactly as cards alone. */
+export async function activePoliciesByProjectName(): Promise<Array<{ name: string; key: string; value: unknown }>> {
+  if (!store) return [];
+  const rows = await store.query<{ name: string; key: string; value: string }>(
+    "SELECT p.name, pol.key, pol.value FROM project_policy pol JOIN projects p ON p.id = pol.project_id WHERE pol.state = 'active'");
+  return rows.map((r) => {
+    let value: unknown = null;
+    try { value = JSON.parse(r.value) as unknown; } catch { /* degrades to null; overlay ignores it */ }
+    return { name: r.name, key: r.key, value };
+  });
+}
+
+/** Attempts the activate step makes when it keeps losing the one-active-row
+ *  index to a concurrent approver. IN-CODE CONSTANT, not an env knob
+ *  (CLAUDE.md) — same shape as MAX_APPROVAL_INSERT_ATTEMPTS. */
+const MAX_POLICY_ACTIVATE_ATTEMPTS = 3;
+
+/** ATOMIC pending→active transition — the approvals-inbox claim pattern
+ *  applied to config authority. Step 1 CLAIMS the row (one conditional UPDATE
+ *  on state='pending' AND approved_at IS NULL, with the audit row written in
+ *  the same statement), so of two concurrent approvals exactly ONE proceeds —
+ *  a double-click cannot double-apply. Step 2 supersedes the currently-active
+ *  revision and activates the claimed one; the partial unique index turns any
+ *  concurrent-activation race into a loud conflict that is retried, never two
+ *  active rows. Returns the activated policy row, or null when the claim was
+ *  lost / the row is not pending / the store is closed. */
+export async function approveProjectPolicy(id: number, approvedBy: string): Promise<ProjectPolicyRow | null> {
+  if (!store) return null;
+  const now = Date.now();
+  const claimed = await store.query<{ project_id: unknown }>(
+    `WITH claimed AS (
+       UPDATE project_policy SET approved_by = $2, approved_at = $3
+       WHERE id = $1 AND state = 'pending' AND approved_at IS NULL
+       RETURNING project_id, key, value
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT project_id, 'policy:' || key || ':approved', NULL, value, $2, $3 FROM claimed
+     RETURNING project_id::float8 AS project_id`,
+    [id, approvedBy, now]);
+  if (claimed.length === 0) return null; // lost the claim — someone already decided
+  const row = await getProjectPolicy(id);
+  if (!row) return null;
+  for (let attempt = 0; attempt < MAX_POLICY_ACTIVATE_ATTEMPTS; attempt++) {
+    await store.exec(
+      "UPDATE project_policy SET state = 'superseded' WHERE project_id = $1 AND key = $2 AND state = 'active' AND id <> $3",
+      [row.projectId, row.key, id]);
+    try {
+      const activated = await store.exec(
+        "UPDATE project_policy SET state = 'active' WHERE id = $1 AND state = 'pending'", [id]);
+      if (activated > 0) return await getProjectPolicy(id);
+      return null; // we own the claim, so 0 here means the row vanished — refuse
+    } catch {
+      // Unique-index conflict: a concurrent approve activated a different row
+      // for the same (project, key) between our supersede and activate. Loop:
+      // supersede it and try again — newest approval wins (insertApproval's
+      // retry semantic).
+    }
+  }
+  console.error(`[db] approveProjectPolicy lost the one-active race ${MAX_POLICY_ACTIVATE_ATTEMPTS} times for policy ${id} — a concurrent approval stands`);
+  return null;
+}
+
+/** ATOMIC pending→rejected — one statement, claim + audit together. True when
+ *  this call was the one that decided the row. */
+export async function rejectProjectPolicy(id: number, actor: string): Promise<boolean> {
+  if (!store) return false;
+  const now = Date.now();
+  const rows = await store.query<{ project_id: unknown }>(
+    `WITH claimed AS (
+       UPDATE project_policy SET state = 'rejected', approved_by = $2, approved_at = $3
+       WHERE id = $1 AND state = 'pending' AND approved_at IS NULL
+       RETURNING project_id, key, value
+     )
+     INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
+     SELECT project_id, 'policy:' || key || ':rejected', value, NULL, $2, $3 FROM claimed
+     RETURNING project_id::float8 AS project_id`,
+    [id, actor, now]);
+  return rows.length > 0;
+}
+
+export async function listProjectAudit(projectId: number, limit = 100): Promise<ProjectAuditRow[]> {
+  if (!store) return [];
+  const rows = await store.query<RawProjectAuditRow>(
+    `SELECT ${PROJECT_AUDIT_COLUMNS} FROM project_config_audit WHERE project_id = $1 ORDER BY id DESC LIMIT $2`,
+    [projectId, limit]);
+  return rows.map(toProjectAuditRow);
+}
+
+// ---------------------------------------------------------------------------
 // Test seam — an in-process PGlite (WASM Postgres) database with the full
 // schema, used only by the unit suite (no bus subscription, no write queue, no
 // file, no server, no port). Kept here so the module-level `store` handle stays
@@ -1199,7 +1644,7 @@ export { num as coerceNumeric };
 
 let testEngine: Store | null = null;
 
-const TEST_TABLES ="events, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback";
+const TEST_TABLES ="events, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit";
 
 export interface TestStoreOptions {
   /** Also wire the write-behind queue to the event bus, exactly as

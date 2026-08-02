@@ -13,6 +13,8 @@ import { HistoryPage } from "./pages/HistoryPage";
 import { TelemetryPage } from "./pages/TelemetryPage";
 import { CatalogPage } from "./pages/CatalogPage";
 import { LessonsPage } from "./pages/LessonsPage";
+import { ProjectsPage } from "./pages/ProjectsPage";
+import { ProjectDetailPage } from "./pages/ProjectDetailPage";
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -75,6 +77,23 @@ const lessonsRoute = createRoute({
   component: LessonsPage,
 });
 
+const projectsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects",
+  component: ProjectsPage,
+});
+
+const projectDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects/$name",
+  component: ProjectDetailRoute,
+});
+
+function ProjectDetailRoute() {
+  const { name } = projectDetailRoute.useParams();
+  return <ProjectDetailPage name={name} />;
+}
+
 const routeTree = rootRoute.addChildren([
   boardRoute,
   runsRoute,
@@ -85,6 +104,8 @@ const routeTree = rootRoute.addChildren([
   telemetryRoute,
   catalogRoute,
   lessonsRoute,
+  projectsRoute,
+  projectDetailRoute,
 ]);
 
 export const router = createRouter({ routeTree });

@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, BarChart3, Columns3, GraduationCap, History, Inbox, Library, ListChecks } from "lucide-react";
+import { Activity, BarChart3, Columns3, FolderKanban, GraduationCap, History, Inbox, Library, ListChecks } from "lucide-react";
 import { useFactory } from "../../lib/store";
 import { usd } from "../../lib/format";
 import { fetchApprovals, splitApprovals } from "../../lib/approvals";
@@ -14,6 +14,7 @@ const NAV = [
   { to: "/runs", label: "Runs", icon: Activity },
   { to: "/queue", label: "Queue", icon: Inbox },
   { to: "/approvals", label: "Review", icon: ListChecks },
+  { to: "/projects", label: "Projects", icon: FolderKanban },
   { to: "/history", label: "History", icon: History },
   { to: "/telemetry", label: "Telemetry", icon: BarChart3 },
   { to: "/catalog", label: "Catalog", icon: Library },

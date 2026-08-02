@@ -7,7 +7,7 @@ import { ensureWorkspace, resetWorkspaceToBase } from "./repos.ts";
 import { isEligible } from "./loop.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
-import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry } from "./db.ts";
+import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry, projectGroundskeeperRowsForCard } from "./db.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 
 // Groundskeepers — per-project loop MASTERS (roadmap "Groundskeeper spec v2").
@@ -324,6 +324,22 @@ function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
 const MINUTE_MS = 60_000;
 let storeClosedWarned = false;
 
+/** Issue #7: the per-project THIRD gate, AND-ed with the two existing ones
+ *  (global GROUNDSKEEPERS_ENABLED + the card's own `enabled: true`). PURE and
+ *  I/O-free — rows come from db.ts projectGroundskeeperRowsForCard.
+ *
+ *  Semantics, pinned by tests/project-config.test.ts:
+ *   - no rows        → true  (a factory that never declared per-project wiring
+ *                             behaves EXACTLY as today — additive-only);
+ *   - any row FALSE  → false (a project can veto a card);
+ *   - rows all TRUE  → true  (…but this NEVER arms a card by itself — the two
+ *                             existing gates are checked first and must hold).
+ *  Never a bypass: this function is only ever consulted AFTER both existing
+ *  gates passed, so `true` here can only mean "not additionally blocked". */
+export function projectGroundskeeperGate(rows: Array<{ enabled: boolean }>): boolean {
+  return rows.every((r) => r.enabled === true);
+}
+
 /**
  * Evaluate the registry once per daemon tick. Returns immediately at ZERO cost
  * when the global gate is off. At most ONE loop-master STAGE runs per tick
@@ -382,6 +398,19 @@ export async function groundskeeperTick(): Promise<void> {
     if (!due) continue;
     const bucket = minuteBucket(due);
     if (state.cards[card.name]?.lastRunMinute === bucket) continue; // already handled this cron-minute
+    // Third gate (issue #7): a project_groundskeepers row can VETO this card.
+    // Checked before the state mark so a vetoed window isn't consumed — lifting
+    // the veto within the catch-up horizon lets the card fire late instead of
+    // silently losing the window. A failed read fails CLOSED (skip), matching
+    // the budget/parks gates' discipline; no rows = today's behavior exactly.
+    const gateRows = await projectGroundskeeperRowsForCard(card.name).catch((error) => {
+      console.error(`[gk:${card.name}] project gate read failed — skipping (fail closed): ${error instanceof Error ? error.message : error}`);
+      return null;
+    });
+    if (gateRows === null || !projectGroundskeeperGate(gateRows)) {
+      if (gateRows !== null) console.log(`[gk:${card.name}] blocked by a project_groundskeepers row (third gate)`);
+      continue;
+    }
     // Mark BEFORE running so a crash mid-run cannot re-fire this window; if the
     // mark cannot be persisted, do NOT run — an unrecorded run can double-fire.
     state.cards[card.name] = { lastRunMinute: bucket, lastRunAt: nowMs };
