@@ -15,6 +15,12 @@ process.env.PROXY_AUTH_TOKEN = "factory-test-proxy-token-a1b2c3";
 process.env.APPROVALS_NOTIFY ??= "0";
 process.env.GROUNDSKEEPERS_ENABLED ??= "";
 process.env.MERGE_AUTO_REPOS ??= "";
+// The suite must NEVER create git commits (issue #8 F8 — a subagent exercising
+// POST /catalog/save once minted real commits on main). With this set,
+// saveCatalogEntry writes its file but never touches git; the one test that
+// exercises the commit GUARD itself deletes the var locally and injects
+// porcelain text instead of spawning git.
+process.env.FACTORY_CATALOG_NO_COMMIT ??= "1";
 // Fail-CLOSED database guard. The suite runs entirely on db.ts's in-process
 // PGlite (WASM Postgres) seam — openTestDatabase() — so `bun test` needs NO
 // container, no port and no server. Blanking this means that even if some code

@@ -231,19 +231,54 @@ export function queueLane(labels: readonly string[], stateDescription: string | 
  *  warning in fetchQueue. An in-code constant, never an env knob. */
 const QUEUE_PAGE = 50;
 
-/** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first. */
-export async function fetchQueue(): Promise<Issue[]> {
-  const data = await gql<{ issues: { nodes: RawIssue[] } }>(
-    `query($teams: [String!]!, $first: Int!) {
-      issues(first: $first, filter: {
+/** Every label that holds an issue OUT of the claimable queue. This is BOTH the
+ *  server-side `labels: { none: ... }` exclusion in fetchQueue's GraphQL filter
+ *  AND the client-side skip-set (belt-and-braces) — one list, so the two can
+ *  never disagree about what "held" means. */
+export const HOLD_LABELS: readonly string[] = [
+  EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL,
+];
+
+/** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first.
+ *
+ * TWO server-side pages in ONE request (issue #8 F1). WP3 moved Blocked /
+ * Needs Human into unstarted-TYPE states, so a backlog of held issues used to
+ * share the single `first: 50` unstarted page with real queue items and could
+ * crowd fresh Todo tickets past the page boundary (label filtering only
+ * happened client-side, AFTER server truncation). Now:
+ *   - `queue`: unstarted MINUS hold labels, excluded SERVER-side
+ *     (`labels: { none: { name: { in: HOLD_LABELS } } }`) — held backlog can no
+ *     longer crowd this page, however large it grows.
+ *   - `held`: the complement (`labels: { some: ... }`), fetched ONLY so the
+ *     queue_snapshot keeps rendering parked/needs-human cards on the dashboard
+ *     board — the WP3 promise ("blocked/needs-human issues keep rendering...
+ *     instead of vanishing") survives the filter split. Never claimable.
+ * The client-side skip below stays as belt-and-braces: if the server-side
+ * exclusion ever regresses (API change, filter typo), held issues still never
+ * reach a claim — worst case is the old crowding, made LOUD by the warning. */
+export async function fetchQueue(deps: LinearTransportDeps = defaultDeps): Promise<Issue[]> {
+  const data = await gqlWith<{ queue: { nodes: RawIssue[] }; held: { nodes: RawIssue[] } }>(deps,
+    `query($teams: [String!]!, $first: Int!, $hold: [String!]!) {
+      queue: issues(first: $first, filter: {
         team: { key: { in: $teams } },
-        state: { type: { eq: "unstarted" } }
+        state: { type: { eq: "unstarted" } },
+        labels: { none: { name: { in: $hold } } }
+      }) { nodes { ${ISSUE_FIELDS} } }
+      held: issues(first: $first, filter: {
+        team: { key: { in: $teams } },
+        state: { type: { eq: "unstarted" } },
+        labels: { some: { name: { in: $hold } } }
       }) { nodes { ${ISSUE_FIELDS} } }
     }`,
-    { teams: config.teamKeys, first: QUEUE_PAGE },
+    { teams: config.teamKeys, first: QUEUE_PAGE, hold: [...HOLD_LABELS] },
   );
-  const all = data.issues.nodes.map(toIssue);
-  const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
+  const queuePage = data.queue.nodes.map(toIssue);
+  const heldPage = data.held.nodes.map(toIssue);
+  // The two filters are disjoint by construction; the dedupe is defensive only
+  // (an issue labelled between the two page evaluations server-side).
+  const seen = new Set<string>();
+  const all = [...queuePage, ...heldPage].filter((i) => !seen.has(i.id) && (seen.add(i.id), true));
+  const skip = new Set(HOLD_LABELS);
   bus.emit({
     type: "queue_snapshot",
     issues: all.map((i) => ({
@@ -252,19 +287,16 @@ export async function fetchQueue(): Promise<Issue[]> {
       lane: queueLane(i.labels, i.stateDescription),
     })),
   });
-  const eligible = all
+  const eligible = queuePage
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // FIFO regardless of server order (C21)
-  // STARVATION WARNING. `first: N` truncates SERVER-side, before the skip-filter
-  // above runs, so a large held backlog inside the unstarted type can hide fresh
-  // Todo tickets behind the page boundary. WP3 slightly widens that exposure: a
-  // needs-human hold used to be released in the started-type working column
-  // (outside this page) and now lands in the unstarted Needs Human column
-  // (inside it) — parked tickets always were in it. Nothing here is auto-tuned;
-  // a full page with everything filtered out is simply made LOUD so the operator
-  // can act, instead of the queue looking empty for no visible reason.
-  if (all.length >= QUEUE_PAGE && eligible.length === 0) {
-    console.error(`[queue] the ${QUEUE_PAGE}-issue unstarted page is FULL and every issue in it is held (parked / needs-human / awaiting-answer / planned / stale) — fresh Todo tickets past the page boundary are invisible to the daemon until some are cleared`);
+  // STARVATION WARNING (belt-and-braces alarm). With the server-side label
+  // exclusion above, a full queue page whose issues ALL carry hold labels can
+  // only mean the exclusion regressed — the client-side skip still protects
+  // claims, but page crowding is back, so say so LOUDLY instead of letting the
+  // queue look empty for no visible reason.
+  if (queuePage.length >= QUEUE_PAGE && eligible.length === 0) {
+    console.error(`[queue] the ${QUEUE_PAGE}-issue queue page is FULL and every issue in it is held (parked / needs-human / awaiting-answer / planned / stale) — the server-side label exclusion is not working; fresh Todo tickets past the page boundary are invisible to the daemon until some are cleared`);
   }
   return eligible;
 }
@@ -571,14 +603,28 @@ async function resolveState(issue: Issue, kind: StateKind): Promise<TeamState | 
  * an issue out of fetchQueue. Required kinds never degrade: a missing one is a
  * genuine "this team has no state of that type", which the caller must see as
  * `false` exactly as before.
+ *
+ * TAG-ANCHORED for the optional kinds (issue #8 F5). The transition target for
+ * Blocked / Needs Human is unified on the `[factory:<kind>]` description tag —
+ * the SAME anchor resolveBoardStates trusts first — so a renamed-but-tagged
+ * column stays a first-class target (the rename never mattered to reads, and
+ * now provably never matters to writes either). A NAME-ONLY match is the read
+ * side's reservation trick: it keeps a hand-made, untagged "Blocked" column
+ * out of the queue lane, but that column belongs to a human and is not
+ * authoritative enough to be transitioned INTO — parking degrades to the queue
+ * state exactly as if the column were absent. Required kinds keep their
+ * name/position fallbacks verbatim: those ARE the pre-WP3 contract.
  */
 export function transitionTarget(
   board: Readonly<Record<StateKind, TeamState | null>>,
   kind: StateKind,
 ): { state: TeamState; degradedFrom: StateKind | null } | null {
   const direct = board[kind];
-  if (direct) return { state: direct, degradedFrom: null };
-  if (kind !== "blocked" && kind !== "needs_human") return null;
+  const optional = kind === "blocked" || kind === "needs_human";
+  if (direct && (!optional || taggedKind(direct.description) === kind)) {
+    return { state: direct, degradedFrom: null };
+  }
+  if (!optional) return null;
   const fallback = board.queue;
   return fallback ? { state: fallback, degradedFrom: kind } : null;
 }

@@ -316,6 +316,50 @@ describe("transitionTarget — the degrade-safely path", () => {
   });
 });
 
+describe("transitionTarget — tag-anchored for the optional kinds (issue #8 F5)", () => {
+  test("a RENAMED but still-tagged column keeps being the transition target (the rename-proof promise)", () => {
+    // resolveBoardStates always resolved this (tag beats name); the fix is that
+    // the TRANSITION now provably rides the same anchor, so a renamed state
+    // resolves for reads AND transitions — no contradiction left to reintroduce.
+    const board = resolveBoardStates(tagged().map((s) =>
+      s.name === "Blocked" ? { ...s, name: "Stuck \u{1F9F1}" }
+        : s.name === "Needs Human" ? { ...s, name: "Escalated \u{1F6A8}" } : s));
+    const blocked = transitionTarget(board, "blocked");
+    expect(blocked?.state.name).toBe("Stuck \u{1F9F1}");
+    expect(blocked?.degradedFrom).toBeNull();
+    const nh = transitionTarget(board, "needs_human");
+    expect(nh?.state.name).toBe("Escalated \u{1F6A8}");
+    expect(nh?.degradedFrom).toBeNull();
+  });
+
+  test("a hand-made UNTAGGED 'Blocked' column is reserved for reads but NOT transitioned into", () => {
+    // This is the promise the reserved-set test above alludes to ("not
+    // authoritative enough to be transitioned INTO"): the name match keeps the
+    // human's column out of the queue lane, but a park degrades to the queue
+    // state instead of driving a column the factory does not own.
+    const board = resolveBoardStates([
+      st("Blocked", "unstarted", 1),
+      st("Todo", "unstarted", 2, "[factory:queue]"),
+      st("Doing", "started", 3),
+      st("Done", "completed", 4),
+    ]);
+    expect(board.blocked?.name).toBe("Blocked"); // read side: still reserved
+    const t = transitionTarget(board, "blocked");
+    expect(t?.state.name).toBe("Todo");          // write side: degrades to queue
+    expect(t?.degradedFrom).toBe("blocked");
+  });
+
+  test("REQUIRED kinds keep their pre-WP3 name/position fallbacks as transition targets", () => {
+    // Only the optional kinds are tag-anchored — an untagged legacy board must
+    // keep transitioning to Done / In Progress exactly as before.
+    const board = resolveBoardStates(legacy());
+    expect(transitionTarget(board, "done")?.state.name).toBe("Done");
+    expect(transitionTarget(board, "working")?.state.name).toBe("In Progress");
+    expect(transitionTarget(board, "review")?.state.name).toBe("In Review");
+    for (const kind of REQUIRED_STATE_KINDS) expect(transitionTarget(board, kind)?.degradedFrom).toBeNull();
+  });
+});
+
 describe("isReviewLane", () => {
   test("the tag identifies the review lane regardless of the column name", () => {
     expect(isReviewLane("Awaiting merge", "blurb\n\n[factory:review]")).toBe(true);
