@@ -61,6 +61,9 @@ export function registerStoreParitySuite(
       await s.exec("DROP TABLE IF EXISTS parity");
       await s.exec("DROP TABLE IF EXISTS parity_pk");
       await s.exec("DROP TABLE IF EXISTS parity_reg");
+      await s.exec("DROP TABLE IF EXISTS parity_transcript");
+      await s.exec("DROP TABLE IF EXISTS parity_mig");
+      await s.exec("DROP TABLE IF EXISTS parity_mig_quarantine");
       // Same column types db.ts's real DDL uses, so the shapes asserted below
       // are the shapes the daemon actually reads.
       await s.exec(`CREATE TABLE parity (
@@ -77,6 +80,9 @@ export function registerStoreParitySuite(
       await s.exec("DROP TABLE IF EXISTS parity").catch(() => {});
       await s.exec("DROP TABLE IF EXISTS parity_pk").catch(() => {});
       await s.exec("DROP TABLE IF EXISTS parity_reg").catch(() => {});
+      await s.exec("DROP TABLE IF EXISTS parity_transcript").catch(() => {});
+      await s.exec("DROP TABLE IF EXISTS parity_mig").catch(() => {});
+      await s.exec("DROP TABLE IF EXISTS parity_mig_quarantine").catch(() => {});
       await s.close();
     });
 
@@ -152,6 +158,36 @@ export function registerStoreParitySuite(
         expect(rows[0]?.roles).toBe("implementer");
       });
 
+      test("stage_transcript batch shape: multi-row VALUES with body ::text::jsonb round-trips jsonb_typeof='object' + GIN containment (issue #11)", async () => {
+        // The EXACT write shape db.ts's writeTranscriptBatch uses: a multi-row
+        // INSERT where every body param binds `::text::jsonb`. Under the real
+        // Bun driver a bare `::jsonb` bind would jsonb-encode the
+        // pre-stringified string into a jsonb STRING SCALAR (live-found
+        // 2026-08-02, cost a HIGH) — jsonb_typeof pins the object shape on
+        // BOTH drivers, and the @> containment probe proves the GIN-indexable
+        // query surface actually works against what was stored.
+        await s.exec(`CREATE TABLE IF NOT EXISTS parity_transcript (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          seq INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          body JSONB NOT NULL)`);
+        await s.exec("CREATE INDEX IF NOT EXISTS parity_transcript_body ON parity_transcript USING GIN (body)");
+        await s.exec("DELETE FROM parity_transcript");
+        await s.exec(
+          "INSERT INTO parity_transcript (seq, kind, body) VALUES ($1, $2, $3::text::jsonb), ($4, $5, $6::text::jsonb)",
+          [1, "tool_use", JSON.stringify({ tool: "Bash", input: { command: "bun test" } }),
+           2, "result", JSON.stringify({ subtype: "success", ok: true })]);
+        const rows = await s.query<{ t: unknown; cmd: unknown }>(
+          "SELECT jsonb_typeof(body) AS t, body->'input'->>'command' AS cmd FROM parity_transcript ORDER BY id ASC");
+        expect(rows.map((r) => r.t)).toEqual(["object", "object"]);
+        expect(rows[0]?.cmd).toBe("bun test");
+        // The query surface the GIN index exists for — containment on the object.
+        const contained = await s.query<{ n: unknown }>(
+          "SELECT COUNT(*)::int AS n FROM parity_transcript WHERE body @> $1::text::jsonb",
+          [JSON.stringify({ subtype: "success" })]);
+        expect(contained[0]?.n).toBe(1);
+      });
+
       test("the migrate() repair unwraps a double-encoded jsonb string scalar", async () => {
         // The damaged shape rows written before the fix hold, then the exact
         // repair expression migrate() ships: (col #>> '{}')::jsonb guarded by
@@ -170,6 +206,103 @@ export function registerStoreParitySuite(
           "SELECT jsonb_typeof(doc) AS t, doc->'roles'->>0 AS roles FROM parity_jsonb");
         expect(after[0]?.t).toBe("object");
         expect(after[0]?.roles).toBe("fixer");
+      });
+
+      test("issue #11 w2: the three migrated columns' WRITE SHAPES round-trip jsonb_typeof='object' via ::text::jsonb", async () => {
+        // The exact bind shapes db.ts now uses for events.json (multi-row
+        // batch — writeBatch), merge_shadow_log.evidence_json and
+        // approvals.gate_summary_json (single-row inserts). A bare `::jsonb`
+        // bind under the real Bun driver would store a jsonb STRING SCALAR
+        // (live-found 2026-08-02); jsonb_typeof pins the object shape on BOTH
+        // drivers, and ->> proves the query surface works against what landed.
+        await s.exec("DROP TABLE IF EXISTS parity_mig");
+        await s.exec(`CREATE TABLE parity_mig (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          kind TEXT NOT NULL, doc JSONB)`);
+        // events batch shape: multi-row VALUES, every json param ::text::jsonb.
+        await s.exec(
+          "INSERT INTO parity_mig (kind, doc) VALUES ($1, $2::text::jsonb), ($3, $4::text::jsonb)",
+          ["events", JSON.stringify({ type: "run_finished", outcome: "pr_open", costUsd: 1.25 }),
+           "events", JSON.stringify({ type: "run_stage_finished", stage: "implementer" })]);
+        // evidence/gate-summary shape: single row, nullable column, same bind.
+        await s.exec("INSERT INTO parity_mig (kind, doc) VALUES ($1, $2::text::jsonb)",
+          ["evidence", JSON.stringify({ gatesGreen: true, strength: "real" })]);
+        await s.exec("INSERT INTO parity_mig (kind, doc) VALUES ($1, $2::text::jsonb)",
+          ["gate_summary", JSON.stringify({ green: true, strength: "strong", tests: [{ name: "bun test", from: 631, to: 640 }] })]);
+        // NULL through the same cast (insertApproval binds null when no summary).
+        await s.exec("INSERT INTO parity_mig (kind, doc) VALUES ($1, $2::text::jsonb)", ["gate_summary", null]);
+
+        const rows = await s.query<{ kind: string; t: unknown }>(
+          "SELECT kind, jsonb_typeof(doc) AS t FROM parity_mig WHERE doc IS NOT NULL ORDER BY id ASC");
+        expect(rows.map((r) => r.t)).toEqual(["object", "object", "object", "object"]);
+        const probe = await s.query<{ outcome: unknown; n: unknown }>(
+          "SELECT doc->>'outcome' AS outcome, (doc->>'costUsd')::float8 AS n FROM parity_mig WHERE kind = 'events' AND doc->>'type' = 'run_finished'");
+        expect(probe[0]?.outcome).toBe("pr_open");
+        expect(probe[0]?.n).toBe(1.25);
+        const nested = await s.query<{ v: unknown }>(
+          "SELECT doc->'tests'->0->>'name' AS v FROM parity_mig WHERE kind = 'gate_summary' AND doc IS NOT NULL");
+        expect(nested[0]?.v).toBe("bun test");
+        const nulls = await s.query<{ n: unknown }>(
+          "SELECT COUNT(*)::int AS n FROM parity_mig WHERE kind = 'gate_summary' AND doc IS NULL");
+        expect(nulls[0]?.n).toBe(1);
+      });
+
+      test("issue #11 w2: TEXT→jsonb migration statement shape — ALTER ... USING, quarantine fallback, idempotent", async () => {
+        // The exact migration pattern db.ts's DO blocks run for events.json /
+        // evidence_json / gate_summary_json, replayed on a scratch table with
+        // a deliberately unparseable legacy row: the ALTER fails, the row scan
+        // quarantines the bad row (raw preserved, source nulled), the retried
+        // ALTER succeeds, and a second pass is a no-op (data_type probe).
+        await s.exec("DROP TABLE IF EXISTS parity_mig");
+        await s.exec("DROP TABLE IF EXISTS parity_mig_quarantine");
+        await s.exec(`CREATE TABLE parity_mig (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, doc TEXT)`);
+        await s.exec(`CREATE TABLE parity_mig_quarantine (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          src_table TEXT NOT NULL, src_id BIGINT NOT NULL, raw TEXT, at BIGINT NOT NULL)`);
+        await s.exec("INSERT INTO parity_mig (doc) VALUES ($1)", [JSON.stringify({ ok: 1 })]);
+        await s.exec("INSERT INTO parity_mig (doc) VALUES ($1)", ["not json {{{"]);
+        await s.exec("INSERT INTO parity_mig (doc) VALUES ($1)", [null]);
+
+        const MIGRATE = `DO $mig$
+          DECLARE bad RECORD;
+          BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = current_schema() AND table_name = 'parity_mig'
+                         AND column_name = 'doc' AND data_type = 'text') THEN
+              BEGIN
+                ALTER TABLE parity_mig ALTER COLUMN doc TYPE jsonb USING doc::jsonb;
+              EXCEPTION WHEN OTHERS THEN
+                FOR bad IN SELECT id::bigint AS id, doc::text AS raw FROM parity_mig WHERE doc IS NOT NULL LOOP
+                  BEGIN
+                    PERFORM bad.raw::jsonb;
+                  EXCEPTION WHEN OTHERS THEN
+                    INSERT INTO parity_mig_quarantine (src_table, src_id, raw, at)
+                    VALUES ('parity_mig', bad.id, bad.raw, (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT);
+                    UPDATE parity_mig SET doc = NULL WHERE id = bad.id;
+                  END;
+                END LOOP;
+                ALTER TABLE parity_mig ALTER COLUMN doc TYPE jsonb USING doc::jsonb;
+              END;
+            END IF;
+          END $mig$`;
+        for (let pass = 0; pass < 2; pass++) await s.exec(MIGRATE); // twice: idempotent
+
+        const type = await s.query<{ t: unknown }>(
+          "SELECT data_type AS t FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'parity_mig' AND column_name = 'doc'");
+        expect(type[0]?.t).toBe("jsonb");
+        const good = await s.query<{ t: unknown; ok: unknown }>(
+          "SELECT jsonb_typeof(doc) AS t, (doc->>'ok')::int AS ok FROM parity_mig WHERE id = 1");
+        expect(good[0]?.t).toBe("object");
+        expect(good[0]?.ok).toBe(1);
+        // The bad row: moved aside (raw preserved), source nulled — never crashed.
+        const quarantined = await s.query<{ src_id: unknown; raw: unknown }>(
+          "SELECT src_id::float8 AS src_id, raw FROM parity_mig_quarantine ORDER BY id ASC");
+        expect(quarantined.length).toBe(1); // idempotent: the second pass added nothing
+        expect(quarantined[0]?.src_id).toBe(2);
+        expect(quarantined[0]?.raw).toBe("not json {{{");
+        const nulled = await s.query<{ doc: unknown }>("SELECT doc::text AS doc FROM parity_mig WHERE id = 2");
+        expect(nulled[0]?.doc).toBeNull();
       });
 
       test("DOUBLE PRECISION keeps cents across a sum (why cost_usd is not REAL)", async () => {

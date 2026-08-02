@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.ts";
+import { appendStageTranscript, TRANSCRIPT_MAX_ROWS_PER_STAGE } from "./db.ts";
 import { bus, summarizeToolInput, type AgentStreamEvent } from "./events.ts";
 import type { Effort } from "./meta.ts";
 
@@ -466,6 +467,76 @@ const defaultDeps: StageDeps = {
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
+// ---------------------------------------------------------------------------
+// Issue #11: full-fidelity stage transcript. One writer per STAGE RUN (created
+// in runStage, shared across retry/failover attempts so seq stays monotone and
+// the per-stage row cap covers the whole run), fed from runOneAttempt's message
+// loop — the single choke point every SDK message already flows through.
+// Redaction happens HERE at write time (every string leaf passes redactSecrets,
+// the same emit-time discipline as the events table); bounds (body cap, row
+// cap) are enforced in db.ts's appendStageTranscript, the raw write path.
+// Capture is strictly additive and best-effort: no issueKey → no writer, a
+// closed store → append is a no-op, and record() never throws — the pipeline
+// must never fail because auditing did.
+// ---------------------------------------------------------------------------
+
+interface StageTranscriptWriter {
+  record(kind: string, body: Record<string, unknown>): void;
+  setSessionId(id: string): void;
+}
+
+/** Redact one string for transcript storage and strip NUL — Postgres jsonb
+ *  cannot store \u0000, and tool results can carry binary junk. */
+const redactTranscriptString = (s: string): string => redactSecrets(s.replaceAll("\u0000", "")).clean;
+
+/** Deep-clean a transcript body before serialization: every string VALUE and
+ *  every object KEY is redacted + NUL-stripped. A JSON.stringify replacer
+ *  cannot do this — replacers are never invoked to transform KEYS (the return
+ *  value replaces only the property value), so a secret appearing as a
+ *  property NAME (a model-built map keyed by token, an "Authorization:
+ *  Bearer …" header string used as a key) would reach the stored row
+ *  unredacted. Cycles (impossible in parsed SDK JSON, but capture must never
+ *  hang a stage) collapse to a marker instead of recursing. */
+function redactTranscriptBody(v: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof v === "string") return redactTranscriptString(v);
+  if (Array.isArray(v)) {
+    if (seen.has(v)) return "[circular]";
+    seen.add(v);
+    return v.map((item) => redactTranscriptBody(item, seen));
+  }
+  if (typeof v === "object" && v !== null) {
+    if (seen.has(v)) return "[circular]";
+    seen.add(v);
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) out[redactTranscriptString(k)] = redactTranscriptBody(val, seen);
+    return out;
+  }
+  return v;
+}
+
+/** Transcript writer for one stage run, or null when capture is switched off
+ *  (FACTORY_TRANSCRIPT=0 — the operational kill switch behind issue #11's
+ *  additive-off verification: flag off ⇒ zero rows, stage behavior byte-
+ *  identical) or when the stage has no issueKey (groundskeeper probes outside
+ *  an issue context, tests) — skip capture entirely, never crash. */
+function beginStageTranscript(stage: string, issueKey: string | undefined): StageTranscriptWriter | null {
+  if (!config.transcriptEnabled) return null;
+  if (issueKey === undefined || issueKey.trim() === "") return null;
+  let seq = 0;
+  let sessionId: string | null = null;
+  return {
+    setSessionId(id: string): void { sessionId = id; },
+    record(kind: string, body: Record<string, unknown>): void {
+      if (seq >= TRANSCRIPT_MAX_ROWS_PER_STAGE) return; // past the cap — stop serializing (db.ts enforces the cap too)
+      try {
+        seq += 1;
+        appendStageTranscript({ issueKey, stage, sessionId, seq, kind,
+          bodyJson: JSON.stringify(redactTranscriptBody(body)) });
+      } catch { /* audit capture must never break a stage */ }
+    },
+  };
+}
+
 export async function runStage(label: string, prompt: string, opts: StageOptions, deps: StageDeps = defaultDeps): Promise<StageResult> {
   const t0 = Date.now();
   // Allowlist audit BEFORE any SDK spawn or spend: an unpinnable tool grant is
@@ -504,8 +575,13 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     mergedUsage = mergeModelUsage(mergedUsage, r.modelUsage);
   };
 
+  // #11: one transcript writer per stage RUN — shared across retries/failover
+  // so seq stays monotone and the row cap bounds the whole run. Null when the
+  // stage has no issueKey (skip capture, never crash).
+  const transcript = beginStageTranscript(label, opts.issueKey);
+
   let attempt = 1;
-  let last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+  let last = await runOneAttempt(label, prompt, opts, primaryModel, deps, transcript);
   accumulate(last);
   while (last.error && isTransientStageError(last.error) && attempt < 1 + RETRY_ATTEMPTS) {
     const waitMs = backoffMs(attempt);
@@ -514,7 +590,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     if (opts.deadlineMs - Date.now() < waitMs + 5_000) break;
     await deps.sleep(waitMs);
     attempt += 1;
-    last = await runOneAttempt(label, prompt, opts, primaryModel, deps);
+    last = await runOneAttempt(label, prompt, opts, primaryModel, deps, transcript);
     accumulate(last);
   }
   if (last.error && isTransientStageError(last.error)) {
@@ -522,7 +598,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
     if (fallbackModel && fallbackModel !== primaryModel && Date.now() < opts.deadlineMs) {
       console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}); failing over to ${fallbackModel}`);
       bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: fallbackModel, reason: last.error });
-      const fromFallback = await runOneAttempt(label, prompt, opts, fallbackModel, deps);
+      const fromFallback = await runOneAttempt(label, prompt, opts, fallbackModel, deps, transcript);
       accumulate(fromFallback);
       // Ran on a non-primary model — surface that like reviewer-fallback does,
       // so the report/UI can flag it even when the fallback run succeeded.
@@ -554,7 +630,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
  *  the mechanics (env, abort/deadline, message loop, result shaping). Split
  *  out of runStage so the retry loop above can call it multiple times against
  *  different models without duplicating any of this. */
-async function runOneAttempt(label: string, prompt: string, opts: StageOptions, model: string, deps: StageDeps): Promise<StageResult> {
+async function runOneAttempt(label: string, prompt: string, opts: StageOptions, model: string, deps: StageDeps, transcript: StageTranscriptWriter | null = null): Promise<StageResult> {
   const t0 = Date.now();
   // Non-claude models route via the proxy automatically (any role can be either
   // vendor); an explicit opts.viaProxy still overrides.
@@ -632,6 +708,10 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
       const m = message as { type?: string; message?: { content?: unknown }; event?: { type?: string; delta?: { type?: string; text?: string } } };
       if (m.type === "system" && (m as { subtype?: string }).subtype === "init") {
         const sid = (m as { session_id?: string }).session_id;
+        // #11: bind the session id BEFORE recording so the init row (and every
+        // later row) carries it — the join key to stage_sessions/resume.
+        if (sid) transcript?.setSessionId(sid);
+        transcript?.record("system", m as Record<string, unknown>);
         if (sid) await opts.onSessionId?.(sid);
         continue;
       }
@@ -648,7 +728,15 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
       }
       if (m.type === "assistant" && Array.isArray(m.message?.content)) {
         for (const block of m.message.content as Array<Record<string, unknown>>) {
+          if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim() !== "") {
+            // #11: reasoning summaries where the SDK surfaces them (both
+            // current test-roster models are reasoning models).
+            transcript?.record("reasoning", { text: block.thinking });
+          }
           if (block.type === "tool_use" && typeof block.name === "string") {
+            // #11: the FULL tool input — the events stream keeps only a
+            // 160-char summary; this row is the audit-fidelity record.
+            transcript?.record("tool_use", { id: block.id, tool: block.name, input: block.input });
             // #17 delegation observability: a Task spawn of a REGISTER delegate
             // resolves its subagent_type to "name@version" in the detail; every
             // other tool use (worker spawns included) is byte-identical to before.
@@ -661,12 +749,26 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
             opts.onEvent?.({ kind: "tool_use", stage: label, tool: block.name,
               detail: redactSecrets(prefix === "" ? summary : `${prefix} ${summary}`.trim()).clean.slice(0, 160) });
           } else if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
+            transcript?.record("assistant_text", { text: block.text }); // #11: FULL text, not the 500-char stream snippet
             opts.onEvent?.({ kind: "assistant_text", stage: label,
               text: redactSecrets(block.text).clean.slice(0, 500) });
           }
         }
       }
-      if (m.type === "result") result = message as Record<string, unknown>;
+      // #11: tool RESULTS — what the tool returned to the model — arrive as
+      // user messages with tool_result blocks. Previously not captured at all.
+      if (m.type === "user" && Array.isArray(m.message?.content)) {
+        for (const block of m.message.content as Array<Record<string, unknown>>) {
+          if (block.type === "tool_result") {
+            transcript?.record("tool_result", { toolUseId: block.tool_use_id, content: block.content,
+              ...(block.is_error === true ? { isError: true } : {}) });
+          }
+        }
+      }
+      if (m.type === "result") {
+        result = message as Record<string, unknown>;
+        transcript?.record("result", result); // #11: the full result record (cost, turns, usage, text)
+      }
     }
     // Non-success subtypes (error_max_turns, error_max_budget_usd, …) carry no
     // result field — they must surface as errors, not silent success (C7).

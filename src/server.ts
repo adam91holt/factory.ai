@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { startEventStore, issueEvents, getTelemetry, flushEvents } from "./db.ts";
+import { startEventStore, issueEvents, getTelemetry, flushEvents, issueTranscriptPage } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
 import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
@@ -16,7 +16,7 @@ import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { config } from "./config.ts";
+import { config, resolveDashboardPort } from "./config.ts";
 import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView, type StageView } from "./events.ts";
 import { killSwitch } from "./control.ts";
 
@@ -268,19 +268,9 @@ export function applyEvent(mission: MissionState, e: FactoryEvent): MissionState
   return { ...m, seq: e.seq };
 }
 
-function resolvePort(): number | null {
-  const raw = process.env.DASHBOARD_PORT?.trim();
-  if (raw === undefined || raw === "") {
-    if (config.oneShot || config.dryRun) return null; // off in --once/--dry unless forced
-    return 8787;
-  }
-  if (raw === "0") return null; // explicit off
-  const port = Number(raw);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`DASHBOARD_PORT must be an integer in 1..65535 or 0 to disable (got "${raw}")`);
-  }
-  return port;
-}
+// Port resolution moved to config.ts (resolveDashboardPort) so report.ts can
+// render the transcript deep-link with the same rules the server binds with.
+const resolvePort = resolveDashboardPort;
 
 function readRunRecords(historyPath: string): RunRecord[] {
   let text: string;
@@ -510,6 +500,56 @@ export function handleRegisterRoutes(url: URL, req: IncomingMessage, res: Server
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Transcript route (issue #11): GET /issue/:key/transcript — the audit read
+// over stage_transcript ("what exactly did the factory do on FAC-49?").
+// Read-only, loopback-bound like every other GET here (guardedJsonBody guards
+// mutations only — this route accepts no body and mutates nothing). Extracted
+// like handleProjectRoutes so tests mount it on an ephemeral server. Bounded:
+// keyset-paginated (`after` cursor), page size capped in db.ts
+// (TRANSCRIPT_PAGE_MAX_ROWS — an in-code constant, not a knob). The key
+// pattern is the WIDE one (/run-events): groundskeeper/steward stages write
+// transcripts under GK-<card> style keys too. Every stored body was redacted
+// at write time (agents.ts).
+// ---------------------------------------------------------------------------
+export function handleTranscriptRoute(url: URL, req: IncomingMessage, res: ServerResponse): boolean {
+  const match = url.pathname.match(/^\/issue\/([A-Z]+-[A-Za-z0-9-]{1,80})\/transcript$/);
+  if (!match) return false;
+  if (req.method !== "GET") {
+    res.writeHead(405, { "content-type": "application/json" });
+    res.end('{"error":"method not allowed"}');
+    return true;
+  }
+  const key = match[1] ?? "";
+  const bad = (msg: string): true => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: msg }));
+    return true;
+  };
+  const stageRaw = url.searchParams.get("stage");
+  if (stageRaw !== null && !/^[A-Za-z0-9_-]{1,80}$/.test(stageRaw)) return bad("bad stage");
+  const afterRaw = url.searchParams.get("after");
+  const after = afterRaw === null ? 0 : Number(afterRaw);
+  if (!Number.isInteger(after) || after < 0) return bad("bad after cursor");
+  const limitRaw = url.searchParams.get("limit");
+  const limit = limitRaw === null ? 200 : Number(limitRaw);
+  if (!Number.isInteger(limit) || limit < 1) return bad("bad limit"); // over-cap is clamped in db.ts, not an error
+  void issueTranscriptPage(key, {
+    ...(stageRaw !== null ? { stage: stageRaw } : {}),
+    afterId: after, limit,
+  })
+    .then((page) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ issueKey: key, stage: stageRaw, ...page }));
+    })
+    .catch((error: unknown) => {
+      console.error(`[dashboard] transcript failed: ${error instanceof Error ? error.message : error}`);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end('{"error":"transcript unavailable"}');
+    });
+  return true;
 }
 
 /** Serve ui/dist/index.html if built. Returns false (nothing written) otherwise. */
@@ -742,6 +782,9 @@ export async function startDashboard(): Promise<{
         });
       return;
     }
+
+    // Issue #11 audit read: GET /issue/:key/transcript (paginated, bounded).
+    if (handleTranscriptRoute(url, req, res)) return;
 
     if (url.pathname === "/issue") {
       const key = url.searchParams.get("key") ?? "";

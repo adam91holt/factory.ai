@@ -1,4 +1,5 @@
 import { SENTINEL, PARKED_LABEL } from "./linear.ts";
+import { resolveDashboardPort } from "./config.ts";
 import type { StageResult } from "./agents.ts";
 import type { GateResult } from "./verify.ts";
 
@@ -63,6 +64,20 @@ export interface RoutingEntry {
   unknownTools: string[];
 }
 
+/** Loopback deep-link to the full stage transcript for one issue (issue #11's
+ *  read surface, served by server.ts handleTranscriptRoute), or null when the
+ *  dashboard is off / the port env is malformed / the key is not link-shaped.
+ *  Same WIDE key pattern as the route itself (GK-<card> keys included). Only
+ *  meaningful on the daemon's own machine — which is exactly who reads a
+ *  factory report to audit a run. */
+export function transcriptUrlFor(issueKey: string): string | null {
+  if (!/^[A-Z]+-[A-Za-z0-9-]{1,80}$/.test(issueKey)) return null;
+  let port: number | null;
+  try { port = resolveDashboardPort(); } catch { return null; }
+  if (port === null) return null;
+  return `http://127.0.0.1:${port}/issue/${issueKey}/transcript`;
+}
+
 export function buildReport(input: ReportInput): string {
   const totalCost = input.stages.reduce((sum, s) => sum + s.costUsd, 0);
   const degraded = input.stages.some((s) => s.degraded);
@@ -78,6 +93,13 @@ export function buildReport(input: ReportInput): string {
   } else {
     lines.push(`**Outcome:** ${input.outcome}${input.reason ? ` — ${input.reason}` : ""}`, "");
   }
+
+  // Issue #11: every report links the full-fidelity audit transcript (every
+  // message, full tool inputs AND results) — the answer to "what exactly did
+  // the factory do here?" is one click, not a dig through session files.
+  // Omitted when the dashboard is off, keeping those reports byte-identical.
+  const transcriptUrl = transcriptUrlFor(input.issueKey);
+  if (transcriptUrl) lines.push(`📜 Full transcript: ${transcriptUrl}`, "");
 
   if (input.outcome === "parked") {
     // #13: a parked ticket stays in Todo — only the label keeps it out of the
