@@ -129,6 +129,7 @@ export type FactoryEventBody =
   // the spend cap) entering drain mode ever emits, so alerts.ts has a single
   // trigger to watch. `reason` is already bounded/plain text (never raw input).
   | { type: "drain_entered"; trigger: "kill_switch" | "budget_cap"; reason: string }
+  | { type: "drain_resumed"; previousReason: string }
   // B3: park's own Linear mutations (Parked label / queue transition / Executing-
   // label release) exhausted their bounded retries during processIssue's park()
   // — the ticket may now be STRANDED (still Executing-labeled and/or missing its
