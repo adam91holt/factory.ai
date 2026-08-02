@@ -6,18 +6,18 @@ import { effectiveMergeTier, decideMerge, type MergeEvidence } from "../src/merg
 // both halves: the tier resolution AND that "auto" tier never merges an unsafe task.
 
 describe("effectiveMergeTier — auto-merge default + human-review opt-out", () => {
-  test("autoDefault ON, un-enrolled non-self repo → auto", () => {
+  test("autoDefault ON, un-enrolled non-self repo → auto", async () => {
     expect(effectiveMergeTier("acme/widgets", null, { autoDefault: true })).toBe("auto");
   });
-  test("autoDefault OFF → human (unchanged legacy behavior)", () => {
+  test("autoDefault OFF → human (unchanged legacy behavior)", async () => {
     expect(effectiveMergeTier("acme/widgets", null, { autoDefault: false })).toBe("human");
     expect(effectiveMergeTier("acme/widgets", null)).toBe("human");
   });
-  test("self-repo is ALWAYS human, even with autoDefault ON", () => {
+  test("self-repo is ALWAYS human, even with autoDefault ON", async () => {
     // isSelfRepo matches config.selfRepo OR any '.../factory'
     expect(effectiveMergeTier("acme/factory", null, { autoDefault: true })).toBe("human");
   });
-  test("human-review opt-out forces human, even with autoDefault ON", () => {
+  test("human-review opt-out forces human, even with autoDefault ON", async () => {
     expect(effectiveMergeTier("acme/widgets", null, { autoDefault: true, humanReview: true })).toBe("human");
   });
 });
@@ -27,25 +27,25 @@ describe("decideMerge — auto tier NEVER merges an unsafe task (safety unchange
   const OPTS = { lowRiskMaxDiff: 40 };
   const clean: MergeEvidence = { green: true, strength: "strong", guarded: false, needsHuman: false, security: "pass", browser: "pass", diffLines: 10 };
 
-  test("a fully clean task at auto tier DOES merge (act=true)", () => {
+  test("a fully clean task at auto tier DOES merge (act=true)", async () => {
     expect(decideMerge(AUTO, clean, OPTS).act).toBe(true);
   });
-  test("security FAIL → never acts", () => {
+  test("security FAIL → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, security: "fail" }, OPTS).act).toBe(false);
   });
-  test("guarded paths touched → never acts", () => {
+  test("guarded paths touched → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, guarded: true }, OPTS).act).toBe(false);
   });
-  test("needsHuman fold (taste/tester/test-deletion) → never acts", () => {
+  test("needsHuman fold (taste/tester/test-deletion) → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, needsHuman: true }, OPTS).act).toBe(false);
   });
-  test("gates not green → never acts", () => {
+  test("gates not green → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, green: false }, OPTS).act).toBe(false);
   });
-  test("gate strength not strong → never acts", () => {
+  test("gate strength not strong → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, strength: "real" }, OPTS).act).toBe(false);
   });
-  test("browser evidence failed/missing → never acts", () => {
+  test("browser evidence failed/missing → never acts", async () => {
     expect(decideMerge(AUTO, { ...clean, browser: "fail" }, OPTS).act).toBe(false);
     expect(decideMerge(AUTO, { ...clean, browser: "missing" }, OPTS).act).toBe(false);
   });
@@ -82,79 +82,79 @@ describe("preMergeIntegrity — stale-main re-gate + head pinning", () => {
     };
   }
 
-  test("up to date (behind 0) → merge proceeds pinned to the ORIGINAL gated SHA; no update/re-gate/push runs", () => {
+  test("up to date (behind 0) → merge proceeds pinned to the ORIGINAL gated SHA; no update/re-gate/push runs", async () => {
     const d = deps();
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r).toEqual({ ok: true, pinnedHeadSha: SHA });
     expect(d.calls).toEqual(["fetch", "behind"]); // never touched the branch it didn't need to
   });
 
-  test("no gated SHA recorded → hold (an unpinned auto-merge is refused before any I/O)", () => {
+  test("no gated SHA recorded → hold (an unpinned auto-merge is refused before any I/O)", async () => {
     const d = deps();
-    const r = preMergeIntegrity(WS, null, d);
+    const r = await preMergeIntegrity(WS, null, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/unpinned/);
     expect(d.calls).toEqual([]);
   });
 
-  test("fetch failure → hold (cannot prove the branch is current; ambiguity routes to a human)", () => {
+  test("fetch failure → hold (cannot prove the branch is current; ambiguity routes to a human)", async () => {
     const d = deps({ fetchBase: () => ({ ok: false, out: "network unreachable" }) });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/could not refresh/);
     expect(d.calls).toEqual([]);
   });
 
-  test("unknown behind-count (git failure) → hold, never 'assume current'", () => {
+  test("unknown behind-count (git failure) → hold, never 'assume current'", async () => {
     const d = deps({ commitsBehindBase: () => null });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/refusing to merge blind/);
   });
 
-  test("behind + clean update + green re-gate → merge proceeds pinned to the NEW head (never the stale gated SHA)", () => {
+  test("behind + clean update + green re-gate → merge proceeds pinned to the NEW head (never the stale gated SHA)", async () => {
     const d = deps({ commitsBehindBase: () => { d.calls.push("behind"); return 2; } });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r).toEqual({ ok: true, pinnedHeadSha: NEW_SHA });
     // full sequence ran, in order: the push lands the re-gated head BEFORE the pin is read
     expect(d.calls).toEqual(["fetch", "behind", "update", "regate", "push", "headSha"]);
   });
 
-  test("behind + conflicting update → hold; the re-gate and push NEVER run", () => {
+  test("behind + conflicting update → hold; the re-gate and push NEVER run", async () => {
     const d = deps({
       commitsBehindBase: () => { d.calls.push("behind"); return 1; },
       mergeBaseIntoBranch: () => { d.calls.push("update"); return { ok: false, out: "CONFLICT (content): shared.txt" }; },
     });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/behind .* conflicted .* human/);
     expect(d.calls).toEqual(["fetch", "behind", "update"]);
   });
 
-  test("behind + update ok + RED re-gate → hold (the sibling's changes break this branch); push never runs", () => {
+  test("behind + update ok + RED re-gate → hold (the sibling's changes break this branch); push never runs", async () => {
     const d = deps({
       commitsBehindBase: () => { d.calls.push("behind"); return 1; },
       regate: () => { d.calls.push("regate"); return { green: false, failures: [{ name: "test" }, { name: "typecheck" }] }; },
     });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/gates FAILED against the combined head \(test, typecheck\)/);
     expect(d.calls).toEqual(["fetch", "behind", "update", "regate"]);
   });
 
-  test("behind + green re-gate but push throws → hold (never merge a head GitHub cannot see)", () => {
+  test("behind + green re-gate but push throws → hold (never merge a head GitHub cannot see)", async () => {
     const d = deps({
       commitsBehindBase: () => 1,
       push: () => { throw new Error("push failed: remote hung up"); },
     });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/could not push/);
   });
 
-  test("behind + green re-gate but the NEW head SHA is unreadable → hold (unpinned re-gated merge refused too)", () => {
+  test("behind + green re-gate but the NEW head SHA is unreadable → hold (unpinned re-gated merge refused too)", async () => {
     const d = deps({ commitsBehindBase: () => 1, headSha: () => null });
-    const r = preMergeIntegrity(WS, SHA, d);
+    const r = await preMergeIntegrity(WS, SHA, d);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.hold).toMatch(/unpinned/);
   });

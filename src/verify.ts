@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Workspace } from "./repos.ts";
@@ -100,23 +101,37 @@ function npmScripts(dir: string): Record<string, string> {
 
 export interface RunResult { ok: boolean; out: string; errored: boolean }
 
-function run(dir: string, cmd: string, args: string[], timeoutMs = 300_000): RunResult {
-  const r = spawnSync(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs });
-  // errored: the command could not be run to COMPLETION — a spawn error (bad
-  // cmd, permissions) or our timeout killed it (a signal, not an exit code).
-  // Distinct from a clean non-zero exit (r.status is a number, r.signal null,
-  // r.error undefined), which means the command ran and genuinely failed.
-  const errored = r.error !== undefined || r.signal !== null;
-  return { ok: r.status === 0, out: ((r.stdout ?? "") + (r.stderr ?? "")).slice(-3000), errored };
+const execFileP = promisify(execFile);
+
+/** ASYNC on purpose (dashboard-starvation fix, live 2026-08-02): gates run
+ * for MINUTES (npm ci, Playwright e2e), and the old spawnSync version blocked
+ * the daemon's entire event loop for the duration — the mission-control HTTP
+ * server stopped accepting, ticks froze, and async gh children went zombie
+ * unreaped. Same RunResult contract: `errored` = could not run to COMPLETION
+ * (spawn failure or our timeout's signal), distinct from a clean non-zero
+ * exit (ran and genuinely failed).
+ * maxBuffer generous (32MB): a huge test log must surface as output (we slice
+ * the tail), never as a spurious ENOBUFS "error". */
+async function run(dir: string, cmd: string, args: string[], timeoutMs = 300_000): Promise<RunResult> {
+  try {
+    const { stdout, stderr } = await execFileP(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+    return { ok: true, out: ((stdout ?? "") + (stderr ?? "")).slice(-3000), errored: false };
+  } catch (error) {
+    const e = error as { code?: number | string; signal?: string | null; killed?: boolean; stdout?: string; stderr?: string };
+    const out = (((e.stdout ?? "") as string) + ((e.stderr ?? "") as string)).slice(-3000);
+    // Timeout kills via signal; a spawn failure has a string code (ENOENT…).
+    const errored = e.killed === true || (e.signal !== undefined && e.signal !== null) || typeof e.code === "string";
+    return { ok: false, out, errored };
+  }
 }
 
 /** Retry-once-on-error/timeout policy shared by ensureDeps and baseline (#12a).
  * Pure w.r.t. the injected `attempt` so the policy is unit-testable without
  * shelling out or waiting on a real timeout. Never retries a clean non-zero
  * exit — only a run that could not complete gets the second try. */
-export function runWithRetryOnError(attempt: () => RunResult): RunResult {
-  const first = attempt();
-  return first.errored ? attempt() : first;
+export async function runWithRetryOnError(attempt: () => Promise<RunResult> | RunResult): Promise<RunResult> {
+  const first = await attempt();
+  return first.errored ? await attempt() : first;
 }
 
 /** Per-repo package manager: respect the TARGET repo's lockfile — the factory
@@ -137,10 +152,10 @@ export function packageManager(dir: string): { name: "bun" | "npm"; install: str
  * once before failing (runWithRetryOnError); `transient: true` on a failure
  * that survived the retry tells the caller this is worth a plain requeue
  * rather than a deeper look — FAC-34's "transient install/timeout" case. */
-export function ensureDeps(ws: Workspace): { ok: boolean; detail: string; transient?: boolean } {
+export async function ensureDeps(ws: Workspace): Promise<{ ok: boolean; detail: string; transient?: boolean }> {
   if (!existsSync(join(ws.dir, "package.json"))) return { ok: true, detail: "no package.json" };
   const pm = packageManager(ws.dir);
-  const r = runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.install], 600_000));
+  const r = await runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.install], 600_000));
   return r.ok ? { ok: true, detail: `${pm.name} ${pm.install[0]}` } : { ok: false, detail: r.out.slice(-800), transient: r.errored };
 }
 
@@ -175,28 +190,30 @@ export interface BaselineRun { ok: boolean; testCount: number | null }
  * once via runWithRetryOnError before its baselinePassed verdict is recorded —
  * a transient hiccup here used to be indistinguishable from a genuinely red
  * baseline, classing the gate no-gate (FAC-34/B11). */
-export function baseline(ws: Workspace, gates: string[]): Map<string, BaselineRun> {
+export async function baseline(ws: Workspace, gates: string[]): Promise<Map<string, BaselineRun>> {
   const pm = packageManager(ws.dir);
   const result = new Map<string, BaselineRun>();
   for (const gate of gates) {
-    const r = runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.runner, gate]));
+    const r = await runWithRetryOnError(() => run(ws.dir, pm.name, [...pm.runner, gate]));
     result.set(gate, { ok: r.ok, testCount: r.ok && isTestGate(gate) ? parsePassingTestCount(r.out) : null });
   }
   return result;
 }
 
 /** After changes: a gate counts only if its baseline passed. */
-export function verify(ws: Workspace, gates: string[], baselines: Map<string, BaselineRun>): GateResult[] {
+export async function verify(ws: Workspace, gates: string[], baselines: Map<string, BaselineRun>): Promise<GateResult[]> {
   const pm = packageManager(ws.dir);
-  return gates.map((gate) => {
+  const out: GateResult[] = [];
+  for (const gate of gates) {
     const base = baselines.get(gate);
     const baselinePassed = base?.ok ?? false;
-    if (!baselinePassed) return { name: gate, baselinePassed, passed: null, output: "skipped: fails on clean baseline (no-gate)", baselineTestCount: null, testCount: null };
-    const r = run(ws.dir, pm.name, [...pm.runner, gate]);
-    return { name: gate, baselinePassed, passed: r.ok, output: r.ok ? "" : r.out,
+    if (!baselinePassed) { out.push({ name: gate, baselinePassed, passed: null, output: "skipped: fails on clean baseline (no-gate)", baselineTestCount: null, testCount: null }); continue; }
+    const r = await run(ws.dir, pm.name, [...pm.runner, gate]);
+    out.push({ name: gate, baselinePassed, passed: r.ok, output: r.ok ? "" : r.out,
       baselineTestCount: base?.testCount ?? null,
-      testCount: isTestGate(gate) ? parsePassingTestCount(r.out) : null };
-  });
+      testCount: isTestGate(gate) ? parsePassingTestCount(r.out) : null });
+  }
+  return out;
 }
 
 // ---- Test-count ratchet (withhold-only) -----------------------------------

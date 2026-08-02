@@ -297,7 +297,7 @@ describe("integrity-hold prominence (regateFailed)", () => {
   const ws = { dir: "/tmp/x", branch: "factory/FAC-1", baseRef: "origin/main" } as Workspace;
 
   test("the flag is set by the LIVE preMergeIntegrity red-re-gate hold (marker coupling)", async () => {
-    const result = preMergeIntegrity(ws, GATED, {
+    const result = await preMergeIntegrity(ws, GATED, {
       fetchBase: () => ({ ok: true, out: "" }),
       commitsBehindBase: () => 3,
       mergeBaseIntoBranch: () => ({ ok: true, out: "" }),

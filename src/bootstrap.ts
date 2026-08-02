@@ -205,12 +205,12 @@ export async function bootstrapProject(issue: linear.Issue): Promise<void> {
     if (scaffolder.error) { await park(`scaffolder: ${scaffolder.error}`); return; }
 
     // (b) REAL green gates on a clean baseline — else park (repo left empty).
-    const deps = ensureDeps(ws);
+    const deps = await ensureDeps(ws);
     if (!deps.ok) { await park(`scaffold dependency install failed: ${deps.detail.slice(0, 200)}`); return; }
     const gates = detectGates(ws);
     // baseline() carries per-gate test counts for the ratchet (verify.ts) —
     // scaffold only needs the green/red verdicts, so project down to those.
-    const baselines = baseline(ws, gates);
+    const baselines = await baseline(ws, gates);
     const green = scaffoldGatesGreen(gates, new Map(Array.from(baselines, ([g, b]) => [g, b.ok])));
     if (!green.green) { await park(`green-gate check failed — ${green.reason}. Repo left private and empty (nothing pushed/registered).`); return; }
 

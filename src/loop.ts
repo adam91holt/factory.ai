@@ -492,10 +492,10 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       return;
     }
 
-    const deps = ensureDeps(ws);
+    const deps = await ensureDeps(ws);
     if (!deps.ok) { await park(issue, repo, stages, `dependency install failed${deps.transient ? " (transient — safe to requeue)" : ""}: ${deps.detail.slice(0, 300)}`, ws); return; }
     const gates = detectGates(ws);
-    const baselines = baseline(ws, gates);
+    const baselines = await baseline(ws, gates);
 
     // ---- agent routing (routing.ts): which CARD runs each stage, and which
     // TOOLS that stage is granted.
@@ -778,7 +778,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     }
 
     // ---- verify (baselined) with bounded, budgeted, deadlined repair rounds
-    let results = verify(ws, gates, baselines);
+    let results = await verify(ws, gates, baselines);
     let summary = gateSummary(results);
     bus.emit({ type: "run_gates", issueKey: issue.identifier, round: 0,
       green: summary.green, strength: summary.strength,
@@ -807,7 +807,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       stages.push(escalated);
       await postStageComment(issue, escalated);
       commitAll(ws, `${issue.identifier}: tier-escalated gate fix`);
-      results = verify(ws, gates, baselines);
+      results = await verify(ws, gates, baselines);
       summary = gateSummary(results);
       gateRound += 1;
       bus.emit({ type: "run_gates", issueKey: issue.identifier, round: gateRound,
@@ -823,7 +823,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       stages.push(repair);
     await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
-      results = verify(ws, gates, baselines);
+      results = await verify(ws, gates, baselines);
       summary = gateSummary(results);
       gateRound += 1;
       bus.emit({ type: "run_gates", issueKey: issue.identifier, round: gateRound,
@@ -1040,9 +1040,9 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // this is action-site I/O, factored into preMergeIntegrity (bottom of this
     // file) with injectable deps so the decision sequence is unit-testable.
     const integrity = !config.dryRun && decision.act && prUrl
-      ? preMergeIntegrity(ws, gatedHeadSha, {
+      ? await preMergeIntegrity(ws, gatedHeadSha, {
           fetchBase, commitsBehindBase, mergeBaseIntoBranch,
-          regate: () => gateSummary(verify(ws, gates, baselines)),
+          regate: async () => gateSummary(await verify(ws, gates, baselines)),
           push: pushBranch, headSha,
         })
       : null;
@@ -1361,7 +1361,7 @@ export interface MergeIntegrityDeps {
   /** Re-run the verify gate (verify.ts verify+gateSummary against the SAME
    * gates/baselines the run used) — the combined head must be as green as the
    * original head was. */
-  regate: () => { green: boolean; failures: { name: string }[] };
+  regate: () => Promise<{ green: boolean; failures: { name: string }[] }> | { green: boolean; failures: { name: string }[] };
   push: (ws: Workspace) => void;
   headSha: (ws: Workspace) => string | null;
 }
@@ -1370,7 +1370,7 @@ export type MergeIntegrityResult =
   | { ok: true; pinnedHeadSha: string }
   | { ok: false; hold: string };
 
-export function preMergeIntegrity(ws: Workspace, gatedHeadSha: string | null, deps: MergeIntegrityDeps): MergeIntegrityResult {
+export async function preMergeIntegrity(ws: Workspace, gatedHeadSha: string | null, deps: MergeIntegrityDeps): Promise<MergeIntegrityResult> {
   if (!gatedHeadSha) {
     return { ok: false, hold: "could not record the head SHA the gates ran against (git rev-parse failed) — refusing an unpinned auto-merge" };
   }
@@ -1390,7 +1390,7 @@ export function preMergeIntegrity(ws: Workspace, gatedHeadSha: string | null, de
   if (!upd.ok) {
     return { ok: false, hold: `branch is ${behind} commit(s) behind ${ws.baseRef} and updating it conflicted — a human must resolve (${upd.out.slice(0, 200)})` };
   }
-  const regate = deps.regate();
+  const regate = await deps.regate();
   if (!regate.green) {
     return { ok: false, hold: `branch was ${behind} commit(s) behind ${ws.baseRef}; after updating, gates FAILED against the combined head (${regate.failures.map((f) => f.name).join(", ") || "unknown gate"}) — the changes that landed on main break this branch` };
   }
