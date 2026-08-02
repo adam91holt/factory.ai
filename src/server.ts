@@ -18,7 +18,7 @@ import { join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, resolveDashboardPort } from "./config.ts";
 import { bus, type FactoryEvent, type MissionState, type RunRecord, type RunView, type StageView } from "./events.ts";
-import { killSwitch } from "./control.ts";
+import { killSwitch, resumeFromDrain } from "./control.ts";
 
 // Mission-control dashboard server. Contract: docs/ui-architecture.md §3.
 // Almost observe-only: GET routes, loopback bind exclusively, no env echo, no
@@ -680,6 +680,26 @@ export async function startDashboard(): Promise<{
         const { abortedStages } = killSwitch(reason);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, draining: true, abortedCount: abortedStages.length, abortedStages }));
+      });
+      return;
+    }
+
+    // Write route: /resume — the /stop undo (fix-list ②; before this, the only
+    // way back from a manual stop was killing and restarting the daemon).
+    // Same guardedJsonBody gate. Refuses to clear a BUDGET-CAP drain by
+    // design: control.ts owns that decision (a resumable spend cap is not a
+    // cap), and the 409 carries its explanation.
+    if (url.pathname === "/resume") {
+      void guardedJsonBody(req, res).then((guarded) => {
+        if (guarded === null) return; // refusal already written
+        const outcome = resumeFromDrain();
+        if (!outcome.resumed) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: outcome.refused }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, draining: false }));
       });
       return;
     }

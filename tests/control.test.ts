@@ -90,3 +90,39 @@ describe("abortAllStages / activeStageCount (agents.ts registry)", () => {
     expect(abortAllStages()).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// /resume (fix-list ②): the /stop undo. A kill-switch drain resumes; a
+// budget-cap drain REFUSES (a resumable spend cap is not a cap).
+// ---------------------------------------------------------------------------
+
+import { resumeFromDrain } from "../src/control.ts";
+
+describe("resumeFromDrain", () => {
+  test("clears a kill-switch drain and the next isDraining() is false", () => {
+    killSwitch("operator hit stop by mistake");
+    expect(isDraining()).toBe(true);
+    const out = resumeFromDrain();
+    expect(out.resumed).toBe(true);
+    expect(isDraining()).toBe(false);
+    expect(drainInfo()).toEqual({ draining: false, reason: null });
+  });
+  test("REFUSES to clear a budget-cap drain, with the reason in the refusal", () => {
+    enterDrain("rolling spend exceeded cap", "budget_cap");
+    const out = resumeFromDrain();
+    expect(out.resumed).toBe(false);
+    expect(out.refused ?? "").toContain("BUDGET CAP");
+    expect(isDraining()).toBe(true); // still draining — the cap stands
+  });
+  test("idempotent: resuming a non-draining daemon is a no-op success", () => {
+    expect(resumeFromDrain()).toEqual({ resumed: true });
+  });
+  test("a fresh kill-switch AFTER a refused budget resume still drains (no state corruption)", () => {
+    enterDrain("cap", "budget_cap");
+    resumeFromDrain();
+    resetDrainForTest();
+    killSwitch("second stop");
+    expect(isDraining()).toBe(true);
+    expect(resumeFromDrain().resumed).toBe(true);
+  });
+});

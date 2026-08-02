@@ -196,6 +196,7 @@ export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
   const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
   return data.issues.nodes.map(toIssue)
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
+    .filter((issue) => isQueueLane(issue.stateName, issue.stateDescription)) // same lane rule as fetchQueue
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
@@ -295,6 +296,10 @@ export async function fetchQueue(deps: LinearTransportDeps = defaultDeps): Promi
   });
   const eligible = queuePage
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
+    // Lane filter (FAC-55 escape): only the [factory:queue] lane is claimable —
+    // Blocked / Needs Human are unstarted-TYPE too and must never be, whatever
+    // labels they carry. The snapshot above still renders every lane.
+    .filter((issue) => isQueueLane(issue.stateName, issue.stateDescription))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // FIFO regardless of server order (C21)
   // STARVATION WARNING (belt-and-braces alarm). With the server-side label
   // exclusion above, a full queue page whose issues ALL carry hold labels can
@@ -588,6 +593,22 @@ export function isReviewLane(stateName: string, stateDescription: string | null 
   const kind = taggedKind(stateDescription);
   if (kind !== null) return kind === "review";
   return /review/i.test(stateName);
+}
+
+/** Is this state the CLAIMABLE queue lane? Live-found 2026-08-02 (the FAC-55
+ *  escape, root-caused): WP3 put Blocked and Needs Human in unstarted-TYPE
+ *  states (Linear has no "blocked" type), so a bare `state.type = unstarted`
+ *  filter treats all three lanes as claimable — a ticket parked to Blocked
+ *  whose hold label is stripped (or was never applied) silently re-enters the
+ *  queue. Same tag-anchored discipline as isReviewLane: the `[factory:queue]`
+ *  tag is authoritative; a state carrying a DIFFERENT factory tag is
+ *  authoritatively NOT the queue. Untagged fallback (board-setup never run):
+ *  any unstarted state EXCEPT one whose name says blocked/needs-human — the
+ *  pre-WP3 behaviour, minus the two hold lanes. */
+export function isQueueLane(stateName: string, stateDescription: string | null | undefined = ""): boolean {
+  const kind = taggedKind(stateDescription);
+  if (kind !== null) return kind === "queue";
+  return !/blocked|needs.?human/i.test(stateName);
 }
 
 /**

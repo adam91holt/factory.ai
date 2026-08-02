@@ -142,3 +142,49 @@ describe("fetchQueue — server-side hold-label exclusion", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Lane filter (fix-list ①, the FAC-55 escape root-caused 2026-08-02): Blocked
+// and Needs Human are unstarted-TYPE states, so the by-type server filter
+// hands them back in the queue page — only the [factory:queue] lane may ever
+// be claimable, whatever labels a ticket carries.
+// ---------------------------------------------------------------------------
+
+import { isQueueLane } from "../src/linear.ts";
+
+describe("isQueueLane — tag-anchored, name fallback", () => {
+  test("tags are authoritative in both directions", () => {
+    expect(isQueueLane("Anything", "[factory:queue]")).toBe(true);
+    expect(isQueueLane("Todo", "[factory:blocked]")).toBe(false);
+    expect(isQueueLane("Todo", "[factory:needs_human]")).toBe(false);
+  });
+  test("untagged fallback: unstarted is claimable EXCEPT blocked/needs-human names", () => {
+    expect(isQueueLane("Todo", "")).toBe(true);
+    expect(isQueueLane("Todo", null)).toBe(true);
+    expect(isQueueLane("Blocked", "")).toBe(false);
+    expect(isQueueLane("Needs Human", "")).toBe(false);
+    expect(isQueueLane("needs-human", undefined)).toBe(false);
+  });
+});
+
+describe("fetchQueue — only the queue LANE is claimable (FAC-55 escape)", () => {
+  test("a label-free ticket in a tagged Blocked state is snapshotted but never eligible", async () => {
+    const blocked = { ...node("FAC-55"), state: { name: "Blocked", type: "unstarted", description: "[factory:blocked]" } };
+    const needsHuman = { ...node("FAC-56"), state: { name: "Needs Human", type: "unstarted", description: "[factory:needs_human]" } };
+    const { deps } = queueDeps([node("FAC-1"), blocked, needsHuman], []);
+    const snapshots: unknown[] = [];
+    const unsub = bus.subscribe((e) => { if (e.type === "queue_snapshot") snapshots.push(e); });
+    const eligible = await fetchQueue(deps);
+    unsub();
+    expect(eligible.map((i) => i.identifier)).toEqual(["FAC-1"]);
+    // The dashboard still sees all three — visibility is not claimability.
+    const snap = snapshots[0] as { issues: Array<{ identifier: string }> };
+    expect(snap.issues.map((i) => i.identifier).sort()).toEqual(["FAC-1", "FAC-55", "FAC-56"]);
+  });
+  test("an untagged board still excludes hold lanes by name", async () => {
+    const blocked = { ...node("FAC-57"), state: { name: "Blocked", type: "unstarted", description: "" } };
+    const { deps } = queueDeps([node("FAC-2", { stateDesc: "" }), blocked], []);
+    const eligible = await fetchQueue(deps);
+    expect(eligible.map((i) => i.identifier)).toEqual(["FAC-2"]);
+  });
+});
