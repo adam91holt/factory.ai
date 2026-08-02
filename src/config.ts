@@ -268,6 +268,18 @@ export const config = {
   // to needs_human via decideMerge/the holdReasons folds. Never derived from ticket
   // text (untrusted description can only WITHHOLD via merge:review, never grant).
   autoMergeDefault: (process.env.AUTO_MERGE_DEFAULT ?? "0") === "1",
+  // AUTO_MERGE_ALL=1 — the operator's blanket override (default OFF, ADR-0001:
+  // the factory never merges by default). Stronger than AUTO_MERGE_DEFAULT in
+  // exactly two ways: (1) it forces the "auto" tier for EVERY non-self repo,
+  // INCLUDING ladder-enrolled ones (enrollment normally wins over the default
+  // flag and would hold a repo at shadow while it earns); (2) decideMerge
+  // accepts gate strength "real" (unit tests ran) instead of demanding
+  // "strong" (unit + e2e), since most repos never get a green light otherwise.
+  // Everything else still holds: gates must be GREEN, guarded paths / taste
+  // fails / test-deletion still fold to needs-human, security or browser fail
+  // still blocks, self-repo stays human-merge, and an epic's merge:review
+  // withhold is still honoured. Never derivable from ticket text.
+  autoMergeAll: (process.env.AUTO_MERGE_ALL ?? "0") === "1",
   // Repos where the factory may merge its own green, unguarded PRs. RETAINED but
   // re-interpreted (Gap 2): a repo here is enrolled with ceiling "auto" and STILL
   // starts at shadow — it must earn auto-merge through the ladder, not flip on.

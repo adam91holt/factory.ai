@@ -11,6 +11,7 @@ import { roleTools } from "./routing.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
+import { projectOwningRepo } from "./db.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
 // tickets route here instead of the implementer pipeline.
@@ -215,6 +216,20 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     // lastParkReasonForIssue reads, so this reason reaches steward closeout
     // (FAC-14 lesson) instead of surfacing as "(no reason recorded)".
     await markNeedsHuman(issue, `epic has no parseable "## Repo" section; the planner needs a repo to research.`);
+    return;
+  }
+  // Same PG-driven project-registry membership gate as processIssue: an epic on
+  // an unregistered repo must stop HERE, before the planner decomposes it into
+  // children that would each hit the gate anyway (one needs-human instead of N).
+  // "unavailable" defers rather than labels — a DB blip must not needs-human an
+  // entire epic queue.
+  const ownership = await projectOwningRepo(repo);
+  if (ownership.status === "unavailable") {
+    console.error(`[${issue.identifier}] project registry unavailable — deferring epic planning until the store is back`);
+    return;
+  }
+  if (ownership.status === "unregistered") {
+    await markNeedsHuman(issue, `repo \`${repo}\` is not registered to any active project — register it (dashboard POST /projects/create) before the factory will plan work on it`, repo);
     return;
   }
   bus.emit({ type: "run_started", issueKey: issue.identifier, title: `[plan] ${issue.title}`, repo, dryRun: config.dryRun });

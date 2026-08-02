@@ -20,6 +20,7 @@ import { GATE_OUTPUT_SCHEMA, resolveGateOutput, renderFindings, type GateOutput,
 import { buildReport, type ReportInput, type RoutingEntry, type GateVerdictEntry } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./events.ts";
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
+import { projectOwningRepo } from "./db.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
 // budget threaded cumulatively (C11), deadline before every stage + abort (C12),
@@ -462,6 +463,25 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
   const repo = repoFromTicket(issue.description);
   if (!repo) {
     await markNeedsHuman(issue, `could not parse a single org/name from the "## Repo" section — never guessing (ROUTE failure contract)`);
+    return;
+  }
+
+  // Project-registry membership gate (PG-driven): the factory only works repos
+  // an ACTIVE projects row owns (project_repos, via projectOwningRepo). Fail
+  // closed — an unregistered repo (including the zero-rows case) goes to
+  // needs-human until a human registers it (POST /projects/create), so every
+  // repo being worked is visible in the projects registry BEFORE any work
+  // happens. Ticket text has no path to the registry's writers, so a ticket
+  // alone can never point the factory at a new repo. An outage is NOT
+  // non-membership: on "unavailable" we defer (no claim, ticket stays queued)
+  // instead of mislabeling the whole queue needs-human during a DB blip.
+  const ownership = await projectOwningRepo(repo);
+  if (ownership.status === "unavailable") {
+    console.error(`[${issue.identifier}] project registry unavailable — deferring (not claiming) until the store is back`);
+    return;
+  }
+  if (ownership.status === "unregistered") {
+    await markNeedsHuman(issue, `repo \`${repo}\` is not registered to any active project — register it (dashboard POST /projects/create) before the factory will work on it`, repo);
     return;
   }
 
@@ -1163,9 +1183,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // IGNORED here (only the operator flag can grant; withhold-only invariant).
     const metaMerge = parseFactoryMeta(issue.description).merge;
     const humanReview = metaMerge === "review" || metaMerge === "shadow";
-    const tier = effectiveMergeTier(repo, await getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview });
+    const tier = effectiveMergeTier(repo, await getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview, overrideAll: config.autoMergeAll });
     const ev = buildMergeEvidence({ summary, guarded, needsHuman, security: securityVerdict, browser, diffLines });
-    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff });
+    // AUTO_MERGE_ALL also lowers the evidence floor to "real" (unit tests, no
+    // e2e requirement) — see config.ts. Every other decideMerge condition holds.
+    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(config.autoMergeAll ? { minStrength: "real" as const } : {}) });
     // Gap-1 interaction: a child that declares dependencies must NOT auto-merge
     // out of order — the steward owns epic merge ordering. Standalone tickets only.
     const hasDeps = (parseFactoryMeta(issue.description).depends_on ?? []).length > 0;

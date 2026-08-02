@@ -4,7 +4,7 @@ import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
 import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
 import {
-  projectsView, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
+  projectsView, createProject, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
   proposeProjectPolicy, approvePolicyItem, rejectPolicyItem,
 } from "./project-config.ts";
 import {
@@ -417,6 +417,7 @@ export function handleProjectRoutes(url: URL, req: IncomingMessage, res: ServerR
   }
 
   const writes: Record<string, (body: unknown) => Promise<{ status: number; json: unknown }>> = {
+    "/projects/create": createProject,
     "/projects/save": saveProjectDescriptive,
     "/projects/model": setProjectModel,
     "/projects/groundskeeper": setProjectGroundskeeper,

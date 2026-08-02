@@ -181,7 +181,7 @@ async function repoLadder(repos: string[]): Promise<ProjectView["ladder"]> {
     const earned = await getLadderState(repo);
     return {
       repo,
-      tier: effectiveMergeTier(repo, earned, { autoDefault: config.autoMergeDefault }),
+      tier: effectiveMergeTier(repo, earned, { autoDefault: config.autoMergeDefault, overrideAll: config.autoMergeAll }),
       cleanStreak: earned?.cleanStreak ?? 0,
     };
   }));
@@ -264,6 +264,31 @@ async function resolveProject(nameRaw: unknown): Promise<{ row: ProjectRow } | {
     row = await getProjectRowByName(name);
   }
   return row ? { row } : { error: bad(503, "project store unavailable") };
+}
+
+/** POST /projects/create — register a NEW project (name, team, repos) in
+ *  Postgres, the authoritative registry the loop.ts/plan.ts work gate reads
+ *  (projectOwningRepo): a repo not registered here is never worked. Duplicate
+ *  names 409 (edits go through /projects/save and the policy lane), repo slugs
+ *  are charset-locked to org/name, and every write lands with an audit row.
+ *  deploy/smoke deliberately have NO place in this body — shell-reaching
+ *  strings must never enter through a dashboard POST (registry.ts safety
+ *  envelope d). */
+export async function createProject(body: unknown): Promise<HandlerResult> {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const name = typeof b.name === "string" ? b.name.trim() : "";
+  if (!NAME_RE.test(name)) return bad(400, "name must be 1-64 chars of [A-Za-z0-9_-], starting alphanumeric");
+  const team = typeof b.team === "string" ? b.team.trim() : "";
+  if (team === "" || team.length > 200) return bad(400, "team must be a non-empty string ≤ 200 chars");
+  if (!Array.isArray(b.repos) || b.repos.length === 0) return bad(400, "repos must be a non-empty array of org/name slugs");
+  const repos = [...new Set(b.repos.map((r) => (typeof r === "string" ? r.trim() : "")))];
+  const invalid = repos.filter((r) => !REPO_RE.test(r));
+  if (invalid.length > 0) return bad(400, `invalid repo slug(s): ${invalid.map((r) => JSON.stringify(r)).join(", ")} (want org/name)`);
+  if (await getProjectRowByName(name)) return bad(409, `project ${JSON.stringify(name)} already exists — edit it via /projects/save`);
+  const id = await ensureProjectRow(name, team, DASHBOARD_ACTOR);
+  if (id === null) return bad(503, "project store unavailable");
+  await replaceProjectRepos(id, repos, DASHBOARD_ACTOR);
+  return { status: 200, json: { ok: true, name, id, repos } };
 }
 
 /** POST /projects/save — DESCRIPTIVE fields only, effective immediately.

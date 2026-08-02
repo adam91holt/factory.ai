@@ -70,18 +70,23 @@ export function buildMergeEvidence(x: {
 }
 
 /** Pure merge decision from evidence alone. NOTE the signature: no ticket / no
- * description parameter — untrusted text physically cannot reach this policy. */
-export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskMaxDiff: number }): MergeDecision {
+ * description parameter — untrusted text physically cannot reach this policy.
+ * `minStrength` (default "strong") is the evidence floor: the AUTO_MERGE_ALL
+ * override passes "real" so repos without an e2e gate can still merge on green
+ * unit tests — every OTHER safety condition below is non-negotiable either way. */
+export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskMaxDiff: number; minStrength?: "real" | "strong" }): MergeDecision {
+  const minStrength = opts.minStrength ?? "strong";
+  const strengthOk = ev.strength === "strong" || (minStrength === "real" && ev.strength === "real");
   const reasons: string[] = [];
   if (!ev.green) reasons.push("gates not green");
-  if (ev.strength !== "strong") reasons.push(`gate strength ${ev.strength} (need strong)`);
+  if (!strengthOk) reasons.push(`gate strength ${ev.strength} (need ${minStrength})`);
   if (ev.guarded) reasons.push("guarded paths touched");
   if (ev.needsHuman) reasons.push("needs human (taste/tester/test-deletion)");
   if (ev.security === "fail") reasons.push("security review failed");
   if (ev.browser === "fail") reasons.push("browser evidence failed");
   if (ev.browser === "missing") reasons.push("required browser evidence missing");
 
-  const wouldMerge = ev.green && !ev.guarded && !ev.needsHuman && ev.strength === "strong"
+  const wouldMerge = ev.green && !ev.guarded && !ev.needsHuman && strengthOk
     && ev.security !== "fail" && ev.browser !== "fail" && ev.browser !== "missing";
 
   let act = false;
@@ -138,16 +143,18 @@ function ceilingFor(repo: string): MergeTier {
   return config.autoMergeRepos.includes(repo) ? "auto" : "auto-low-risk";
 }
 
-/** Resolve the tier actually in force: hard rules > DB-earned > config ceiling.
- * self-repo and un-enrolled repos are human-merge; otherwise the earned tier
- * (defaulting to shadow before any row exists) capped by the ceiling. */
+/** Resolve the tier actually in force: hard rules > operator override >
+ * DB-earned > config ceiling. self-repo and un-enrolled repos are human-merge;
+ * otherwise the earned tier (defaulting to shadow before any row exists)
+ * capped by the ceiling. */
 export function effectiveMergeTier(
   repo: string,
   earned: LadderState | null,
-  opts?: { autoDefault?: boolean; humanReview?: boolean },
+  opts?: { autoDefault?: boolean; humanReview?: boolean; overrideAll?: boolean },
 ): MergeTier {
   if (isSelfRepo(repo)) return "human";              // self-repo ALWAYS human (backstop, cannot be overridden)
   if (opts?.humanReview) return "human";             // epic opted INTO human review (merge:review — withhold-only)
+  if (opts?.overrideAll) return "auto";              // AUTO_MERGE_ALL: blanket operator override — beats enrollment/earned/ceiling (but never the two hard rules above)
   if (isEnrolled(repo)) return minTier(earned?.tier ?? "shadow", ceilingFor(repo)); // explicit ladder enrollment wins
   if (opts?.autoDefault) return "auto";              // auto-merge-by-default (operator AUTO_MERGE_DEFAULT flag)
   return "human";                                    // default: human-merge (unchanged when the flag is off)

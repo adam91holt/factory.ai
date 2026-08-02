@@ -203,11 +203,11 @@ const DDL: string[] = [
     status TEXT NOT NULL DEFAULT 'active',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL)`,
-  // ONE-WAY projection reconciled FROM projects/<name>.md cards (registry.ts
-  // loadProjects) by replaceProjectRepos — a DB edit can never WIDEN the repo
-  // set the factory acts on, because effective repos are always intersected
-  // with the card's list (registry.ts applyPolicyOverlay) and the projection is
-  // overwritten from cards on every sync.
+  // AUTHORITATIVE repo→project membership (PG-driven, no card files): the
+  // loop.ts/plan.ts work gate reads this via projectOwningRepo — a repo with no
+  // row here is never worked (fail closed). Rows are written only through
+  // replaceProjectRepos / the /projects/create route (audited); ticket text has
+  // no path to any writer of this table.
   `CREATE TABLE IF NOT EXISTS project_repos (
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     repo TEXT NOT NULL,
@@ -1958,6 +1958,29 @@ export async function listProjectRepos(projectId: number): Promise<string[]> {
   const rows = await store.query<{ repo: string }>(
     "SELECT repo FROM project_repos WHERE project_id = $1 ORDER BY repo", [projectId]);
   return rows.map((r) => r.repo);
+}
+
+/** Project-registry membership gate reader (loop.ts / plan.ts): which ACTIVE
+ *  project owns `repo`? Tri-state on purpose — "unavailable" (store closed or
+ *  query failed) must be distinguishable from "unregistered", because the gate
+ *  defers on an outage but needs-humans a genuinely unregistered repo; folding
+ *  the two together would mislabel every queued ticket during a DB blip. */
+export type ProjectOwnership =
+  | { status: "registered"; project: string }
+  | { status: "unregistered" }
+  | { status: "unavailable" };
+
+export async function projectOwningRepo(repo: string): Promise<ProjectOwnership> {
+  if (!store) return { status: "unavailable" };
+  try {
+    const rows = await store.query<{ name: string }>(
+      "SELECT p.name FROM project_repos pr JOIN projects p ON p.id = pr.project_id WHERE pr.repo = $1 AND p.status = 'active' ORDER BY p.name LIMIT 1",
+      [repo]);
+    return rows[0] ? { status: "registered", project: rows[0].name } : { status: "unregistered" };
+  } catch (error) {
+    console.error(`[db] projectOwningRepo(${repo}) failed — treating registry as unavailable: ${error instanceof Error ? error.message : error}`);
+    return { status: "unavailable" };
+  }
 }
 
 /** Set (or update) one role's model config — descriptive tier: immediate +
