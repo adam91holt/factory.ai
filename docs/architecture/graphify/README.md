@@ -40,10 +40,10 @@ The Mermaid map is the readable operator view. The generated graph below is the 
 
 ## Current snapshot
 
-- Source commit: `72719718`
+- Source commit: `db6dafa4`
 - Nodes: **1,405**
 - Edges: **3,785**
-- Communities: **62**
+- Communities: **61**
 - Edge provenance: **98% extracted**, **2% inferred**, **0% ambiguous**
 - Import cycles: **none detected**
 - Estimated query reduction: **5.5× fewer tokens** than naive corpus reading
