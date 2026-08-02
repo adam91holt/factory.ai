@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { childrenAllTerminal } from "../src/steward.ts";
+import { childrenAllTerminal, stewardEligible } from "../src/steward.ts";
 import { liftPreconditions, parsePreconditions } from "../src/precondition.ts";
 import { withFactoryMeta } from "../src/meta.ts";
 
@@ -97,5 +97,28 @@ describe("steward follow-up precondition stamping", () => {
     // will re-check when the follow-up is later picked up.
     expect(parsePreconditions(stamped).map((p) => p.arg)).toEqual(["acme/w#4"]);
     expect(stamped.startsWith("<!-- factory\n")).toBe(true);
+  });
+});
+
+describe("stewardEligible — canceled epics are never closed out (live bug 2026-08-02)", () => {
+  const base = { labels: [] as string[], stateType: "started" };
+
+  test("an open Factory-Planned epic is eligible", () => {
+    expect(stewardEligible(base)).toBe(true);
+  });
+
+  test("already-stewarded epics are skipped (pre-existing behaviour)", () => {
+    expect(stewardEligible({ ...base, labels: ["Factory-Stewarded"] })).toBe(false);
+  });
+
+  test("THE PIN: a canceled epic is skipped — no closeout, no follow-up tickets", () => {
+    // The live repro: FAC-42 was Canceled by the owner, kept Factory-Planned,
+    // its children were all terminal (canceled counts), and the steward filed
+    // resurrection tickets against it. Cancellation must end the epic's story.
+    expect(stewardEligible({ ...base, stateType: "canceled" })).toBe(false);
+  });
+
+  test("completed epics remain eligible — closeout of finished work is the steward's job", () => {
+    expect(stewardEligible({ ...base, stateType: "completed" })).toBe(true);
   });
 });

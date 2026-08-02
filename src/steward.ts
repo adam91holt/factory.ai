@@ -217,10 +217,27 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
 }
 
 /** Called each tick: steward at most one completed epic. */
+/** Pure closeout-eligibility gate for one Factory-Planned epic. Exported for
+ *  tests (decision logic stays pure and I/O-free — CLAUDE.md).
+ *
+ *  A CANCELED epic is a human saying "don't": it keeps its Factory-Planned
+ *  label, and childrenAllTerminal counts canceled children as terminal, so
+ *  without this gate the steward "closes out" killed work — observed live
+ *  2026-08-02: canceled FAC-42 got stewarded and spawned follow-up tickets
+ *  (one literally titled "Rebuild missing FAC-42 scope") that resurrected
+ *  scope the owner had explicitly canceled, then competed with real work in
+ *  the queue. Cancellation is a terminal HUMAN decision, not a closeout
+ *  trigger — skip entirely: no steward run, no follow-ups, no comment. */
+export function stewardEligible(epic: { labels: readonly string[]; stateType: string }): boolean {
+  if (epic.labels.includes(linear.STEWARDED_LABEL)) return false;
+  if (epic.stateType === "canceled") return false;
+  return true;
+}
+
 export async function stewardTick(): Promise<void> {
   const planned = await linear.fetchByLabel(linear.PLANNED_LABEL);
   for (const epic of planned) {
-    if (epic.labels.includes(linear.STEWARDED_LABEL)) continue;
+    if (!stewardEligible(epic)) continue;
     const detail = await linear.getIssueDetail(epic.identifier);
     if (childrenAllTerminal(detail)) { await stewardEpic(epic); return; }
   }
