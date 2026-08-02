@@ -19,6 +19,7 @@
     "factory:dry": "bun src/index.ts --once --dry-run",
     "factory:server": "bun src/index.ts --server-only",
     "board:setup": "bun scripts/board-setup.ts",
+    "graphify:refresh": "bash scripts/refresh-graphify.sh",
     "ui:dev": "bun run --cwd ui dev",
     "ui:build": "bun run --cwd ui build"
   },
