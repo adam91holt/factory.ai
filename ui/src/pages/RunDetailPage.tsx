@@ -147,7 +147,9 @@ export function RunDetailPage({ issueKey }: { issueKey: string }) {
       </div>
 
       {/* body */}
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,7fr)_minmax(0,5fr)] gap-3 overflow-y-auto">
+      {/* Mobile/tablet: single column — the 7/5 split at 390px gave each column
+    ~180px and wrapped model names letter-by-letter (live review 2026-08-02). */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
         <div className="flex min-h-0 flex-col gap-3">
           <Card>
             <CardHeader className="pb-2">
