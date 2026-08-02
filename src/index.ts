@@ -18,7 +18,8 @@ import { selectRunnable, deriveImplicitDeps, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
-import { startEventStore, flushEvents } from "./db.ts";
+import { startEventStore, flushEvents, listAgentRegisterRows, listSkillRegisterRows } from "./db.ts";
+import { importRegistersFromFiles } from "./register-io.ts";
 import { isDraining } from "./control.ts";
 import { startAlerts } from "./alerts.ts";
 import { startSpendCap } from "./spend-cap.ts";
@@ -228,6 +229,29 @@ async function tick(): Promise<boolean> {
   return batch.length > 0 || inFlight.size > 0;
 }
 
+/** First-boot register seeding (fix-list ④, 2026-08-02). Imports the checked-
+ *  in agents/ + skills/ card files into the registers IFF both registers are
+ *  completely empty — the daemon process doing the import is what makes the
+ *  in-memory snapshot correct immediately (every write path refreshes it), so
+ *  the very first stage pins `name@1` instead of the `@0` file fallback.
+ *  Never overwrites: any existing row means an operator (or a previous boot)
+ *  already owns the register state. Failure is non-fatal by design — the file
+ *  fallback keeps every stage runnable, so a seeding error must not stop the
+ *  daemon; it is logged and the pins stay honest (@0). */
+async function seedRegistersIfEmpty(): Promise<void> {
+  try {
+    const [agents, skills] = await Promise.all([listAgentRegisterRows(), listSkillRegisterRows()]);
+    if (agents.length > 0 || skills.length > 0) return;
+    const report = await importRegistersFromFiles({ createdBy: "daemon-boot" });
+    const saved = (rs: Array<{ ok: boolean }>) => rs.filter((r) => r.ok).length;
+    const failed = [...report.agents, ...report.skills].filter((r) => !r.ok);
+    console.log(`[registers] first boot: seeded ${saved(report.agents)} agent card(s), ${saved(report.skills)} skill(s) from files`);
+    for (const f of failed) console.error(`[registers] seed skipped ${f.name}: ${(f as { error?: string }).error ?? "?"}`);
+  } catch (error) {
+    console.error(`[registers] boot seeding failed (file fallback stays in effect): ${error instanceof Error ? error.message : error}`);
+  }
+}
+
 async function main(): Promise<void> {
   if (config.serverOnly) {
     // Dashboard-only mode: serve mission control, never touch Linear. No
@@ -252,6 +276,16 @@ async function main(): Promise<void> {
   // but steward closeout (childStatusBlock → lastParkReasonForIssue) and
   // groundskeeper governance both read from this store on every tick.
   await startEventStore();
+  // Seed the agent/skill registers from the checked-in card files when they
+  // are EMPTY (first boot on a fresh store) — otherwise every stage of the
+  // first runs pins `@0` (file fallback) and a dashboard rollback has nothing
+  // to roll to. Live-found 2026-08-02: seeding via an external importer
+  // process left THIS process's snapshot stale, so pins stayed @0 until a
+  // register write happened to pass through the daemon. Non-empty registers
+  // are left alone: the register, not the files, is authoritative after that
+  // (deliberate edits must not be silently overwritten at boot), and the
+  // importer stays reachable for an operator refresh via register-io.ts.
+  await seedRegistersIfEmpty();
   // Self-heal orphaned claims from a prior process (restart mid-run) before we
   // start ticking, so in-flight tickets resume instead of stranding In-Progress.
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);

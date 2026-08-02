@@ -1,6 +1,6 @@
 import { config } from "./config.ts";
 import { bus, type FactoryEvent } from "./events.ts";
-import { bunStore, pgliteStore, type Store } from "./store.ts";
+import { bunStore, pgliteStore, jsonbValue, jsonbObject, type Store } from "./store.ts";
 import { advanceLadder, seedLadderState, ceilingForRepo, isEnrolled, type LadderState, type MergeDecision, type MergeEvidence } from "./merge-ladder.ts";
 
 // Durable event store (owner request 2026-07-20): every FactoryEvent — already
@@ -54,11 +54,18 @@ let opening: Promise<void> | null = null;
  *    Telemetry.generatedAt / dayKey() / the watermark cache key are all epoch-ms
  *    numbers. timestamptz would come back as a Date and disagree with the `at`
  *    inside the stored JSON body. Nothing does date arithmetic in SQL.
- *  - JSON columns stay TEXT, NOT jsonb: jsonb normalises key order and drops
- *    duplicate keys, so it does not round-trip the exact emitted bytes of a
- *    forensic log; every consumer already JSON.parses in JS; and the two drivers
- *    disagree on jsonb (string vs parsed object) — exactly the divergence this
- *    whole design exists to eliminate.
+ *  - JSON columns are native jsonb (issue #11, owner decision 2026-08-02 —
+ *    superseding WP1's TEXT choice): queryable with ->/->>/@> and GIN-indexable.
+ *    WP1's two reasons died: key-order fidelity was never load-bearing (every
+ *    payload is our own JSON.stringify — no meaningful order, no duplicate
+ *    keys), and the driver divergence (Bun: string, PGlite: parsed object) is
+ *    now normalised ONCE — every jsonb column is projected `::text` and parsed
+ *    through store.ts's jsonbValue/jsonbObject, pinned by the parity suites on
+ *    both drivers. Writes bind `::text::jsonb` ONLY (never bare `::jsonb` —
+ *    the Bun driver would jsonb-encode the pre-stringified param into a string
+ *    scalar; live-found 2026-08-02). Legacy TEXT stores are migrated in place
+ *    by the idempotent DO blocks below (unparseable rows quarantined, never a
+ *    crashed migrate).
  *  - cost_usd is DOUBLE PRECISION, not REAL: PG REAL is float4 and loses cents
  *    across summed spend.
  *  - SQLite's INTEGER-as-boolean columns are real BOOLEANs now (verified to come
@@ -70,10 +77,32 @@ const DDL: string[] = [
     PRIMARY KEY (issue_key, stage))`,
   `CREATE TABLE IF NOT EXISTS events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    seq BIGINT, at BIGINT, type TEXT, issue_key TEXT, json TEXT)`,
+    seq BIGINT, at BIGINT, type TEXT, issue_key TEXT, json JSONB)`,
   "CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_key, id)",
   // Telemetry aggregation scans by event type (run_stage_finished / run_finished).
   "CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, id)",
+  // Issue #11: full-fidelity per-stage transcript — one row per SDK message
+  // (assistant text, tool_use with FULL input, tool_result, system/init,
+  // reasoning, result), captured at agents.ts's runOneAttempt choke point and
+  // redacted at write. COMPLEMENTS the summary `events` stream (which stays
+  // forever); these rows are bounded (body cap, per-stage row cap) and swept by
+  // sweepStageTranscripts after TRANSCRIPT_RETENTION_DAYS. `body` is native
+  // jsonb per the issue's owner mandate (queryable with ->/->>/@>, GIN-indexed)
+  // — bound `::text::jsonb` ONLY (see writeTranscriptBatch): a bare `::jsonb`
+  // cast makes the real Bun driver jsonb-encode the pre-stringified param into
+  // a jsonb STRING SCALAR (live-found 2026-08-02; pinned in
+  // tests/store-parity-suite.ts).
+  `CREATE TABLE IF NOT EXISTS stage_transcript (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    at BIGINT NOT NULL,
+    issue_key TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    session_id TEXT,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    body JSONB NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS idx_stage_transcript_issue ON stage_transcript(issue_key, stage, id)",
+  "CREATE INDEX IF NOT EXISTS idx_stage_transcript_body ON stage_transcript USING GIN (body)",
   // Durable, repo-scoped lessons distilled from failures (park / needs-human /
   // taste-fail) — the self-improvement flywheel's memory (level-4-roadmap.md,
   // principle 7). All reads/writes go through the row helpers here, and ONLY
@@ -93,7 +122,7 @@ const DDL: string[] = [
     repo TEXT PRIMARY KEY, tier TEXT, clean_streak INTEGER, total_shadow INTEGER, updated_at BIGINT)`,
   `CREATE TABLE IF NOT EXISTS merge_shadow_log (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, at BIGINT, repo TEXT, issue_key TEXT,
-    would_merge BOOLEAN, acted BOOLEAN, tier TEXT, reasons TEXT, evidence_json TEXT)`,
+    would_merge BOOLEAN, acted BOOLEAN, tier TEXT, reasons TEXT, evidence_json JSONB)`,
   // Gap-5 post-merge deploy ledger: EXACTLY-ONCE idempotency for deploy/smoke/
   // revert. A (repo, sha) pair is recorded the moment a deploy is attempted so a
   // second tick (or a reconcile racing postMergeTick) never re-deploys the same
@@ -120,7 +149,7 @@ const DDL: string[] = [
     repo TEXT NOT NULL, pr_url TEXT NOT NULL,
     gated_head_sha TEXT,
     hold_reasons TEXT NOT NULL DEFAULT '',
-    gate_summary_json TEXT,
+    gate_summary_json JSONB,
     security_verdict TEXT NOT NULL DEFAULT 'none',
     taste_verdict TEXT NOT NULL DEFAULT 'not-required',
     findings_digest TEXT NOT NULL DEFAULT '',
@@ -275,6 +304,123 @@ const DDL: string[] = [
     created_by TEXT NOT NULL DEFAULT 'operator',
     UNIQUE (name, version))`,
   "CREATE UNIQUE INDEX IF NOT EXISTS skill_register_active ON skill_register(name) WHERE enabled",
+  // One-time data repair (2026-08-02): the Bun driver infers a bound param's
+  // type from a bare `::jsonb` cast and jsonb-encodes the pre-stringified
+  // JSON, storing a jsonb STRING SCALAR ('"{...}"') instead of an object —
+  // which the read path degrades to {} (empty frontmatter/attach). PGlite
+  // treats the same bind as text, so tests never saw it. The insert sites now
+  // bind `::text::jsonb`; these unwrap any rows written before the fix.
+  // Idempotent: the WHERE clause matches only the damaged shape.
+  `UPDATE agent_register SET frontmatter = (frontmatter #>> '{}')::jsonb
+     WHERE jsonb_typeof(frontmatter) = 'string' AND left(frontmatter #>> '{}', 1) = '{'`,
+  `UPDATE skill_register SET attach = (attach #>> '{}')::jsonb
+     WHERE jsonb_typeof(attach) = 'string' AND left(attach #>> '{}', 1) = '{'`,
+  // ---------------------------------------------------------------------------
+  // Issue #11 (jsonb half): migrate the three WP1-era TEXT-holding-JSON columns
+  // — events.json, merge_shadow_log.evidence_json, approvals.gate_summary_json
+  // — to native jsonb IN PLACE. Idempotent: each DO block fires only while
+  // information_schema still reports the column as text, so a migrated (or
+  // freshly created) store skips it in one catalog probe. Tolerant: the fast
+  // path is a single ALTER; if ANY legacy row fails the jsonb parse the block
+  // falls back to a row scan that QUARANTINES each unparseable row (raw text
+  // preserved in jsonb_migration_quarantine, source column nulled, WARNING
+  // raised) and then re-runs the ALTER — a bad row can never crash migrate()
+  // and is never silently destroyed. Pinned on both drivers in
+  // tests/store-parity-suite.ts and end-to-end in tests/jsonb-migration.test.ts.
+  // ---------------------------------------------------------------------------
+  `CREATE TABLE IF NOT EXISTS jsonb_migration_quarantine (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    src_table TEXT NOT NULL, src_id BIGINT NOT NULL, raw TEXT, at BIGINT NOT NULL)`,
+  `DO $mig$
+   DECLARE bad RECORD;
+   BEGIN
+     IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'events'
+                  AND column_name = 'json' AND data_type = 'text') THEN
+       BEGIN
+         ALTER TABLE events ALTER COLUMN json TYPE jsonb USING json::jsonb;
+       EXCEPTION WHEN OTHERS THEN
+         FOR bad IN SELECT id::bigint AS id, json::text AS json FROM events WHERE json IS NOT NULL LOOP
+           BEGIN
+             PERFORM bad.json::jsonb;
+           EXCEPTION WHEN OTHERS THEN
+             INSERT INTO jsonb_migration_quarantine (src_table, src_id, raw, at)
+             VALUES ('events', bad.id, bad.json, (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT);
+             UPDATE events SET json = NULL WHERE id = bad.id;
+             RAISE WARNING 'events.json -> jsonb: quarantined unparseable row id=%', bad.id;
+           END;
+         END LOOP;
+         ALTER TABLE events ALTER COLUMN json TYPE jsonb USING json::jsonb;
+       END;
+     END IF;
+   END $mig$`,
+  `DO $mig$
+   DECLARE bad RECORD;
+   BEGIN
+     IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'merge_shadow_log'
+                  AND column_name = 'evidence_json' AND data_type = 'text') THEN
+       BEGIN
+         ALTER TABLE merge_shadow_log ALTER COLUMN evidence_json TYPE jsonb USING evidence_json::jsonb;
+       EXCEPTION WHEN OTHERS THEN
+         FOR bad IN SELECT id::bigint AS id, evidence_json::text AS raw FROM merge_shadow_log WHERE evidence_json IS NOT NULL LOOP
+           BEGIN
+             PERFORM bad.raw::jsonb;
+           EXCEPTION WHEN OTHERS THEN
+             INSERT INTO jsonb_migration_quarantine (src_table, src_id, raw, at)
+             VALUES ('merge_shadow_log', bad.id, bad.raw, (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT);
+             UPDATE merge_shadow_log SET evidence_json = NULL WHERE id = bad.id;
+             RAISE WARNING 'merge_shadow_log.evidence_json -> jsonb: quarantined unparseable row id=%', bad.id;
+           END;
+         END LOOP;
+         ALTER TABLE merge_shadow_log ALTER COLUMN evidence_json TYPE jsonb USING evidence_json::jsonb;
+       END;
+     END IF;
+   END $mig$`,
+  `DO $mig$
+   DECLARE bad RECORD;
+   BEGIN
+     IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'approvals'
+                  AND column_name = 'gate_summary_json' AND data_type = 'text') THEN
+       BEGIN
+         ALTER TABLE approvals ALTER COLUMN gate_summary_json TYPE jsonb USING gate_summary_json::jsonb;
+       EXCEPTION WHEN OTHERS THEN
+         FOR bad IN SELECT id::bigint AS id, gate_summary_json::text AS raw FROM approvals WHERE gate_summary_json IS NOT NULL LOOP
+           BEGIN
+             PERFORM bad.raw::jsonb;
+           EXCEPTION WHEN OTHERS THEN
+             INSERT INTO jsonb_migration_quarantine (src_table, src_id, raw, at)
+             VALUES ('approvals', bad.id, bad.raw, (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT);
+             UPDATE approvals SET gate_summary_json = NULL WHERE id = bad.id;
+             RAISE WARNING 'approvals.gate_summary_json -> jsonb: quarantined unparseable row id=%', bad.id;
+           END;
+         END LOOP;
+         ALTER TABLE approvals ALTER COLUMN gate_summary_json TYPE jsonb USING gate_summary_json::jsonb;
+       END;
+     END IF;
+   END $mig$`,
+  // GIN on the two QUERY surfaces (issue #11): events.json here,
+  // stage_transcript.body above. The small tables don't need one. Must follow
+  // the events migration — GIN over TEXT would refuse.
+  "CREATE INDEX IF NOT EXISTS idx_events_json ON events USING GIN (json)",
+  // Project linkage read surface (issue #11 / #7): issue → repo → project_repos
+  // → project, derived — not denormalised onto the hot write path. The repo for
+  // an issue is taken from its newest event that carries one (run_started /
+  // merge_decision / deploy events); jsonb is what makes that ->>'repo' lookup
+  // possible in SQL at all. CREATE OR REPLACE keeps it idempotent, and it must
+  // follow both the events jsonb migration and the projects/project_repos DDL.
+  `CREATE OR REPLACE VIEW project_activity AS
+   SELECT p.id::float8 AS project_id, p.name AS project, ir.repo, e.issue_key,
+          e.id::float8 AS event_id, e.at::float8 AS at, e.type
+   FROM events e
+   JOIN (SELECT DISTINCT ON (issue_key) issue_key, json->>'repo' AS repo
+         FROM events
+         WHERE issue_key IS NOT NULL AND json->>'repo' IS NOT NULL
+         ORDER BY issue_key, id DESC) ir ON ir.issue_key = e.issue_key
+   JOIN project_repos pr ON pr.repo = ir.repo
+   JOIN projects p ON p.id = pr.project_id
+   WHERE e.issue_key IS NOT NULL`,
 ];
 
 /** Create the full schema on `s`. Idempotent. */
@@ -325,6 +471,96 @@ let flushGeneration = 0;
 let writeHealthy = true;
 let subscribed: (() => void) | null = null;
 
+// ---------------------------------------------------------------------------
+// Issue #11: stage-transcript write-behind queue. Same single-writer discipline
+// as the event queue — the SAME single-flight drain() serves both FIFOs, so
+// transcript ids follow append order and `await flushEvents()` makes both
+// streams visible to every read path. Deliberately SEPARATE health accounting:
+// a transcript batch failure drops loudly but never flips writeHealthy /
+// flushGeneration — the governance gates (eventStoreOpen) stay keyed to the
+// summary events stream exactly as before this table existed (additive pin).
+// ---------------------------------------------------------------------------
+
+interface PendingTranscript {
+  at: number; issueKey: string; stage: string; sessionId: string | null;
+  seq: number; kind: string; bodyJson: string;
+  /** utf8 size of bodyJson, precomputed so the queue's byte budget can be
+   *  maintained O(1) on enqueue and on batch splice. */
+  bodyBytes: number;
+}
+
+/** Per-message body cap. IN-CODE CONSTANT, not an env knob (CLAUDE.md): an
+ *  audit row that can grow without bound is its own outage. Oversized bodies
+ *  are truncated to a marker object (see boundedTranscriptBody). */
+export const TRANSCRIPT_BODY_CAP_BYTES = 64 * 1024;
+/** The marker an oversized/capped body carries in its `truncated` field. */
+export const TRANSCRIPT_TRUNCATION_MARKER = "[transcript-truncated]";
+/** Per-stage-run row cap: rows with seq beyond this are dropped, and the row AT
+ *  the cap becomes a `kind: "cap"` marker so the truncation is visible in the
+ *  audit trail rather than silent. */
+export const TRANSCRIPT_MAX_ROWS_PER_STAGE = 2000;
+/** Retention window for transcript rows. The summary `events` stream is kept
+ *  forever; only stage_transcript is swept (sweepStageTranscripts). */
+export const TRANSCRIPT_RETENTION_DAYS = 30;
+/** Hard cap on queued-but-unwritten transcript rows. A row count alone is a
+ *  weak OOM guard here (unlike events, each body can be 64KB), so the REAL
+ *  bound is MAX_QUEUED_TRANSCRIPT_BYTES below; this stays as a secondary cap
+ *  on tiny-row floods. Overflow drops loudly. */
+const MAX_QUEUED_TRANSCRIPTS = 10_000;
+/** Byte budget across all queued-but-unwritten transcript bodies. 10k rows ×
+ *  64KB bodies would be ~640MB of heap during a Postgres outage — an OOM, not
+ *  a guard. The stream is best-effort by contract, so past this budget new
+ *  rows drop loudly while the daemon degrades gracefully. IN-CODE CONSTANT,
+ *  not an env knob (CLAUDE.md). Exported for the bound's regression test. */
+export const MAX_QUEUED_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+/** Rows per multi-row transcript INSERT. Smaller than EVENT_BATCH because each
+ *  body may be up to TRANSCRIPT_BODY_CAP_BYTES. */
+const TRANSCRIPT_BATCH = 64;
+
+const transcriptQueue: PendingTranscript[] = [];
+let queuedTranscriptBytes = 0;
+let droppedTranscripts = 0;
+
+// ---------------------------------------------------------------------------
+// jsonb write hygiene. Postgres jsonb REJECTS two escapes that TEXT accepted
+// without a murmur: \u0000 (NUL) and a lone UTF-16 surrogate — and event
+// payloads embed agent/tool text (snippets sliced mid-string, binary tool
+// junk), so both genuinely occur. One poisoned event would fail its whole
+// batch and flip the governance gate closed. The COMMON path is untouched: a
+// cheap regex over the serialized text, and only a hit pays for the deep
+// clean. (agents.ts already strips NUL for transcript bodies at capture.)
+// ---------------------------------------------------------------------------
+
+/** Matches JSON.stringify output only when it carries an escaped NUL or a lone
+ *  surrogate escape (stringify escapes surrogates ONLY when unpaired). */
+const JSONB_UNSTORABLE = /\\u0000|\\u[dD][89a-fA-F]/;
+
+const cleanJsonString = (s: string): string =>
+  s.replaceAll("\u0000", "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+
+function deepCleanForJsonb(v: unknown): unknown {
+  if (typeof v === "string") return cleanJsonString(v);
+  if (Array.isArray(v)) return v.map(deepCleanForJsonb);
+  if (typeof v === "object" && v !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) out[cleanJsonString(k)] = deepCleanForJsonb(val);
+    return out;
+  }
+  return v;
+}
+
+/** Serialize `value` to a string Postgres jsonb will accept. The regex can
+ *  false-positive on text that merely TALKS about such escapes ("\\u0000" in a
+ *  code snippet) — then the deep clean is a no-op and the re-stringify is
+ *  semantically identical, so correctness never depends on the detection being
+ *  exact, only the fast path does. */
+export function jsonbSafeStringify(value: unknown): string {
+  const raw = JSON.stringify(value);
+  if (!JSONB_UNSTORABLE.test(raw)) return raw;
+  return JSON.stringify(deepCleanForJsonb(value));
+}
+
 /** Sync, never throws — the bus subscriber's whole body. */
 function enqueue(e: FactoryEvent): void {
   if (queue.length >= MAX_QUEUED_EVENTS) {
@@ -337,11 +573,14 @@ function enqueue(e: FactoryEvent): void {
   queue.push({
     seq: e.seq, at: e.at, type: e.type,
     issueKey: (e as { issueKey?: string }).issueKey ?? null,
-    json: JSON.stringify(e),
+    json: jsonbSafeStringify(e),
   });
   void drain();
 }
 
+/** Multi-row event INSERT. `json` binds `::text::jsonb` — NEVER a bare
+ *  `::jsonb` (the Bun driver would jsonb-encode the pre-stringified param into
+ *  a jsonb string scalar; see writeTranscriptBatch and the parity suite). */
 async function writeBatch(batch: PendingEvent[]): Promise<void> {
   const s = store;
   if (!s) return;
@@ -349,10 +588,28 @@ async function writeBatch(batch: PendingEvent[]): Promise<void> {
   const tuples: string[] = [];
   for (const row of batch) {
     const base = params.length;
-    tuples.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`);
+    tuples.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::text::jsonb)`);
     params.push(row.seq, row.at, row.type, row.issueKey, row.json);
   }
   await s.exec(`INSERT INTO events (seq, at, type, issue_key, json) VALUES ${tuples.join(", ")}`, params);
+}
+
+/** Multi-row transcript INSERT. `body` binds `::text::jsonb` — NEVER a bare
+ *  `::jsonb`: the real Bun driver infers a bare-jsonb param's type and
+ *  jsonb-encodes the already-stringified JSON into a jsonb string scalar,
+ *  while PGlite parses it as an object — the exact divergence pinned by the
+ *  "::text::jsonb" tests in tests/store-parity-suite.ts (live-found 2026-08-02). */
+async function writeTranscriptBatch(batch: PendingTranscript[]): Promise<void> {
+  const s = store;
+  if (!s) return;
+  const params: unknown[] = [];
+  const tuples: string[] = [];
+  for (const row of batch) {
+    const base = params.length;
+    tuples.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}::text::jsonb)`);
+    params.push(row.at, row.issueKey, row.stage, row.sessionId, row.seq, row.kind, row.bodyJson);
+  }
+  await s.exec(`INSERT INTO stage_transcript (at, issue_key, stage, session_id, seq, kind, body) VALUES ${tuples.join(", ")}`, params);
 }
 
 /** Single-flight FIFO drain. Serial batches ⇒ identity ids follow emit order. */
@@ -360,39 +617,74 @@ function drain(): Promise<void> {
   if (draining) return draining;
   draining = (async () => {
     try {
-      while (queue.length > 0 && store) {
-        const batch = queue.splice(0, EVENT_BATCH);
-        inFlightEvents = batch.length;
-        try {
-          await writeBatch(batch);
-          writeHealthy = true;
-          flushGeneration += 1;
-        } catch (error) {
-          lastWriteError = String(error instanceof Error ? error.message : error);
-          // One retry, then drop LOUDLY. The SQLITE_BUSY catch this replaces
-          // already established best-effort as the contract here, and under
-          // MVCC a write failure is strictly rarer than it was.
+      while ((queue.length > 0 || transcriptQueue.length > 0) && store) {
+        if (queue.length > 0) {
+          const batch = queue.splice(0, EVENT_BATCH);
+          inFlightEvents = batch.length;
           try {
             await writeBatch(batch);
             writeHealthy = true;
             flushGeneration += 1;
-          } catch {
-            droppedEvents += batch.length;
-            // Both attempts failed — the store is unreachable RIGHT NOW, and
-            // rows were lost. Flip the governance gate closed until a later
-            // batch proves recovery (conservative: unhealthy sticks while no
-            // writes flow, and the daemon emits events constantly, so a real
-            // recovery clears it within one drain).
-            writeHealthy = false;
-            console.error(`[db] event batch dropped (${batch.length} rows): ${lastWriteError} — eventStoreOpen() now false until a write lands (governance gates fail closed)`);
+          } catch (error) {
+            lastWriteError = String(error instanceof Error ? error.message : error);
+            // One retry, then drop LOUDLY. The SQLITE_BUSY catch this replaces
+            // already established best-effort as the contract here, and under
+            // MVCC a write failure is strictly rarer than it was.
+            try {
+              await writeBatch(batch);
+              writeHealthy = true;
+              flushGeneration += 1;
+            } catch {
+              droppedEvents += batch.length;
+              // Both attempts failed — the store is unreachable RIGHT NOW, and
+              // rows were lost. Flip the governance gate closed until a later
+              // batch proves recovery (conservative: unhealthy sticks while no
+              // writes flow, and the daemon emits events constantly, so a real
+              // recovery clears it within one drain).
+              writeHealthy = false;
+              console.error(`[db] event batch dropped (${batch.length} rows): ${lastWriteError} — eventStoreOpen() now false until a write lands (governance gates fail closed)`);
+            }
+          } finally {
+            inFlightEvents = 0;
           }
-        } finally {
-          inFlightEvents = 0;
+          continue; // events first — the governance stream keeps priority
+        }
+        const tBatch = transcriptQueue.splice(0, TRANSCRIPT_BATCH);
+        for (const row of tBatch) queuedTranscriptBytes -= row.bodyBytes;
+        try {
+          await writeTranscriptBatch(tBatch);
+        } catch (error) {
+          // Same one-retry contract as events, but WITHOUT touching
+          // writeHealthy/flushGeneration/lastWriteError: the audit transcript
+          // is best-effort and must never move the governance gate (additive).
+          try {
+            await writeTranscriptBatch(tBatch);
+          } catch {
+            // Defense in depth against batch poisoning: a whole-batch failure
+            // can be ONE unstorable row (jsonb rejects things TEXT accepted),
+            // and dropping 64 innocent neighbors for it would punch holes in
+            // the audit trail. Retry per-row so only the genuinely bad row(s)
+            // drop. During a real outage this costs at most TRANSCRIPT_BATCH
+            // extra failed INSERTs per drain pass — still best-effort, still
+            // bounded.
+            let rowDrops = 0;
+            for (const row of tBatch) {
+              try {
+                await writeTranscriptBatch([row]);
+              } catch {
+                rowDrops += 1;
+              }
+            }
+            if (rowDrops > 0) {
+              droppedTranscripts += rowDrops;
+              console.error(`[db] transcript rows dropped (${rowDrops} of ${tBatch.length} in batch): ${String(error instanceof Error ? error.message : error)}`);
+            }
+          }
         }
       }
     } finally {
       draining = null;
-      if (queue.length > 0 && store) void drain();
+      if ((queue.length > 0 || transcriptQueue.length > 0) && store) void drain();
     }
   })();
   return draining;
@@ -402,7 +694,7 @@ function drain(): Promise<void> {
  *  first statement of EVERY read path, which is what makes write-behind
  *  strictly equivalent to the old inline INSERT from a reader's point of view. */
 export async function flushEvents(): Promise<void> {
-  while (queue.length > 0 || draining) {
+  while (queue.length > 0 || transcriptQueue.length > 0 || draining) {
     const inFlight = draining ?? drain();
     await inFlight;
     if (!store) break; // closed store can never drain — don't spin
@@ -469,6 +761,10 @@ export async function startEventStore(): Promise<void> {
     // then refreshed by every register write.
     await refreshRegisterSnapshot();
     if (!subscribed) subscribed = bus.subscribe(enqueue);
+    // Retention enforcement survives daemon restarts and idle stretches: sweep
+    // (watermark-gated) as soon as the store opens; appendStageTranscript
+    // re-checks the watermark continuously while stages run.
+    void maybeSweepStageTranscripts();
   })().catch((error) => {
     opening = null;
     throw error;
@@ -494,9 +790,210 @@ export function eventStoreOpen(): boolean {
 export async function issueEvents(issueKey: string, limit = 2000): Promise<unknown[]> {
   await flushEvents();
   if (!store) return [];
-  const rows = await store.query<{ json: string }>(
-    "SELECT json FROM events WHERE issue_key = $1 ORDER BY id ASC LIMIT $2", [issueKey, limit]);
-  return rows.map((r) => JSON.parse(r.json) as unknown);
+  const rows = await store.query<{ json: unknown }>(
+    "SELECT json::text AS json FROM events WHERE issue_key = $1 ORDER BY id ASC LIMIT $2", [issueKey, limit]);
+  return rows.map((r) => jsonbValue(r.json));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #11: stage-transcript row helpers. The append path is SYNC and
+// never-throws (same contract as the bus subscriber's enqueue) because it is
+// called from agents.ts's hot message loop; bounds are enforced HERE — the raw
+// write path — so a cap that could be bypassed by calling one layer lower is
+// not a cap (CLAUDE.md, same reasoning as registerWriteViolation).
+// ---------------------------------------------------------------------------
+
+/** Shrink an oversized serialized body to a marker object whose OWN serialized
+ *  size fits the cap. The head is re-measured after wrapping (JSON escaping
+ *  inflates it), shrunk proportionally until it fits; a lone trailing high
+ *  surrogate is dropped so the head can never smuggle an unpaired surrogate
+ *  into jsonb (Postgres rejects those). Bounded: at most 8 passes, then the
+ *  degenerate headless marker. */
+function boundedTranscriptBody(bodyJson: string): string {
+  const originalBytes = Buffer.byteLength(bodyJson, "utf8");
+  if (originalBytes <= TRANSCRIPT_BODY_CAP_BYTES) return bodyJson;
+  let keep = TRANSCRIPT_BODY_CAP_BYTES;
+  for (let i = 0; i < 8 && keep > 0; i++) {
+    let head = bodyJson.slice(0, keep);
+    const lastCode = head.charCodeAt(head.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) head = head.slice(0, -1);
+    const wrapped = JSON.stringify({ truncated: TRANSCRIPT_TRUNCATION_MARKER, originalBytes, head });
+    const wrappedBytes = Buffer.byteLength(wrapped, "utf8");
+    if (wrappedBytes <= TRANSCRIPT_BODY_CAP_BYTES) return wrapped;
+    keep = Math.floor((keep * (TRANSCRIPT_BODY_CAP_BYTES - 256)) / wrappedBytes);
+  }
+  return JSON.stringify({ truncated: TRANSCRIPT_TRUNCATION_MARKER, originalBytes });
+}
+
+/** Make an already-serialized body storable as Postgres jsonb — the transcript
+ *  twin of jsonbSafeStringify (events get that guard in enqueue; the transcript
+ *  path takes pre-stringified JSON, so it is re-checked HERE, the raw write
+ *  path). agents.ts strips raw NULs at capture, but a LONE UTF-16 surrogate
+ *  survives that as a `\udXXX` escape in the serialized text — they arise
+ *  organically when a tool result is truncated mid-surrogate-pair (e.g. cut
+ *  mid-emoji) — and jsonb rejects the row, which without this guard poisoned
+ *  its whole INSERT batch. Cheap regex on the common path; only a hit pays for
+ *  parse + deep clean + re-stringify (never larger — cleaning only removes). */
+function jsonbSafeBodyJson(bodyJson: string): string {
+  if (!JSONB_UNSTORABLE.test(bodyJson)) return bodyJson;
+  try {
+    return JSON.stringify(deepCleanForJsonb(JSON.parse(bodyJson)));
+  } catch {
+    // Contract violation (bodyJson was not valid JSON) — store a visible
+    // marker instead of letting an unstorable row reach the batch writer.
+    return JSON.stringify({ truncated: TRANSCRIPT_TRUNCATION_MARKER, reason: "body was not storable as jsonb" });
+  }
+}
+
+/** Append one transcript row through the write-behind queue. Sync, never
+ *  throws, best-effort — a closed store, a missing key, or a full queue is a
+ *  quiet no-op (the pipeline must never fail because auditing did). `bodyJson`
+ *  must be a serialized JSON OBJECT already redacted by the caller (agents.ts
+ *  redacts at write, the same emit-time discipline as events). Bounds applied
+ *  here: body cap (truncate-with-marker), per-stage row cap (the row AT the
+ *  cap becomes a kind:"cap" marker; rows beyond it are dropped), jsonb-safety
+ *  scrub (lone surrogates / NUL escapes can never poison a batch), and the
+ *  queue's row + byte budgets. Also the retention trigger: appends happen
+ *  constantly while the daemon works, so the daily sweep watermark is checked
+ *  here (and at startEventStore for idle daemons after a restart). */
+export function appendStageTranscript(row: {
+  issueKey: string; stage: string; sessionId: string | null;
+  seq: number; kind: string; bodyJson: string;
+}): void {
+  if (state !== "open" || !store) return; // no transcripts when the store is closed
+  if (row.issueKey.trim() === "" || row.stage.trim() === "") return;
+  if (!Number.isInteger(row.seq) || row.seq < 1 || row.seq > TRANSCRIPT_MAX_ROWS_PER_STAGE) return;
+  const capped = row.seq === TRANSCRIPT_MAX_ROWS_PER_STAGE;
+  const bodyJson = capped
+    ? JSON.stringify({ truncated: TRANSCRIPT_TRUNCATION_MARKER, reason: `per-stage row cap (${TRANSCRIPT_MAX_ROWS_PER_STAGE}) reached — later messages not recorded` })
+    : boundedTranscriptBody(jsonbSafeBodyJson(row.bodyJson));
+  const bodyBytes = Buffer.byteLength(bodyJson, "utf8");
+  if (transcriptQueue.length >= MAX_QUEUED_TRANSCRIPTS || queuedTranscriptBytes + bodyBytes > MAX_QUEUED_TRANSCRIPT_BYTES) {
+    droppedTranscripts += 1;
+    if (droppedTranscripts === 1 || droppedTranscripts % 1000 === 0) {
+      console.error(`[db] transcript queue full (${transcriptQueue.length} rows, ${queuedTranscriptBytes} body bytes) — dropped ${droppedTranscripts} row(s)`);
+    }
+    return;
+  }
+  queuedTranscriptBytes += bodyBytes;
+  transcriptQueue.push({
+    at: Date.now(),
+    issueKey: row.issueKey, stage: row.stage, sessionId: row.sessionId,
+    seq: row.seq,
+    kind: capped ? "cap" : row.kind,
+    bodyJson, bodyBytes,
+  });
+  void drain();
+  void maybeSweepStageTranscripts();
+}
+
+export interface TranscriptRow {
+  id: number; at: number; issueKey: string; stage: string;
+  sessionId: string | null; seq: number; kind: string;
+  /** Parsed body — jsonb read back `::text` and JSON.parsed in JS, one shape on
+   *  both drivers (the registers' normalise-on-read discipline). */
+  body: Record<string, unknown>;
+}
+
+interface RawTranscriptRow { id: unknown; at: unknown; issue_key: string; stage: string;
+  session_id: string | null; seq: unknown; kind: string; body: unknown }
+
+const TRANSCRIPT_COLUMNS = "id::float8 AS id, at::float8 AS at, issue_key, stage, session_id, seq::int AS seq, kind, body::text AS body";
+
+function toTranscriptRow(r: RawTranscriptRow): TranscriptRow {
+  return {
+    id: num(r.id), at: num(r.at), issueKey: r.issue_key, stage: r.stage,
+    sessionId: r.session_id, seq: num(r.seq), kind: r.kind, body: jsonbObject(r.body),
+  };
+}
+
+/** Full transcript for one issue (optionally one stage), ordered by id — the
+ *  audit read behind "what exactly did the factory do on FAC-49?". */
+export async function issueTranscript(issueKey: string, stage?: string, limit = 5000): Promise<TranscriptRow[]> {
+  await flushEvents();
+  if (!store) return [];
+  const rows = stage === undefined
+    ? await store.query<RawTranscriptRow>(
+        `SELECT ${TRANSCRIPT_COLUMNS} FROM stage_transcript WHERE issue_key = $1 ORDER BY id ASC LIMIT $2`, [issueKey, limit])
+    : await store.query<RawTranscriptRow>(
+        `SELECT ${TRANSCRIPT_COLUMNS} FROM stage_transcript WHERE issue_key = $1 AND stage = $2 ORDER BY id ASC LIMIT $3`, [issueKey, stage, limit]);
+  return rows.map(toTranscriptRow);
+}
+
+/** Rows per transcript page — the GET /issue/:key/transcript response bound.
+ *  IN-CODE CONSTANT, not an env knob (CLAUDE.md). */
+export const TRANSCRIPT_PAGE_MAX_ROWS = 500;
+
+export interface TranscriptPage {
+  rows: TranscriptRow[];
+  /** Cursor for the next page (pass as `after`), or null when this was the
+   *  last page. Keyset pagination on id — stable under concurrent appends. */
+  nextAfter: number | null;
+}
+
+/** One bounded page of the transcript for GET /issue/:key/transcript.
+ *  Keyset-paginated (`id > afterId`), capped at TRANSCRIPT_PAGE_MAX_ROWS
+ *  regardless of what the caller asks for. */
+export async function issueTranscriptPage(issueKey: string, opts: { stage?: string; afterId?: number; limit?: number } = {}): Promise<TranscriptPage> {
+  await flushEvents();
+  if (!store) return { rows: [], nextAfter: null };
+  const limit = Math.min(Math.max(1, Math.floor(opts.limit ?? 200)), TRANSCRIPT_PAGE_MAX_ROWS);
+  const after = typeof opts.afterId === "number" && Number.isFinite(opts.afterId) && opts.afterId > 0 ? Math.floor(opts.afterId) : 0;
+  // limit + 1 probes for a next page without a second COUNT query.
+  const raw = opts.stage === undefined
+    ? await store.query<RawTranscriptRow>(
+        `SELECT ${TRANSCRIPT_COLUMNS} FROM stage_transcript WHERE issue_key = $1 AND id > $2 ORDER BY id ASC LIMIT $3`,
+        [issueKey, after, limit + 1])
+    : await store.query<RawTranscriptRow>(
+        `SELECT ${TRANSCRIPT_COLUMNS} FROM stage_transcript WHERE issue_key = $1 AND id > $2 AND stage = $3 ORDER BY id ASC LIMIT $4`,
+        [issueKey, after, opts.stage, limit + 1]);
+  const rows = raw.slice(0, limit).map(toTranscriptRow);
+  const last = rows[rows.length - 1];
+  return { rows, nextAfter: raw.length > limit && last ? last.id : null };
+}
+
+/** Retention sweep: delete transcript rows older than TRANSCRIPT_RETENTION_DAYS.
+ *  Deletes ONLY stage_transcript rows — the summary `events` stream is kept
+ *  forever (issue #11: "keeping the summary events stream forever"). Returns
+ *  the deleted-row count. Scheduled via maybeSweepStageTranscripts below — an
+ *  exported-but-uncalled sweep would leave the retention bound unenforced,
+ *  and a cap nothing enforces is not a cap (CLAUDE.md). */
+export async function sweepStageTranscripts(): Promise<number> {
+  await flushEvents();
+  if (!store) return 0;
+  const cutoff = Date.now() - TRANSCRIPT_RETENTION_DAYS * 86_400_000;
+  return store.exec("DELETE FROM stage_transcript WHERE at < $1", [cutoff]);
+}
+
+/** Minimum interval between retention sweeps. IN-CODE CONSTANT (CLAUDE.md). */
+const TRANSCRIPT_SWEEP_INTERVAL_MS = 86_400_000; // daily
+
+let lastTranscriptSweepAt = 0;
+let transcriptSweepInFlight: Promise<number> | null = null;
+
+/** Run the retention sweep at most once per TRANSCRIPT_SWEEP_INTERVAL_MS.
+ *  Called from the two places that guarantee coverage without a dedicated
+ *  scheduler: appendStageTranscript (a working daemon appends constantly, so
+ *  the watermark is checked continuously) and startEventStore (a restarted or
+ *  idle daemon still sweeps on open). Never throws; returns the in-flight
+ *  sweep promise when one was started, null when inside the interval. The
+ *  watermark advances BEFORE the async work so concurrent callers can never
+ *  stack sweeps. */
+export function maybeSweepStageTranscripts(now = Date.now()): Promise<number> | null {
+  if (state !== "open" || !store) return null;
+  if (now - lastTranscriptSweepAt < TRANSCRIPT_SWEEP_INTERVAL_MS) return null;
+  lastTranscriptSweepAt = now;
+  transcriptSweepInFlight = sweepStageTranscripts()
+    .catch((error) => {
+      // Best-effort like the rest of the transcript path: a failed sweep must
+      // never surface into a stage. Leave the watermark advanced — the next
+      // interval retries, and a DB that is down will fail appends loudly
+      // elsewhere anyway.
+      console.error(`[db] transcript retention sweep failed: ${String(error instanceof Error ? error.message : error)}`);
+      return 0;
+    })
+    .finally(() => { transcriptSweepInFlight = null; });
+  return transcriptSweepInFlight;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,13 +1009,11 @@ export async function issueEvents(issueKey: string, limit = 2000): Promise<unkno
 export async function stageSpendForIssueSince(issueKey: string, sinceMs: number): Promise<number> {
   await flushEvents();
   if (!store) return 0;
-  const rows = await store.query<{ json: string }>(
-    "SELECT json FROM events WHERE type = 'run_stage_finished' AND issue_key = $1 AND at >= $2",
+  const rows = await store.query<{ json: unknown }>(
+    "SELECT json::text AS json FROM events WHERE type = 'run_stage_finished' AND issue_key = $1 AND at >= $2",
     [issueKey, sinceMs]);
   let total = 0;
-  for (const r of rows) {
-    try { total += num((JSON.parse(r.json) as { costUsd?: unknown }).costUsd); } catch { /* skip one bad row */ }
-  }
+  for (const r of rows) total += num(jsonbObject(r.json).costUsd); // bad row ⇒ {} ⇒ +0
   return total;
 }
 
@@ -540,14 +1035,12 @@ export async function stageRunCountForIssueSince(issueKey: string, sinceMs: numb
 export async function parkedRunsSince(sinceMs: number): Promise<number> {
   await flushEvents();
   if (!store) return 0;
-  const rows = await store.query<{ json: string }>(
-    "SELECT json FROM events WHERE type = 'run_finished' AND at >= $1", [sinceMs]);
+  const rows = await store.query<{ json: unknown }>(
+    "SELECT json::text AS json FROM events WHERE type = 'run_finished' AND at >= $1", [sinceMs]);
   let n = 0;
   for (const r of rows) {
-    try {
-      const e = JSON.parse(r.json) as { outcome?: string; dryRun?: boolean };
-      if (!e.dryRun && e.outcome === "parked") n += 1;
-    } catch { /* skip one bad row */ }
+    const e = jsonbObject(r.json) as { outcome?: string; dryRun?: boolean }; // bad row ⇒ {} ⇒ not counted
+    if (!e.dryRun && e.outcome === "parked") n += 1;
   }
   return n;
 }
@@ -563,16 +1056,14 @@ export async function parkedRunsSince(sinceMs: number): Promise<number> {
 export async function lastParkReasonForIssue(issueKey: string): Promise<string | null> {
   await flushEvents();
   if (!store) return null;
-  const rows = await store.query<{ type: string; json: string }>(
-    "SELECT type, json FROM events WHERE issue_key = $1 AND type IN ('run_finished', 'issue_needs_human') ORDER BY id DESC LIMIT 50",
+  const rows = await store.query<{ type: string; json: unknown }>(
+    "SELECT type, json::text AS json FROM events WHERE issue_key = $1 AND type IN ('run_finished', 'issue_needs_human') ORDER BY id DESC LIMIT 50",
     [issueKey]);
   for (const r of rows) {
-    try {
-      const e = JSON.parse(r.json) as { outcome?: string; reason?: unknown };
-      const reason = typeof e.reason === "string" && e.reason.trim() ? e.reason.trim() : null;
-      if (r.type === "issue_needs_human" && reason) return reason;
-      if (r.type === "run_finished" && (e.outcome === "parked" || e.outcome === "needs_human") && reason) return reason;
-    } catch { /* skip one bad row */ }
+    const e = jsonbObject(r.json) as { outcome?: string; reason?: unknown }; // bad row ⇒ {} ⇒ skipped
+    const reason = typeof e.reason === "string" && e.reason.trim() ? e.reason.trim() : null;
+    if (r.type === "issue_needs_human" && reason) return reason;
+    if (r.type === "run_finished" && (e.outcome === "parked" || e.outcome === "needs_human") && reason) return reason;
   }
   return null;
 }
@@ -594,11 +1085,10 @@ export async function catalogUsage(): Promise<{ byStage: Record<string, CardUsag
   const byIssueKey: Record<string, CardUsage> = {};
   await flushEvents();
   if (!store) return { byStage, byIssueKey };
-  const rows = await store.query<{ json: string }>(
-    "SELECT json FROM events WHERE type = 'run_stage_finished'");
+  const rows = await store.query<{ json: unknown }>(
+    "SELECT json::text AS json FROM events WHERE type = 'run_stage_finished'");
   for (const r of rows) {
-    let e: { costUsd?: unknown; turns?: unknown; stage?: unknown; issueKey?: unknown };
-    try { e = JSON.parse(r.json) as typeof e; } catch { continue; }
+    const e = jsonbObject(r.json) as { costUsd?: unknown; turns?: unknown; stage?: unknown; issueKey?: unknown };
     const cost = num(e.costUsd);
     const turns = num(e.turns);
     if (typeof e.stage === "string" && e.stage.trim() !== "") {
@@ -748,15 +1238,16 @@ async function computeTelemetry(): Promise<Telemetry> {
   const t = emptyTelemetry();
   const dailyByDate = new Map(t.daily.map((d) => [d.date, d]));
 
-  const stageRows = await s.query<{ at: unknown; json: string }>(
-    "SELECT at::float8 AS at, json FROM events WHERE type = 'run_stage_finished' ORDER BY id ASC");
+  const stageRows = await s.query<{ at: unknown; json: unknown }>(
+    "SELECT at::float8 AS at, json::text AS json FROM events WHERE type = 'run_stage_finished' ORDER BY id ASC");
   const perModel = new Map<string, Telemetry["perModel"][number]>();
   const perStage = new Map<string, Telemetry["perStage"][number]>();
   const costByIssue = new Map<string, { costUsd: number; runs: number }>();
 
   for (const row of stageRows) {
-    let e: StageFinished;
-    try { e = JSON.parse(row.json) as StageFinished; } catch { continue; }
+    const body = jsonbObject(row.json);
+    if (Object.keys(body).length === 0) continue; // quarantined/bad row — skip, exactly as the JSON.parse catch did
+    const e = body as StageFinished;
     const costUsd = num(e.costUsd);
     const turns = num(e.turns);
     t.totals.costUsd += costUsd;
@@ -800,13 +1291,14 @@ async function computeTelemetry(): Promise<Telemetry> {
     }
   }
 
-  const runRows = await s.query<{ at: unknown; json: string }>(
-    "SELECT at::float8 AS at, json FROM events WHERE type = 'run_finished' ORDER BY id ASC");
+  const runRows = await s.query<{ at: unknown; json: unknown }>(
+    "SELECT at::float8 AS at, json::text AS json FROM events WHERE type = 'run_finished' ORDER BY id ASC");
   const parkReasons = new Map<string, number>();
 
   for (const row of runRows) {
-    let e: RunFinished;
-    try { e = JSON.parse(row.json) as RunFinished; } catch { continue; }
+    const body = jsonbObject(row.json);
+    if (Object.keys(body).length === 0) continue; // quarantined/bad row — skip, exactly as the JSON.parse catch did
+    const e = body as RunFinished;
     if (e.dryRun) continue; // rehearsals don't count as deliveries
     t.totals.runs += 1;
     const outcome = e.outcome;
@@ -1011,9 +1503,10 @@ export async function recordShadowDecision(repo: string, issueKey: string, decis
     if (store) {
       try {
         await store.exec(
-          "INSERT INTO merge_shadow_log (at, repo, issue_key, would_merge, acted, tier, reasons, evidence_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          // evidence_json is jsonb — bind ::text::jsonb ONLY (see writeBatch).
+          "INSERT INTO merge_shadow_log (at, repo, issue_key, would_merge, acted, tier, reasons, evidence_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
           [Date.now(), repo, issueKey, decision.wouldMerge, decision.act, decision.tier,
-            decision.reasons.join("; ").slice(0, 1000), JSON.stringify(ev)]);
+            decision.reasons.join("; ").slice(0, 1000), jsonbSafeStringify(ev)]);
         await store.exec(
           `INSERT INTO merge_ladder (repo, tier, clean_streak, total_shadow, updated_at) VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (repo) DO UPDATE SET tier = EXCLUDED.tier, clean_streak = EXCLUDED.clean_streak, total_shadow = EXCLUDED.total_shadow, updated_at = EXCLUDED.updated_at`,
@@ -1128,18 +1621,19 @@ export interface ApprovalItem {
 interface RawApprovalRow {
   id: unknown; created_at: unknown; updated_at: unknown; issue_key: string; title: string;
   repo: string; pr_url: string; gated_head_sha: string | null; hold_reasons: string;
-  gate_summary_json: string | null; security_verdict: string; taste_verdict: string;
+  gate_summary_json: unknown; security_verdict: string; taste_verdict: string;
   findings_digest: string; diff_stat: string; cost_usd: unknown; turns: unknown;
   regate_failed: boolean; status: string; resolution: string;
 }
 
-const APPROVAL_COLUMNS = "id::float8 AS id, created_at::float8 AS created_at, updated_at::float8 AS updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd::float8 AS cost_usd, turns::float8 AS turns, regate_failed, status, resolution";
+const APPROVAL_COLUMNS = "id::float8 AS id, created_at::float8 AS created_at, updated_at::float8 AS updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json::text AS gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd::float8 AS cost_usd, turns::float8 AS turns, regate_failed, status, resolution";
 
 function toApprovalItem(r: RawApprovalRow): ApprovalItem {
-  let gateSummary: ApprovalItem["gateSummary"] = null;
-  if (r.gate_summary_json) {
-    try { gateSummary = JSON.parse(r.gate_summary_json) as ApprovalItem["gateSummary"]; } catch { /* legacy/bad row degrades to null */ }
-  }
+  // jsonb read through the central normaliser (store.ts) — a NULL column or a
+  // quarantined/legacy row degrades to null, exactly as the old catch did.
+  const summary = r.gate_summary_json === null ? null : jsonbObject(r.gate_summary_json);
+  const gateSummary = summary && Object.keys(summary).length > 0
+    ? (summary as unknown as ApprovalItem["gateSummary"]) : null;
   return {
     id: num(r.id), createdAt: num(r.created_at), updatedAt: num(r.updated_at), issueKey: r.issue_key,
     title: r.title, repo: r.repo, prUrl: r.pr_url, gatedHeadSha: r.gated_head_sha,
@@ -1187,11 +1681,11 @@ export async function insertApproval(row: {
     // that beat us and insert again.
     const rows = await store.query<{ id: unknown }>(
       `INSERT INTO approvals (created_at, updated_at, issue_key, title, repo, pr_url, gated_head_sha, hold_reasons, gate_summary_json, security_verdict, taste_verdict, findings_digest, diff_stat, cost_usd, turns, regate_failed, status, resolution)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', '')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::jsonb, $10, $11, $12, $13, $14, $15, $16, 'pending', '')
        ON CONFLICT (issue_key) WHERE status = 'pending' DO NOTHING
        RETURNING id::float8 AS id`,
       [now, now, row.issueKey, row.title, row.repo, row.prUrl, row.gatedHeadSha, row.holdReasons,
-        row.gateSummary ? JSON.stringify(row.gateSummary) : null,
+        row.gateSummary ? jsonbSafeStringify(row.gateSummary) : null,
         row.securityVerdict, row.tasteVerdict, row.findingsDigest, row.diffStat, row.costUsd, row.turns,
         row.regateFailed]);
     const id = num(rows[0]?.id);
@@ -1737,16 +2231,11 @@ interface RawAgentRegisterRow { id: unknown; name: string; version: unknown; fro
 interface RawSkillRegisterRow { id: unknown; name: string; version: unknown; description: string;
   content: string; attach: unknown; content_hash: string; enabled: boolean; created_at: unknown; created_by: string }
 
-/** Normalise a jsonb column read back `::text` (or, defensively, as an already-
- *  parsed object) into a plain object. Anything else degrades to {}. */
-function jsonbObject(v: unknown): Record<string, unknown> {
-  let parsed: unknown = v;
-  if (typeof v === "string") {
-    try { parsed = JSON.parse(v) as unknown; } catch { parsed = null; }
-  }
-  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>) : {};
-}
+// jsonb columns are normalised by store.ts's jsonbValue/jsonbObject — the ONE
+// central parse-if-string (imported at the top of this file). The bounded
+// double-parse in jsonbObject also degrades the damaged double-encoded shape a
+// bare `::jsonb` bind under the Bun driver used to write (see the migrate()
+// repair) to a usable object.
 
 function toFlatStringMap(v: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -1928,7 +2417,7 @@ export async function insertAgentRegisterVersion(row: {
              UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
            )
            INSERT INTO agent_register (name, version, frontmatter, prompt, content_hash, enabled, created_at, created_by)
-           SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::jsonb, $3, $4, TRUE, $5, $6
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::text::jsonb, $3, $4, TRUE, $5, $6
            WHERE (SELECT COUNT(*) FROM deactivated) >= 0
            RETURNING id::float8 AS id, version::int AS version`,
           [row.name, fmJson, row.prompt, row.contentHash, now, row.createdBy]);
@@ -1981,7 +2470,7 @@ export async function insertSkillRegisterVersion(row: {
              UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
            )
            INSERT INTO skill_register (name, version, description, content, attach, content_hash, enabled, created_at, created_by)
-           SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::jsonb, $5, TRUE, $6, $7
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::text::jsonb, $5, TRUE, $6, $7
            WHERE (SELECT COUNT(*) FROM deactivated) >= 0
            RETURNING id::float8 AS id, version::int AS version`,
           [row.name, row.description, row.content, attachJson, row.contentHash, now, row.createdBy]);
@@ -2112,7 +2601,7 @@ export { num as coerceNumeric };
 
 let testEngine: Store | null = null;
 
-const TEST_TABLES ="events, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit, agent_register, skill_register";
+const TEST_TABLES ="events, stage_transcript, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit, agent_register, skill_register, jsonb_migration_quarantine";
 
 export interface TestStoreOptions {
   /** Also wire the write-behind queue to the event bus, exactly as
@@ -2132,6 +2621,11 @@ export interface TestStoreOptions {
    *  retry lands, the gate stays open). Everything else — reads, other writes —
    *  hits the real engine, so only the drain's failure handling is simulated. */
   failEventWrites?: number;
+  /** Test-only poisoned-row simulation: any stage_transcript INSERT whose
+   *  bound params contain this marker string rejects — exactly like Postgres
+   *  rejecting one unstorable body — while every other write succeeds. Lets a
+   *  test prove the per-row fallback persists a poisoned row's neighbors. */
+  failTranscriptRowContaining?: string;
   /** Test-only interleaving control (issue #8 F7): after the FIRST query whose
    *  SQL contains `contains` has EXECUTED (rows already fetched from the
    *  engine), hold those rows back from the caller until `release` resolves;
@@ -2166,6 +2660,20 @@ export async function openTestDatabase(opts: TestStoreOptions = {}): Promise<voi
       close: () => inner.close(),
     };
   }
+  if (opts.failTranscriptRowContaining !== undefined) {
+    const inner = store;
+    const marker = opts.failTranscriptRowContaining;
+    store = {
+      query: (text, params) => inner.query(text, params),
+      exec: (text, params) => {
+        if (text.startsWith("INSERT INTO stage_transcript") && (params ?? []).some((p) => typeof p === "string" && p.includes(marker))) {
+          return Promise.reject(new Error("simulated unstorable transcript row (failTranscriptRowContaining)"));
+        }
+        return inner.exec(text, params);
+      },
+      close: () => inner.close(),
+    };
+  }
   if (opts.holdQueryResult) {
     const inner = store;
     const hold = opts.holdQueryResult;
@@ -2190,9 +2698,18 @@ export async function openTestDatabase(opts: TestStoreOptions = {}): Promise<voi
   telemetryInFlight = null;
   flushGeneration = 0;
   queue.length = 0;
+  transcriptQueue.length = 0;
+  queuedTranscriptBytes = 0;
+  // Suppress the append-triggered retention sweep across tests: a stale
+  // watermark would let test A's fire-and-forget DELETE land after test B's
+  // TRUNCATE and eat B's deliberately-old fixture rows. Tests that exercise
+  // the sweep move the watermark back explicitly (testSetTranscriptSweepAt).
+  lastTranscriptSweepAt = Date.now();
+  transcriptSweepInFlight = null;
   draining = null;
   inFlightEvents = 0;
   droppedEvents = 0;
+  droppedTranscripts = 0;
   lastWriteError = null;
   // The TRUNCATE above emptied both registers; the snapshot must agree, and the
   // generation must MOVE (never reset — catalog.ts's cache entries from an
@@ -2215,18 +2732,29 @@ export async function closeTestDatabase(): Promise<void> {
   // makes any batch that has not started a no-op, and awaiting the in-flight
   // promise guarantees no write is outstanding when this resolves.
   queue.length = 0;
+  transcriptQueue.length = 0;
   store = null;
   const inFlight = draining;
   if (inFlight) await inFlight.catch(() => { /* drain never rejects, but be safe */ });
+  // A retention DELETE dispatched before store was nulled must settle too —
+  // otherwise it could land after the next test's TRUNCATE and eat that
+  // test's deliberately-old fixture rows.
+  const sweepInFlight = transcriptSweepInFlight;
+  if (sweepInFlight) await sweepInFlight.catch(() => 0);
   state = "closed";
   writeHealthy = true;
   telemetryCache = null;
   telemetryInFlight = null;
   flushGeneration = 0;
   queue.length = 0;
+  transcriptQueue.length = 0;
+  queuedTranscriptBytes = 0;
+  lastTranscriptSweepAt = Date.now();
+  transcriptSweepInFlight = null;
   draining = null;
   inFlightEvents = 0;
   droppedEvents = 0;
+  droppedTranscripts = 0;
   lastWriteError = null;
   // Closed store = empty register snapshot (file-fallback behaviour), and the
   // generation moves forward so no cached card survives the close.
@@ -2243,6 +2771,61 @@ export async function closeTestDatabase(): Promise<void> {
 export async function insertTestEvent(type: string, body: Record<string, unknown>, at = Date.now()): Promise<void> {
   if (!store) return;
   const key = typeof body.issueKey === "string" ? body.issueKey : null;
-  await store.exec("INSERT INTO events (seq, at, type, issue_key, json) VALUES ($1, $2, $3, $4, $5)",
+  await store.exec("INSERT INTO events (seq, at, type, issue_key, json) VALUES ($1, $2, $3, $4, $5::text::jsonb)",
     [0, at, type, key, JSON.stringify({ type, seq: 0, at, ...body })]);
+}
+
+/** Test-only: insert a raw transcript row with an explicit `at`, bypassing the
+ *  write queue — the retention-sweep tests need rows older than the window and
+ *  appendStageTranscript always stamps Date.now(). Same `::text::jsonb` bind
+ *  discipline as the production batch writer. */
+export async function insertTestTranscriptRow(issueKey: string, stage: string, kind: string, body: Record<string, unknown>, at = Date.now(), seq = 1): Promise<void> {
+  if (!store) return;
+  await store.exec(
+    "INSERT INTO stage_transcript (at, issue_key, stage, session_id, seq, kind, body) VALUES ($1, $2, $3, NULL, $4, $5, $6::text::jsonb)",
+    [at, issueKey, stage, seq, kind, JSON.stringify(body)]);
+}
+
+/** Test-only: jsonb_typeof of every stored events.json for one issue, in id
+ *  order — pins that the write-behind QUEUE stores native jsonb OBJECTS,
+ *  never the double-encoded string scalar a bare `::jsonb` bind produces
+ *  under the real Bun driver (the read path's parse-if-string would mask it). */
+export async function testEventJsonTypes(issueKey: string): Promise<string[]> {
+  await flushEvents();
+  if (!store) return [];
+  const rows = await store.query<{ t: string }>(
+    "SELECT jsonb_typeof(json) AS t FROM events WHERE issue_key = $1 ORDER BY id ASC", [issueKey]);
+  return rows.map((r) => r.t);
+}
+
+/** Test-only: move the retention-sweep watermark. openTestDatabase pins it to
+ *  "now" (so a cross-test sweep can never race a TRUNCATE); a sweep test moves
+ *  it back past TRANSCRIPT_SWEEP_INTERVAL_MS to arm the trigger. */
+export function testSetTranscriptSweepAt(at: number): void {
+  lastTranscriptSweepAt = at;
+}
+
+/** Test-only: the in-flight retention sweep (resolved 0 when none) — lets a
+ *  test await the fire-and-forget DELETE deterministically. */
+export function testTranscriptSweepInFlight(): Promise<number> {
+  return transcriptSweepInFlight ?? Promise.resolve(0);
+}
+
+/** Test-only: transcript queue occupancy and drop counter — pins the byte
+ *  budget (rows past it are DROPPED, not queued, so heap stays bounded during
+ *  a Postgres outage). */
+export function testTranscriptQueueStats(): { rows: number; bytes: number; dropped: number } {
+  return { rows: transcriptQueue.length, bytes: queuedTranscriptBytes, dropped: droppedTranscripts };
+}
+
+/** Test-only: jsonb_typeof of every stored body for one issue, in id order —
+ *  pins that the QUEUE write path stores native jsonb OBJECTS, never the
+ *  double-encoded string scalar a bare `::jsonb` bind produces under the real
+ *  Bun driver (issueTranscript's defensive double-parse would mask that). */
+export async function testTranscriptBodyTypes(issueKey: string): Promise<string[]> {
+  await flushEvents();
+  if (!store) return [];
+  const rows = await store.query<{ t: string }>(
+    "SELECT jsonb_typeof(body) AS t FROM stage_transcript WHERE issue_key = $1 ORDER BY id ASC", [issueKey]);
+  return rows.map((r) => r.t);
 }

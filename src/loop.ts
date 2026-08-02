@@ -5,12 +5,13 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, headSha, fetchBase, commitsBehindBase, mergeBaseIntoBranch, DIFF_FAILED, type Workspace } from "./repos.ts";
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence, testCountRatchet, repoFacts } from "./verify.ts";
 import { routeStage, factTerms, type RepoFacts, type StageRoute } from "./routing.ts";
-import { runStage, untrusted, redactSecrets, type StageResult, CLAIM_LOST } from "./agents.ts";
+import { runStage, untrusted, redactSecrets, type StageResult, type DelegateRoster, CLAIM_LOST } from "./agents.ts";
 import { isDraining } from "./control.ts";
 import { parseFactoryMeta, resolveModel, resolveModelForRisk, resolveEffort } from "./meta.ts";
 import { deriveRiskClass, diffFilePaths, escalationModel, MAX_TIER_ESCALATIONS } from "./risk.ts";
 import { checkFreshness } from "./precondition.ts";
-import { activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback } from "./db.ts";
+import { activeAgentRegisterSnapshot, activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback } from "./db.ts";
+import { MATERIALIZED_SKILLS_SUBDIR, buildDelegateRoster, buildRegisterIndex, delegableSpecialists, indexBlockForStage, materializeSkills, refreshMaterializedSkills } from "./discovery.ts";
 import { fileApproval, shouldFileApproval } from "./approvals.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
@@ -569,6 +570,86 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // mirroring selectCard). An empty register carries nothing, and every
     // prompt below is then byte-identical to before this feature existed.
     const skillRows = [...activeSkillRegisterSnapshot().values()];
+
+    // ---- discovery (issue #17 part 1): materialize every ENABLED register
+    // skill into <worktree>/.factory/skills/<name>.md so workers can Read the
+    // long tail on demand (no new tool; the Read shows up in tool_use events,
+    // which is the usage-attribution seam for #11). Redaction re-scan happens
+    // at the write (discovery.ts); .factory/ is factory scratch that repos.ts
+    // excludes from commitAll and guarded-path classification, so nothing
+    // materialized can reach a commit, diff, or PR. Then build the register
+    // INDEX — a compact TRUSTED catalog block (enabled skills that actually
+    // materialized + delegable specialists, judges excluded in-code) injected
+    // ONLY into orchestrating stages (resolved allowlist grants Task/Agent).
+    // Assembled from operator-authored register rows only — ticket text can
+    // never contribute an index line. Empty register → "" → prompts and the
+    // worktree stay byte-identical to post-#16 (additive-only).
+    const materialization = materializeSkills(ws.dir, skillRows);
+    for (const rej of materialization.rejected) console.error(`[${issue.identifier}] skill materialization rejected "${rej.skill}": ${rej.reason}`);
+    if (materialization.written.length > 0 || materialization.removed.length > 0) {
+      console.log(`[${issue.identifier}] materialized skills: wrote [${materialization.written.join(", ")}], removed stale [${materialization.removed.join(", ")}]`);
+    }
+    const skillDescriptions = new Map(skillRows.map((r) => [r.name, r.description]));
+    const agentRows = [...activeAgentRegisterSnapshot().values()];
+    const registerIndex = buildRegisterIndex(
+      materialization.materialized.map((m) => ({ name: m.name, version: m.version, description: skillDescriptions.get(m.name) ?? "" })),
+      delegableSpecialists(agentRows));
+    /** The TRUSTED index block for a routed stage — "" for non-orchestrators. */
+    const indexFor = (route: StageRoute): string => indexBlockForStage(route.tools, registerIndex);
+    /** Materialized-skill pins for event detail (agents.ts skillReadDetail):
+     *  relPath → "name@version", built from what ACTUALLY materialized — a
+     *  worker Read of `.factory/skills/<name>.md` then surfaces in the event
+     *  trail with its version pin (issue #17 Verification bullet; the usage-
+     *  attribution seam #11 consumes). Empty map → omitted → additive. */
+    const skillPins: Record<string, string> = Object.fromEntries(
+      materialization.materialized.map((m) => [m.relPath, `${m.name}@${m.version}`]));
+    const skillPinsOpt = Object.keys(skillPins).length > 0 ? { skillPins } : {};
+    /** Stage-boundary skill REFRESH (finding fix): setup's materialization runs
+     *  ONCE, but the implementer (bare Write) and the fixer family run in this
+     *  same worktree before later stages read `.factory/skills/` — so a
+     *  ticket-steered overwrite would be read by the fixer/tester (a GATE
+     *  stage) under the file's TRUSTED header, invisibly (`.factory/` never
+     *  reaches a commit, diff, or PR). materializeSkills is idempotent and
+     *  self-repairing, so re-running it here restores tampered files and
+     *  deletes planted ones — and because the register snapshot is unchanged
+     *  since setup, ANY rewrite at a refresh IS evidence of in-worktree
+     *  tampering: logged loudly. Returns the index rebuilt from the FRESH
+     *  report, so a skill that now refuses to materialize (e.g. the symlink
+     *  refusal) is no longer advertised to the stage about to run. */
+    const refreshSkillsBefore = (stage: string): string => {
+      const { report, index } = refreshMaterializedSkills(ws.dir, skillRows, skillDescriptions, delegableSpecialists(agentRows));
+      for (const rej of report.rejected) console.error(`[${issue.identifier}] skill refresh before ${stage} rejected "${rej.skill}": ${rej.reason}`);
+      if (report.written.length > 0) console.error(`[${issue.identifier}] TAMPERED SKILL(S) RESTORED before ${stage}: [${report.written.join(", ")}] differed on disk from the register — a worktree stage modified factory-trusted content`);
+      if (report.removed.length > 0) console.error(`[${issue.identifier}] planted file(s) removed from ${MATERIALIZED_SKILLS_SUBDIR} before ${stage}: [${report.removed.join(", ")}]`);
+      return index;
+    };
+    // ---- delegation (issue #17 part 2): the same delegable specialists the
+    // index advertises become real SDK subagent types for orchestrating
+    // stages, each confined to the TRIPLE INTERSECTION parent allowlist ∩ its
+    // own tools: selection ∩ its role ceiling (discovery.ts delegateTools —
+    // a delegate can never hold a tool its parent lacks), model "inherit",
+    // the in-code subagent turn cap, side-channels + Task/Agent denied
+    // (depth 1). Judges are never delegable: a delegable: true row for one is
+    // ignored LOUDLY here. Zero delegable entries → undefined → runStage's
+    // agents map stays exactly { worker }, byte-identical to post-#16.
+    const loggedDelegateNotes = new Set<string>();
+    const delegatesFor = (route: StageRoute): DelegateRoster | undefined => {
+      const { roster, excluded } = buildDelegateRoster(agentRows, route.tools);
+      for (const ex of excluded) {
+        if (loggedDelegateNotes.has(ex.name)) continue;
+        loggedDelegateNotes.add(ex.name);
+        console.error(`[${issue.identifier}] register delegate "${ex.name}" REFUSED: ${ex.reason}`);
+      }
+      const pins = Object.values(roster.pins);
+      if (pins.length === 0) return undefined;
+      const note = `${route.stage}:${pins.join(",")}`;
+      if (!loggedDelegateNotes.has(note)) {
+        loggedDelegateNotes.add(note);
+        console.log(`[${issue.identifier}] delegates for ${route.stage}: ${pins.join(", ")}`);
+      }
+      return roster;
+    };
+
     const skillSelections = new Map<string, SkillSelection>();
     const skillsFor = (role: string): SkillSelection => {
       let sel = skillSelections.get(role);
@@ -648,10 +729,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       : "";
     if (ownerFeedback) console.log(`[${issue.identifier}] running fix round with owner pushback feedback (${ownerFeedback.length} chars)`);
     pinStage("implementer", implRoute.card, "implementer");
-    const implSpec = skillBlockFor("implementer") + spec;
+    const implSpec = indexFor(implRoute) + skillBlockFor("implementer") + spec;
     const implPrompt = ownerFeedbackBlock + lessonsBlock + renderPrompt(implRoute.card, { repo, spec: implSpec },
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${implSpec}`);
+    const implDelegates = delegatesFor(implRoute);
     const implOpts = { model: implModel, effort: implEffort, cwd: ws.dir, allowedTools: implRoute.tools, maxTurns: config.caps.turnsImplementer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+      ...(implDelegates ? { delegates: implDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "implementer", id) };
     // Resume an interrupted implementer: a lingering session row means the prior
     // run was cut off mid-build (process killed) — pick up its actual conversation
@@ -718,6 +801,11 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // cap respects it; the sequential fallback below (only reached after the pair
     // has settled) can safely reuse the full remainingUsd.
     const parallelReviewBudget = budget.remainingUsd / 2;
+    // Repair pass after the WRITE stage: restore any materialized skill the
+    // implementer overwrote before the read-capable reviewer-repo leg (and
+    // everything downstream) walks this worktree. Index discarded — reviewers
+    // never carry it.
+    refreshSkillsBefore("reviewers");
     pinStage("reviewer-claude", reviewerSpecRoute.card, "reviewer-spec");
     pinStage("reviewer-repo", reviewerRepoRoute.card, "reviewer-repo");
     const specForReviewerSpec = skillBlockFor("reviewer-spec") + spec;
@@ -762,10 +850,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // instead of paying for a fresh run. Reviewer legs stay stateless by
     // design — they are cheap to rerun and their independence is the point.
     pinStage("fixer", fixerRoute.card, "fixer");
-    const specForFixer = skillBlockFor("fixer") + spec;
+    const specForFixer = indexBlockForStage(fixerRoute.tools, refreshSkillsBefore("fixer")) + skillBlockFor("fixer") + spec;
     const fixPrompt = ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec: specForFixer, reviews: untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`) },
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${specForFixer}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`);
+    const fixDelegates = delegatesFor(fixerRoute);
     const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+      ...(fixDelegates ? { delegates: fixDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
     const priorFixSession = await getStageSession(issue.identifier, "fixer");
     let fixer = await runStage("fixer", fixPrompt, { ...fixOpts, ...(priorFixSession ? { resume: priorFixSession } : {}) });
@@ -928,10 +1018,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     let browser: BrowserEvidence = requiresBrowserEvidence(ws) ? "missing" : "not-required";
     if ((requiresBrowserEvidence(ws) || wantsBrowserVerification(issue.description)) && hasPlaywright(ws) && !budget.expired) {
       pinStage("tester", testerRoute.card, "tester");
-      const specForTester = skillBlockFor("tester") + spec;
+      const specForTester = indexBlockForStage(testerRoute.tools, refreshSkillsBefore("tester")) + skillBlockFor("tester") + spec;
       const testerPrompt = renderPrompt(testerRoute.card, { spec: specForTester, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${specForTester}`);
+      const testerDelegates = delegatesFor(testerRoute);
       const testerOpts = { model: resolveModelForRisk("tester", meta, risk.class), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card)), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT,
+        ...(testerDelegates ? { delegates: testerDelegates } : {}), ...skillPinsOpt,
         onSessionId: (id: string) => recordStageSession(issue.identifier, "tester", id) };
       const priorTesterSession = await getStageSession(issue.identifier, "tester");
       let tester = await runStage("tester", testerPrompt, { ...testerOpts, ...(priorTesterSession ? { resume: priorTesterSession } : {}) });

@@ -35,6 +35,41 @@ export interface Store {
   close(): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// jsonb read normalisation — the ONE place a jsonb column becomes a JS value.
+//
+// Measured divergence (same class as the numeric one below): a raw jsonb
+// column comes back as a STRING from Bun's client and as a parsed OBJECT from
+// PGlite. db.ts therefore projects every jsonb column `::text` (one shape on
+// both drivers) and funnels it through these helpers — parse-if-string ONCE,
+// centrally, so no caller ever JSON.parses a row field again.
+// tests/db-jsonb-discipline.test.ts machine-enforces that rule the same way
+// tests/db-cast-discipline.test.ts enforces the numeric casts.
+// ---------------------------------------------------------------------------
+
+/** Parsed value of a jsonb column on BOTH drivers: strings (the `::text`
+ *  projection, or Bun's raw-jsonb shape) are JSON.parsed once; anything
+ *  already parsed (PGlite's raw-jsonb shape) passes through. An unparseable
+ *  string degrades to null — one bad row must never throw into a read path. */
+export function jsonbValue(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  try { return JSON.parse(v) as unknown; } catch { return null; }
+}
+
+/** jsonbValue narrowed to a plain object; anything else degrades to {}.
+ *  Parses AT MOST twice: once for the ::text read, and once more iff that
+ *  yields a string — the double-encoded shape a bare `::jsonb` bind under the
+ *  Bun driver used to write (jsonb string scalar holding JSON; see the
+ *  migrate() repair in db.ts). Bounded, never recursive. */
+export function jsonbObject(v: unknown): Record<string, unknown> {
+  let parsed: unknown = v;
+  for (let i = 0; i < 2 && typeof parsed === "string"; i++) {
+    try { parsed = JSON.parse(parsed) as unknown; } catch { parsed = null; }
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>) : {};
+}
+
 /** Production store: Bun's built-in Postgres client over a loopback URL. */
 export async function bunStore(url: string): Promise<Store> {
   const { SQL } = await import("bun");

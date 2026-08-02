@@ -224,6 +224,15 @@ export const config = {
   // APPROVALS_NOTIFY=0 disables. No-op off macOS regardless.
   approvalsNotify: (process.env.APPROVALS_NOTIFY ?? "1").trim() !== "0",
 
+  // Stage-transcript capture kill switch (issue #11 "additive" verification).
+  // ON by default — the audit trail is the point — and this is deliberately a
+  // DISABLE gate, not a tunable: the transcript BOUNDS (body cap, row cap,
+  // queue budgets, retention window) stay in-code constants in db.ts per
+  // CLAUDE.md, so no env value can weaken them. FACTORY_TRANSCRIPT=0 gives the
+  // operator a way to shut capture off at runtime (misbehaving capture, disk
+  // pressure) without stopping the daemon; anything else leaves it on.
+  transcriptEnabled: (process.env.FACTORY_TRANSCRIPT ?? "1").trim() !== "0",
+
   // Extra origins the dashboard's write-route guard (server.ts
   // guardedJsonBody) accepts IN ADDITION to loopback — exact full-origin
   // matches only (scheme+host+port). Purpose: the owner serving mission
@@ -296,4 +305,25 @@ if (config.proxyBaseUrl && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$
   if (policy === "warn") {
     console.error(`[config] vendor-diversity WARNING (not fatal — no gate-stage tier vars declared): ${violations.join("; ")}`);
   }
+}
+
+/** The dashboard's effective port, or null when it is off. Extracted from
+ *  server.ts's resolvePort so the factory report (report.ts) can render the
+ *  transcript deep-link with the SAME resolution the server binds with —
+ *  duplicating the default here and there is exactly the drift this export
+ *  prevents. Read at CALL time (not module load) because tests and the server
+ *  both consult DASHBOARD_PORT dynamically. Throws on a malformed value —
+ *  startDashboard() wants that loud; report.ts catches and omits the link. */
+export function resolveDashboardPort(): number | null {
+  const raw = process.env.DASHBOARD_PORT?.trim();
+  if (raw === undefined || raw === "") {
+    if (config.oneShot || config.dryRun) return null; // off in --once/--dry unless forced
+    return 8787;
+  }
+  if (raw === "0") return null; // explicit off
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`DASHBOARD_PORT must be an integer in 1..65535 or 0 to disable (got "${raw}")`);
+  }
+  return port;
 }
