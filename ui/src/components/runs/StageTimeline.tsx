@@ -1,5 +1,6 @@
 import type { RunView, StageView } from "../../lib/events";
 import { secs, usd } from "../../lib/format";
+import { pinLabel } from "../../lib/registers";
 import { useNow } from "../../lib/useNow";
 import { Badge } from "../ui/badge";
 import { cn } from "../../lib/utils";
@@ -51,6 +52,17 @@ export function StageTimeline({ run }: { run: RunView }) {
               <span className={cn("font-mono text-[11px]", running ? "text-live" : "text-fg-dim")}>
                 {s.stage}
               </span>
+              {/* Version pin (issue #16 WP3): which card@version the stage ran
+                  with — small, monospace, desktop-only (mobile keeps one line;
+                  the ledger below shows it there). Skills pins live in title. */}
+              {s.card !== undefined && (
+                <span
+                  className="hidden font-mono text-[9.5px] text-fg-faint sm:inline"
+                  title={s.skills && s.skills.length > 0 ? `skills: ${s.skills.map(pinLabel).join(", ")}` : undefined}
+                >
+                  {pinLabel(s.card)}
+                </span>
+              )}
               <span
                 className={cn("size-1.5 shrink-0 rounded-full", isCodex(s) ? "bg-codex" : "bg-claude")}
                 title={`${s.model}${s.viaProxy ? " · via proxy" : ""}`}

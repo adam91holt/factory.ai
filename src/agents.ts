@@ -31,6 +31,14 @@ export interface StageResult {
   // Deliberately `unknown` — NOTHING consumes it except gate.ts's strict
   // validator (resolveGateOutput), which fails CLOSED on any shape violation.
   structured?: unknown;
+  // Version pins (issue #16 WP2), attached by the CALLER (loop.ts) after the
+  // stage returns — runStage itself never sets them. `card` is the prompt
+  // card the stage ran with as "name@version" (version 0 = file-fallback),
+  // `skills` the register skills carried into its prompt. Optional and purely
+  // additive: report.ts renders them only when present, so pin-less stages
+  // (and every pre-pin caller) produce byte-identical output.
+  card?: string;
+  skills?: string[];
 }
 
 interface StageOptions {

@@ -16,7 +16,7 @@ import { parseFactoryMeta, resolveModel } from "../src/meta.ts";
 import { config } from "../src/config.ts";
 import { buildReport } from "../src/report.ts";
 import { readCatalog } from "../src/catalog-manager.ts";
-import { openTestDatabase, closeTestDatabase } from "../src/db.ts";
+import { openTestDatabase, closeTestDatabase, insertAgentRegisterVersion } from "../src/db.ts";
 
 // Agent routing (WP4). Card frontmatter `tools:` is load-bearing now, and a
 // specialist card can win a stage on REPO facts. Both are capability changes,
@@ -579,4 +579,74 @@ describe("catalog surfaces the resolved routing, not the raw declaration", () =>
       expect(a.routing.unknownTools).toEqual([]);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #16: PG-SOURCED cards inherit every invariant above. A register row's
+// frontmatter never went through the file parser, so it is the WORST-case
+// declaration source — and it must flow through the exact same resolveTools
+// filter, keeping the ⊆-ceiling theorem for any stored string.
+// ---------------------------------------------------------------------------
+
+describe("invariant 1, PG-sourced: a register card's declaration can only SUBTRACT", () => {
+  beforeEach(async () => { await openTestDatabase(); });
+  afterEach(async () => { await closeTestDatabase(); });
+
+  test("a PG card declaring out-of-ceiling tools grants NOTHING — end to end through routeStage", async () => {
+    // Three match terms so this specialist out-specifies the committed
+    // implementer-ui card (two terms) and provably WINS the stage; winning the
+    // stage must still not widen anything.
+    await insertAgentRegisterVersion({
+      name: "pg-hostile", frontmatter: {
+        name: "pg-hostile", role: "implementer", match: "ui playwright gate:test",
+        tools: "[Bash(git push:*), Bash(gh pr merge:*), SendMessage, CronCreate]",
+      }, prompt: "pwn", contentHash: "h", createdBy: "test",
+    });
+    const route = routeStage("implementer", "implementer", listRoutableCards(), UI_FACTS);
+    expect(route.card).toBe("pg-hostile");         // the PG specialist was selected...
+    expect(route.specialist).toBe(true);
+    expect(route.tools).toEqual([]);               // ...and granted NOTHING it asked for
+    expect(route.unknownTools).toEqual(["Bash(git push:*)", "Bash(gh pr merge:*)", "SendMessage", "CronCreate"]);
+    expect(forbiddenToolViolations(route.tools)).toEqual([]);
+  });
+
+  test("every hostile declaration stored in the register resolves to a SUBSET of every ceiling", async () => {
+    for (const declared of HOSTILE_DECLARATIONS) {
+      await insertAgentRegisterVersion({
+        name: "pg-fuzz", frontmatter: { name: "pg-fuzz", tools: declared },
+        prompt: "p", contentHash: `h-${declared.length}-${Math.random()}`, createdBy: "test",
+      });
+      const roundTripped = cardTools("pg-fuzz");   // read back THROUGH the register
+      expect(roundTripped).toBe(declared);         // jsonb round trip is faithful
+      for (const [role, ceiling] of PRODUCTION_CEILINGS) {
+        const { tools } = resolveTools(ceiling, roundTripped);
+        for (const t of tools) {
+          expect(ceiling.includes(t), `role ${role}: PG-sourced "${declared}" produced "${t}"`).toBe(true);
+        }
+        expect(forbiddenToolViolations(tools)).toEqual([]);
+      }
+    }
+  });
+
+  test("fuzz: arbitrary PG-stored declaration strings all stay inside the ceiling", async () => {
+    // Same generator as the file-sourced fuzz above, but every string makes a
+    // real round trip: register write → jsonb → snapshot → getCard → cardTools.
+    const alphabet = "ReadWriteEditBashGlobGrep()[]*:,git push -force gh pr merge sh rm/\\'\"\n\t{}$;|&";
+    let seed = 0x5eed123;
+    const rand = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < 120; i++) {
+      let s = "";
+      const len = Math.floor(rand() * 60);
+      for (let j = 0; j < len; j++) s += alphabet[Math.floor(rand() * alphabet.length)];
+      const inserted = await insertAgentRegisterVersion({
+        name: "pg-fuzz", frontmatter: { name: "pg-fuzz", tools: s },
+        prompt: "p", contentHash: `h-${i}`, createdBy: "test",
+      });
+      expect(inserted?.version).toBe(i + 1);
+      const { tools } = resolveTools(IMPLEMENTER_TOOLS, cardTools("pg-fuzz"));
+      expect(new Set(tools).size).toBe(tools.length);                 // no duplicates
+      for (const t of tools) expect(IMPLEMENTER_TOOLS).toContain(t);  // ⊆ ceiling
+      expect(forbiddenToolViolations(tools)).toEqual([]);
+    }
+  }, 30_000);
 });

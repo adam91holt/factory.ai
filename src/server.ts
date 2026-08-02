@@ -7,6 +7,10 @@ import {
   projectsView, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
   proposeProjectPolicy, approvePolicyItem, rejectPolicyItem,
 } from "./project-config.ts";
+import {
+  registersView, saveRegisterEntry, rollbackRegisterVersion,
+  setSkillAttach, setSkillEnabledState, previewSkillAttach,
+} from "./register-manager.ts";
 import { getIssueDetail, getEpicDag, type IssueDetail, type EpicDagPayload } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
@@ -184,6 +188,11 @@ export function applyEvent(mission: MissionState, e: FactoryEvent): MissionState
           ...run.stages,
           {
             stage: e.stage, model: e.model, viaProxy: e.viaProxy, startedAt: e.at,
+            // Version pins (issue #16 WP3) — carried into the StageView so the
+            // run detail can show card@version; spread-conditional so events
+            // recorded before pinning existed fold byte-identically.
+            ...(e.card !== undefined ? { card: e.card } : {}),
+            ...(e.skills !== undefined ? { skills: e.skills } : {}),
             finishedAt: null, costUsd: 0, turns: 0, toolCalls: 0, lastActivity: "",
             resultText: "",
           },
@@ -449,6 +458,60 @@ export function handleProjectRoutes(url: URL, req: IncomingMessage, res: ServerR
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Register routes (issue #16 WP3): the PG agent/skill register surface —
+// version history + one-tap rollback, PG saves (append-only new versions),
+// skill attach editing and the carry preview. Same extraction pattern as
+// handleProjectRoutes so tests mount them on an ephemeral server and exercise
+// the REAL gate: every mutation goes through guardedJsonBody — the SAME
+// function as every other write route. File + git stays available ONLY as the
+// export action (the existing /catalog/save route).
+// ---------------------------------------------------------------------------
+export function handleRegisterRoutes(url: URL, req: IncomingMessage, res: ServerResponse): boolean {
+  const respond = (p: Promise<{ status: number; json: unknown }>, label: string): void => {
+    void p.then((result) => {
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.json));
+    }).catch((error: unknown) => {
+      console.error(`[dashboard] ${label} failed: ${error instanceof Error ? error.message : error}`);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `${label} failed` }));
+    });
+  };
+
+  if (url.pathname === "/registers") {
+    if (req.method !== "GET") {
+      res.writeHead(405, { "content-type": "application/json" });
+      res.end('{"error":"method not allowed"}');
+      return true;
+    }
+    // Same SPA/API split as /catalog and /projects.
+    if ((req.headers.accept ?? "").includes("text/html") && serveIndex(res)) return true;
+    respond(registersView(), "registers view");
+    return true;
+  }
+
+  const writes: Record<string, (body: unknown) => Promise<{ status: number; json: unknown }>> = {
+    "/registers/save": saveRegisterEntry,
+    "/registers/rollback": rollbackRegisterVersion,
+    "/registers/skill/attach": setSkillAttach,
+    "/registers/skill/enabled": setSkillEnabledState,
+    // Pure computation (no mutation), but it takes a JSON body — POSTing it
+    // through the same gate keeps every body-carrying route behind ONE guard.
+    "/registers/skill/preview": previewSkillAttach,
+  };
+  const write = writes[url.pathname];
+  if (write) {
+    void guardedJsonBody(req, res).then((guarded) => {
+      if (guarded === null) return; // refusal already written
+      respond(write(guarded.body), url.pathname);
+    });
+    return true;
+  }
+
+  return false;
+}
+
 /** Serve ui/dist/index.html if built. Returns false (nothing written) otherwise. */
 function serveIndex(res: ServerResponse): boolean {
   const index = join(UI_DIST, "index.html");
@@ -615,6 +678,10 @@ export async function startDashboard(): Promise<{
     // Project-config routes (issue #7): GET /projects plus the guarded write
     // routes — all mutations behind the same guardedJsonBody gate as above.
     if (handleProjectRoutes(url, req, res)) return;
+
+    // Register routes (issue #16 WP3): GET /registers plus the guarded PG
+    // register writes (save / rollback / attach / enabled / preview).
+    if (handleRegisterRoutes(url, req, res)) return;
 
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain" });

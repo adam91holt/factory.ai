@@ -1,8 +1,17 @@
 import type { RunView, StageView } from "../../lib/events";
 import type { StageUsage } from "../../lib/reconstruct";
 import { compact, secs, usd } from "../../lib/format";
+import { pinLabel } from "../../lib/registers";
 import { Tooltip } from "../ui/tooltip";
 import { cn } from "../../lib/utils";
+
+/** "card@v3 + design-skill@v2" — the version pins one stage ran with (issue
+ *  #16 WP3), or null for pre-pinning events / card-less stages. */
+function stagePins(s: StageView): string | null {
+  if (s.card === undefined) return null;
+  const skills = (s.skills ?? []).map(pinLabel);
+  return skills.length > 0 ? `${pinLabel(s.card)} + ${skills.join(" + ")}` : pinLabel(s.card);
+}
 
 function isCodex(s: StageView): boolean {
   return s.viaProxy || s.stage === "reviewer-codex";
@@ -40,6 +49,9 @@ export function StageDetail({
               <span className="font-mono text-[11.5px] text-fg">{s.stage}</span>
               <span className="min-w-0 flex-1 truncate text-right font-mono text-[10.5px] text-fg-faint">{s.model}</span>
             </div>
+            {stagePins(s) !== null && (
+              <div className="mt-0.5 truncate font-mono text-[9.5px] text-fg-faint">{stagePins(s)}</div>
+            )}
             <div className="mt-1.5 grid grid-cols-3 gap-x-2 gap-y-1 font-mono text-[10.5px] text-fg-dim">
               <span>{s.turns}t</span>
               <span>{wall !== null ? secs(wall) : "…"}</span>
@@ -81,6 +93,10 @@ export function StageDetail({
                     </span>
                     {s.degraded && <span className="text-[9.5px] text-parked">deg</span>}
                   </span>
+                  {/* card@version + carried skills — small, mono, unobtrusive */}
+                  {stagePins(s) !== null && (
+                    <span className="block font-mono text-[9.5px] text-fg-faint">{stagePins(s)}</span>
+                  )}
                 </td>
                 <td className="px-2 py-1 text-fg-faint">
                   {s.model || "—"}

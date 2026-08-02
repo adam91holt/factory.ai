@@ -5,7 +5,8 @@ import * as linear from "./linear.ts";
 import { ensureWorkspace, repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets, type StageResult } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
-import { renderPrompt, listRoutableCards } from "./catalog.ts";
+import { renderPrompt, cardPin, listRoutableCards } from "./catalog.ts";
+import type { StagePin } from "./skills.ts";
 import { roleTools } from "./routing.ts";
 import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
@@ -88,9 +89,16 @@ export function decideIntake(authorText: string, contract: { title: string; desc
   return { action: "needs_human", reason: "intake author produced neither clarifying questions nor a complete contract file" };
 }
 
-function forwardStage(issueKey: string): (e: AgentStreamEvent) => void {
+// `pins` (issue #16 WP2): stage label → version pins so run_stage_started
+// records the card version. intake-scout runs a raw inline prompt (no card) so
+// it carries no pin; no skills outside the pipeline's repo-facts context.
+function forwardStage(issueKey: string, pins?: ReadonlyMap<string, StagePin>): (e: AgentStreamEvent) => void {
   return (e) => {
-    if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
+    if (e.kind === "stage_started") {
+      const pin = pins?.get(e.stage);
+      bus.emit({ type: "run_stage_started", issueKey, stage: e.stage, model: e.model, viaProxy: e.viaProxy,
+        ...(pin ? { card: pin.card, skills: pin.skills } : {}) });
+    }
     else if (e.kind === "tool_use") bus.emit({ type: "run_tool_use", issueKey, stage: e.stage, tool: e.tool, detail: e.detail });
     else if (e.kind === "assistant_text") bus.emit({ type: "run_assistant_text", issueKey, stage: e.stage, text: e.text });
     else bus.emit({ type: "run_stage_finished", issueKey, stage: e.stage, costUsd: e.costUsd, turns: e.turns, wallSeconds: e.wallSeconds, resultText: e.resultText, ...(e.error ? { error: e.error } : {}), ...(e.modelUsage ? { modelUsage: e.modelUsage } : {}) });
@@ -106,7 +114,9 @@ export async function runIntake(issue: linear.Issue): Promise<void> {
   const repo = repoFromTicket(issue.description); // may be null — the contract may name it
   bus.emit({ type: "run_started", issueKey: issue.identifier, title: `[intake] ${issue.title}`, repo: repo ?? "", dryRun: config.dryRun });
   const deadline = Date.now() + config.caps.wallMinutesPerIssue * 60_000;
-  const onEvent = forwardStage(issue.identifier);
+  const onEvent = forwardStage(issue.identifier, new Map<string, StagePin>([
+    ["intake-author", { card: cardPin("intake-author"), skills: [] }],
+  ]));
   const stages: StageResult[] = [];
 
   const finish = (outcome: "authored" | "awaiting_answer" | "parked" | "needs_human", reason: string): void => {
