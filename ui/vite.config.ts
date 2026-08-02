@@ -47,6 +47,17 @@ export default defineConfig({
         bypass: (req) =>
           req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
       },
+      // /projects is the JSON read endpoint AND the SPA route (list + detail
+      // deep links); /projects/save|model|groundskeeper|policy/* are the POST
+      // writes. Identical split to /catalog.
+      "/projects": {
+        target: "http://127.0.0.1:8787",
+        bypass: (req) =>
+          req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
+      },
+      // /issue is JSON-only (ticket detail + the epic-DAG child reads) — never
+      // a SPA route, so no bypass needed.
+      "/issue": "http://127.0.0.1:8787",
     },
   },
 });

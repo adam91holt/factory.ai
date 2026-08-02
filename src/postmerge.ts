@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { config } from "./config.ts";
-import { loadProjects, type ProjectCard } from "./registry.ts";
+import { effectiveProjects, type ProjectCard } from "./registry.ts";
 import { claimDeploy, recordDeploy } from "./db.ts";
 import { ensureWorkspace, revertMerge as realRevertMerge, createRevertPr as realCreateRevertPr, type Workspace } from "./repos.ts";
 import { redactSecrets } from "./agents.ts";
@@ -144,7 +144,11 @@ export async function deployAndVerify(
  * after the first real deploy (one heavy op per tick, like groundskeeperTick). */
 export async function postMergeTick(): Promise<void> {
   if (!config.deployEnabled) return; // global kill-switch — no git, no shell, no spend
-  const cards = loadProjects().filter((c) => c.deployEnabled && c.deploy);
+  // effectiveProjects (issue #7): PG-approved authority overrides layered over
+  // the cards — deployEnabled can be governed from the approved policy rows,
+  // but the deploy/smoke COMMANDS still come only from the card file (see
+  // registry.ts applyPolicyOverlay), and no rows ⇒ cards exactly as before.
+  const cards = (await effectiveProjects()).filter((c) => c.deployEnabled && c.deploy);
   if (cards.length === 0) return;
 
   for (const card of cards) {
