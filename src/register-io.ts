@@ -70,11 +70,20 @@ export type RegisterSaveResult =
 
 const fail = (name: string, error: string): RegisterSaveResult => ({ ok: false, name, error });
 
+// Control characters have no place in a card or skill body: tab/newline/CR are
+// the only whitespace a prompt file legitimately carries, and a NUL byte is a
+// hard Postgres TEXT error that must be a clear 422 at the gate, never a
+// database failure mid-write.
+const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+
 /** Shared write-route validation. Returns an error string or null. */
 function contentViolation(name: string, content: string): string | null {
   if (!NAME_RE.test(name)) return `name must match ${NAME_RE}`;
   if (Buffer.byteLength(content, "utf8") > MAX_CONTENT_BYTES) {
     return `content exceeds the ${MAX_CONTENT_BYTES / 1024}KB cap`;
+  }
+  if (CONTROL_CHAR_RE.test(content)) {
+    return "content contains control characters (only tab, newline and carriage return are allowed)";
   }
   const scan = redactSecrets(content);
   if (scan.found > 0) return `content contains ${scan.found} secret-like string(s)`;
@@ -96,7 +105,7 @@ export async function saveAgentRegisterVersionFromContent(name: string, content:
     return { ok: true, name, version: active.version, unchanged: true };
   }
   const inserted = await insertAgentRegisterVersion({ name, frontmatter, prompt, contentHash, createdBy });
-  if (!inserted) return fail(name, "register write refused (closed store, validation, or a lost concurrent-write race)");
+  if (!inserted) return fail(name, "register write refused (closed store, a database error, or a concurrent write — see the daemon log)");
   return { ok: true, name, version: inserted.version, unchanged: false };
 }
 
@@ -117,7 +126,7 @@ export async function saveSkillRegisterVersionFromContent(name: string, content:
   const inserted = await insertSkillRegisterVersion({
     name, description: frontmatter.description ?? "", content, attach: active?.attach ?? {}, contentHash, createdBy,
   });
-  if (!inserted) return fail(name, "register write refused (closed store, validation, or a lost concurrent-write race)");
+  if (!inserted) return fail(name, "register write refused (closed store, a database error, or a concurrent write — see the daemon log)");
   return { ok: true, name, version: inserted.version, unchanged: false };
 }
 

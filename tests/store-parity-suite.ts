@@ -253,6 +253,46 @@ export function registerStoreParitySuite(
         await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, TRUE)", ["other", 1]);
       });
 
+      test("atomic register swap — a data-modifying CTE is one statement on both drivers", async () => {
+        // insertAgentRegisterVersion / setRegisterEnabled run deactivate +
+        // insert (or demote + activate) as ONE statement via a data-modifying
+        // CTE, so a failure anywhere leaves the register's active row standing.
+        // Both drivers must (a) execute the CTE before the main statement,
+        // (b) report the MAIN statement's affected count from exec(), and
+        // (c) roll the CTE's update back when the main statement fails.
+        await s.exec("DELETE FROM parity_reg");
+        await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, TRUE)", ["card", 1]);
+        await s.exec("INSERT INTO parity_reg (name, version, enabled) VALUES ($1, $2, FALSE)", ["card", 2]);
+
+        // (a)+(b): demote-then-activate in one statement; exec() must report
+        // the OUTER update's count — setRegisterEnabled returns `changed > 0`.
+        const swapped = await s.exec(
+          `WITH demoted AS (
+             UPDATE parity_reg SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2 RETURNING id
+           )
+           UPDATE parity_reg SET enabled = TRUE WHERE name = $1 AND version = $2 AND (SELECT COUNT(*) FROM demoted) >= 0`,
+          ["card", 2]);
+        expect(swapped).toBe(1);
+        const active = await s.query<{ version: unknown }>(
+          "SELECT version::int AS version FROM parity_reg WHERE name = $1 AND enabled", ["card"]);
+        expect(active.map((r) => r.version)).toEqual([2]);
+
+        // (c): a failing INSERT (NUL byte in TEXT — a genuine server-side
+        // error) must roll back the CTE's deactivate with it.
+        await expect(s.query(
+          `WITH deactivated AS (
+             UPDATE parity_reg SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
+           )
+           INSERT INTO parity_reg (name, version, enabled)
+           SELECT $2, 1, TRUE WHERE (SELECT COUNT(*) FROM deactivated) >= 0
+           RETURNING id::float8 AS id`,
+          ["card", `bad${String.fromCharCode(0)}name`]),
+        ).rejects.toThrow();
+        const survivor = await s.query<{ version: unknown }>(
+          "SELECT version::int AS version FROM parity_reg WHERE name = $1 AND enabled", ["card"]);
+        expect(survivor.map((r) => r.version)).toEqual([2]); // still active — nothing half-applied
+      });
+
       test("ON CONFLICT DO NOTHING reports 0 affected — restorePushbackFeedback's contract", async () => {
         // restorePushbackFeedback returns `changed > 0`: a restore must never
         // overwrite a NEWER directive the owner recorded during the run. The

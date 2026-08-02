@@ -190,6 +190,32 @@ describe("register saves are append-only PG versions; rollback is re-enable", ()
     expect((await post("/registers/rollback", { kind: "agent", name: "x", version: 0 })).status).toBe(400);
   });
 
+  test("a NUL-byte save cannot deactivate the active version — refused at the gate, register and snapshot agree", async () => {
+    const nul = String.fromCharCode(0);
+    await post("/registers/save", { kind: "agent", name: "victim", content: agentCard("victim", "GOOD PROMPT v1") });
+    expect(getCard("victim")?.prompt).toBe("GOOD PROMPT v1");
+
+    // The confirmed exploit shape: passes NAME_RE, the 64KB cap and the secret
+    // scan, then (before the fix) died inside Postgres AFTER the active row had
+    // been deactivated. Now it is a clear 422 and NOTHING changes.
+    const res = await post("/registers/save", { kind: "agent", name: "victim", content: agentCard("victim", `EVIL${nul}PROMPT`) });
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toContain("control character");
+
+    // The register still has an ACTIVE v1 (nothing was deactivated)...
+    expect((await getActiveAgentRegisterRow("victim"))?.version).toBe(1);
+    // ...and the pipeline-facing snapshot agrees with the DB — the two
+    // surfaces can no longer disagree after a failed write.
+    expect(getCard("victim")?.prompt).toBe("GOOD PROMPT v1");
+    expect((await getRegisters()).agents.find((a) => a.name === "victim")?.activeVersion).toBe(1);
+
+    // Skill twin.
+    await post("/registers/save", { kind: "skill", name: "vskill", content: skillCard("vskill", "good body") });
+    const sres = await post("/registers/save", { kind: "skill", name: "vskill", content: skillCard("vskill", `evil${nul}body`) });
+    expect(sres.status).toBe(422);
+    expect((await getActiveSkillRegisterRow("vskill"))?.version).toBe(1);
+  });
+
   test("secret-like content is a HARD reject over the wire — nothing lands in the register", async () => {
     const secret = agentCard("leaky", `use ${process.env.LINEAR_API_KEY} for auth`);
     const res = await post("/registers/save", { kind: "agent", name: "leaky", content: secret });
@@ -237,6 +263,61 @@ describe("agent routing declarations are locked on the register save route too",
     const res = await post("/registers/save", { kind: "agent", name: "implementer", content: card });
     expect(res.status).toBe(422);
     expect(((await res.json()) as { error: string }).error).toContain("TotallyNotATool");
+  });
+
+  test("ROLLBACK cannot re-point routing either: a target version whose role:/match: differ from the baseline → 422", async () => {
+    // Seed history the way it really arises: the importer (daemon-side,
+    // trusted) wrote a specialist v1, then the operator decommissioned it in
+    // git and re-imported — v2 declares NO routing.
+    const { insertAgentRegisterVersion } = await import("../src/db.ts");
+    await insertAgentRegisterVersion({
+      name: "spec-card", frontmatter: { name: "spec-card", role: "implementer", match: "ui" },
+      prompt: "p1", contentHash: "h1", createdBy: "import",
+    });
+    await insertAgentRegisterVersion({
+      name: "spec-card", frontmatter: { name: "spec-card" },
+      prompt: "p2", contentHash: "h2", createdBy: "import",
+    });
+
+    // Before the fix this 200'd and re-minted the specialist from the browser.
+    const res = await post("/registers/rollback", { kind: "agent", name: "spec-card", version: 1 });
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toMatch(/routing declaration/);
+    expect((await getActiveAgentRegisterRow("spec-card"))?.version).toBe(2);
+  });
+
+  test("ROLLBACK cannot restore a historical tools: grant that a later version narrowed", async () => {
+    const { insertAgentRegisterVersion } = await import("../src/db.ts");
+    await insertAgentRegisterVersion({
+      name: "implementer", frontmatter: { name: "implementer", tools: "[Read, Grep]" },
+      prompt: "p1", contentHash: "h1", createdBy: "import",
+    });
+    // The operator later narrowed the grant to least privilege.
+    await insertAgentRegisterVersion({
+      name: "implementer", frontmatter: { name: "implementer", tools: "[Read]" },
+      prompt: "p2", contentHash: "h2", createdBy: "import",
+    });
+
+    const res = await post("/registers/rollback", { kind: "agent", name: "implementer", version: 1 });
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toContain("tools");
+    expect((await getActiveAgentRegisterRow("implementer"))?.version).toBe(2);
+  });
+
+  test("a rollback that KEEPS the baseline's routing declarations is still allowed (prompt-only history)", async () => {
+    const { insertAgentRegisterVersion } = await import("../src/db.ts");
+    await insertAgentRegisterVersion({
+      name: "spec-keep", frontmatter: { name: "spec-keep", role: "implementer", match: "ui" },
+      prompt: "p1", contentHash: "h1", createdBy: "import",
+    });
+    await insertAgentRegisterVersion({
+      name: "spec-keep", frontmatter: { name: "spec-keep", role: "implementer", match: "ui" },
+      prompt: "p2", contentHash: "h2", createdBy: "import",
+    });
+
+    const res = await post("/registers/rollback", { kind: "agent", name: "spec-keep", version: 1 });
+    expect(res.status).toBe(200);
+    expect((await getActiveAgentRegisterRow("spec-keep"))?.prompt).toBe("p1");
   });
 });
 

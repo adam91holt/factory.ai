@@ -240,13 +240,17 @@ export function validateAgentCardRouting(
 /** The pure core of validateAgentCardRouting: compare an incoming frontmatter
  *  against a trusted BASELINE declaration (the on-disk file for /catalog/save;
  *  the active register row for the PG register save route — issue #16 WP3).
- *  Extracted rather than duplicated so the two browser-reachable write paths
+ *  Extracted rather than duplicated so the browser-reachable write paths
  *  cannot drift: whatever routing edit the file route refuses, the register
- *  route refuses identically. */
+ *  route refuses identically. `opts.lockTools` additionally pins the `tools:`
+ *  line itself to the baseline (beyond the ceiling check) — used by register
+ *  ROLLBACK, where re-enabling a historical version must not silently undo a
+ *  later least-privilege narrowing from the browser. */
 export function validateAgentRoutingAgainst(
   name: string,
   incoming: Record<string, string>,
   baseline: Record<string, string>,
+  opts: { lockTools?: boolean } = {},
 ): string | null {
   const norm = (v: string | undefined): string => (v ?? "").trim().replace(/^\[/, "").replace(/\]$/, "")
     .split(/[,\s]+/).filter(Boolean).join(" ");
@@ -254,6 +258,9 @@ export function validateAgentRoutingAgainst(
     if (norm(incoming[key]) !== norm(baseline[key])) {
       return `refusing to change an agent card's \`${key}:\` routing declaration from the UI (the trusted baseline has ${JSON.stringify(baseline[key] ?? null)}) — routing decides which agent runs a stage, so it is an on-disk, git-committed edit only. The prompt body is freely editable here.`;
     }
+  }
+  if (opts.lockTools && norm(incoming.tools) !== norm(baseline.tools)) {
+    return `refusing to change an agent card's \`tools:\` grant from the trusted baseline (${JSON.stringify(baseline.tools ?? null)}) here — restoring a historical tool grant would undo a later narrowing, so make it a fresh save (file or register) instead.`;
   }
   // Which ceiling this card's tools are measured against: a specialist's
   // declared role, else the card's own name when that is a wired stage.

@@ -1867,52 +1867,96 @@ export async function listActiveSkillRegisterRows(): Promise<SkillRegisterRow[]>
 // --- Writes (append-only versions; exactly-one-active is the DB's invariant). ---
 
 /** Structural validation shared by both insert helpers. Returns an error string
- *  or null. The cap and charset live in code, not env (CLAUDE.md). */
-function registerWriteViolation(name: string, contentBytes: number): string | null {
+ *  or null. The cap and charset live in code, not env (CLAUDE.md). `texts` are
+ *  the values bound to TEXT columns: Postgres rejects a NUL byte in TEXT at the
+ *  database, so refusing it here turns a would-be DB error into a clear
+ *  refusal before anything is issued. (register-io's contentViolation rejects
+ *  the whole control-character class at the user-facing write gate; this is
+ *  the structural backstop for direct callers.) */
+function registerWriteViolation(name: string, contentBytes: number, texts: string[]): string | null {
   if (!REGISTER_NAME_RE.test(name)) return `register name ${JSON.stringify(name)} fails the charset lock`;
   if (contentBytes > MAX_REGISTER_CONTENT_BYTES) return `register content exceeds the ${MAX_REGISTER_CONTENT_BYTES / 1024}KB cap`;
+  if (texts.some((t) => t.includes("\u0000"))) return "register content contains a NUL byte";
   return null;
 }
 
-/** Append a NEW version of an agent card and make it the active one. The claim
- *  pattern (deactivate-then-insert, retried on the unique-index conflict a
- *  concurrent writer causes) keeps exactly-one-active true under any
- *  interleaving — the partial index is the invariant, this loop is just how a
- *  loser converges. Returns {id, version}, or null (closed store / validation
- *  failure / lost the race MAX_REGISTER_WRITE_ATTEMPTS times). */
+/** True when a DB error is the unique-index conflict a concurrent register
+ *  writer causes (SQLSTATE 23505) — the ONLY error class the claim loops
+ *  retry. Every other database error (NUL in a jsonb escape, statement
+ *  timeout, disk full, …) is reported as what it is and never as "lost a
+ *  race". Bun's client exposes `code`; PGlite surfaces only the message. */
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const e = error as { code?: unknown; message?: unknown };
+  if (e.code === "23505") return true;
+  return typeof e.message === "string" && e.message.includes("duplicate key");
+}
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Append a NEW version of an agent card and make it the active one. The
+ *  deactivate + insert run as ONE statement (the data-modifying CTE), so they
+ *  are atomic: a failed insert — NUL in a jsonb escape, timeout, disk full,
+ *  anything — rolls the deactivate back with it and the current active version
+ *  keeps standing. The `WHERE (SELECT COUNT(*) FROM deactivated) >= 0` clause
+ *  is always true; its job is to make the INSERT depend on the CTE so Postgres
+ *  completes the deactivate before the insert's unique check runs. Only the
+ *  unique-index conflict a concurrent writer causes is retried — the partial
+ *  index is the invariant, the loop is just how a loser converges. Returns
+ *  {id, version}, or null (closed store / validation failure / database error
+ *  / lost the race MAX_REGISTER_WRITE_ATTEMPTS times). */
 export async function insertAgentRegisterVersion(row: {
   name: string; frontmatter: Record<string, string>; prompt: string;
   contentHash: string; createdBy: string;
 }): Promise<{ id: number; version: number } | null> {
   if (!store) return null;
   const fmJson = JSON.stringify(row.frontmatter);
-  const violation = registerWriteViolation(row.name, Buffer.byteLength(row.prompt, "utf8") + Buffer.byteLength(fmJson, "utf8"));
+  const violation = registerWriteViolation(
+    row.name,
+    Buffer.byteLength(row.prompt, "utf8") + Buffer.byteLength(fmJson, "utf8"),
+    [row.prompt, row.contentHash, row.createdBy]);
   if (violation) {
     console.error(`[db] agent register write refused: ${violation}`);
     return null;
   }
   const now = Date.now();
-  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
-    await store.exec("UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled", [row.name]);
-    try {
-      const rows = await store.query<{ id: unknown; version: unknown }>(
-        `INSERT INTO agent_register (name, version, frontmatter, prompt, content_hash, enabled, created_at, created_by)
-         SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::jsonb, $3, $4, TRUE, $5, $6
-         RETURNING id::float8 AS id, version::int AS version`,
-        [row.name, fmJson, row.prompt, row.contentHash, now, row.createdBy]);
-      const id = num(rows[0]?.id);
-      if (id > 0) {
-        await refreshRegisterSnapshot();
-        return { id, version: num(rows[0]?.version) };
+  try {
+    for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+      try {
+        const rows = await store.query<{ id: unknown; version: unknown }>(
+          `WITH deactivated AS (
+             UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
+           )
+           INSERT INTO agent_register (name, version, frontmatter, prompt, content_hash, enabled, created_at, created_by)
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM agent_register WHERE name = $1), 0) + 1)::int, $2::jsonb, $3, $4, TRUE, $5, $6
+           WHERE (SELECT COUNT(*) FROM deactivated) >= 0
+           RETURNING id::float8 AS id, version::int AS version`,
+          [row.name, fmJson, row.prompt, row.contentHash, now, row.createdBy]);
+        const id = num(rows[0]?.id);
+        if (id > 0) return { id, version: num(rows[0]?.version) };
+        return null; // statement inserted nothing — refuse, do not claim a race
+      } catch (error) {
+        // The statement is atomic, so a failure changed NOTHING. Retry only
+        // the conflict a concurrent writer causes; report anything else as
+        // the database error it is.
+        if (!isUniqueViolation(error)) {
+          console.error(`[db] insertAgentRegisterVersion failed for ${row.name} (database error, nothing written): ${errorText(error)}`);
+          return null;
+        }
       }
-    } catch { /* one-active or (name,version) conflict — a concurrent writer; loop */ }
+    }
+    console.error(`[db] insertAgentRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
+    return null;
+  } finally {
+    // Belt-and-braces: the snapshot must never outlive the rows it mirrors,
+    // whatever path the write took out of this function.
+    await refreshRegisterSnapshot();
   }
-  console.error(`[db] insertAgentRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
-  return null;
 }
 
-/** Append a NEW version of a skill pack and make it the active one. Same claim
- *  discipline as insertAgentRegisterVersion. `attach` must be a plain object
+/** Append a NEW version of a skill pack and make it the active one. Same
+ *  atomic-statement + retry-only-conflicts discipline as
+ *  insertAgentRegisterVersion. `attach` must be a plain object
  *  ({roles/projects/match} selector) — it is stored verbatim as jsonb. */
 export async function insertSkillRegisterVersion(row: {
   name: string; description: string; content: string; attach: Record<string, unknown>;
@@ -1920,29 +1964,42 @@ export async function insertSkillRegisterVersion(row: {
 }): Promise<{ id: number; version: number } | null> {
   if (!store) return null;
   const attachJson = JSON.stringify(row.attach);
-  const violation = registerWriteViolation(row.name, Buffer.byteLength(row.content, "utf8") + Buffer.byteLength(attachJson, "utf8"));
+  const violation = registerWriteViolation(
+    row.name,
+    Buffer.byteLength(row.content, "utf8") + Buffer.byteLength(attachJson, "utf8"),
+    [row.content, row.description, row.contentHash, row.createdBy]);
   if (violation) {
     console.error(`[db] skill register write refused: ${violation}`);
     return null;
   }
   const now = Date.now();
-  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
-    await store.exec("UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled", [row.name]);
-    try {
-      const rows = await store.query<{ id: unknown; version: unknown }>(
-        `INSERT INTO skill_register (name, version, description, content, attach, content_hash, enabled, created_at, created_by)
-         SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::jsonb, $5, TRUE, $6, $7
-         RETURNING id::float8 AS id, version::int AS version`,
-        [row.name, row.description, row.content, attachJson, row.contentHash, now, row.createdBy]);
-      const id = num(rows[0]?.id);
-      if (id > 0) {
-        await refreshRegisterSnapshot();
-        return { id, version: num(rows[0]?.version) };
+  try {
+    for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+      try {
+        const rows = await store.query<{ id: unknown; version: unknown }>(
+          `WITH deactivated AS (
+             UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled RETURNING id
+           )
+           INSERT INTO skill_register (name, version, description, content, attach, content_hash, enabled, created_at, created_by)
+           SELECT $1, (COALESCE((SELECT MAX(version) FROM skill_register WHERE name = $1), 0) + 1)::int, $2, $3, $4::jsonb, $5, TRUE, $6, $7
+           WHERE (SELECT COUNT(*) FROM deactivated) >= 0
+           RETURNING id::float8 AS id, version::int AS version`,
+          [row.name, row.description, row.content, attachJson, row.contentHash, now, row.createdBy]);
+        const id = num(rows[0]?.id);
+        if (id > 0) return { id, version: num(rows[0]?.version) };
+        return null; // statement inserted nothing — refuse, do not claim a race
+      } catch (error) {
+        if (!isUniqueViolation(error)) {
+          console.error(`[db] insertSkillRegisterVersion failed for ${row.name} (database error, nothing written): ${errorText(error)}`);
+          return null;
+        }
       }
-    } catch { /* conflict — loop */ }
+    }
+    console.error(`[db] insertSkillRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
+    return null;
+  } finally {
+    await refreshRegisterSnapshot();
   }
-  console.error(`[db] insertSkillRegisterVersion lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${row.name} — a concurrent write stands`);
-  return null;
 }
 
 /** Flip one version's enabled flag. enabled=true is ROLLBACK — "make version N
@@ -1960,12 +2017,29 @@ async function setRegisterEnabled(table: "agent_register" | "skill_register", na
   const probeSql = table === "agent_register"
     ? "SELECT 1 AS n FROM agent_register WHERE name = $1 AND version = $2"
     : "SELECT 1 AS n FROM skill_register WHERE name = $1 AND version = $2";
-  const disableOthersSql = table === "agent_register"
-    ? "UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2"
-    : "UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND enabled AND version <> $2";
+  // Demote-others + enable-target as ONE atomic statement. The demote CTE
+  // carries its own EXISTS guard on the target version, so even mid-statement
+  // the current active version can never be demoted in favour of nothing; the
+  // always-true `(SELECT COUNT(*) FROM demoted) >= 0` clause makes the enable
+  // depend on the CTE so the demote completes before the unique check runs.
+  // A failure anywhere rolls the whole statement back — no half-applied swap.
   const enableSql = table === "agent_register"
-    ? "UPDATE agent_register SET enabled = TRUE WHERE name = $1 AND version = $2"
-    : "UPDATE skill_register SET enabled = TRUE WHERE name = $1 AND version = $2";
+    ? `WITH demoted AS (
+         UPDATE agent_register SET enabled = FALSE
+         WHERE name = $1 AND enabled AND version <> $2
+           AND EXISTS (SELECT 1 FROM agent_register WHERE name = $1 AND version = $2)
+         RETURNING id
+       )
+       UPDATE agent_register SET enabled = TRUE
+       WHERE name = $1 AND version = $2 AND (SELECT COUNT(*) FROM demoted) >= 0`
+    : `WITH demoted AS (
+         UPDATE skill_register SET enabled = FALSE
+         WHERE name = $1 AND enabled AND version <> $2
+           AND EXISTS (SELECT 1 FROM skill_register WHERE name = $1 AND version = $2)
+         RETURNING id
+       )
+       UPDATE skill_register SET enabled = TRUE
+       WHERE name = $1 AND version = $2 AND (SELECT COUNT(*) FROM demoted) >= 0`;
   const disableSql = table === "agent_register"
     ? "UPDATE agent_register SET enabled = FALSE WHERE name = $1 AND version = $2"
     : "UPDATE skill_register SET enabled = FALSE WHERE name = $1 AND version = $2";
@@ -1973,24 +2047,37 @@ async function setRegisterEnabled(table: "agent_register" | "skill_register", na
   // a no-op refusal, never "deactivate the current version and activate nothing".
   const probe = await store.query(probeSql, [name, version]);
   if (probe.length === 0) return false;
-  if (!enabled) {
-    await store.exec(disableSql, [name, version]);
-    await refreshRegisterSnapshot();
-    return true;
-  }
-  for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
-    await store.exec(disableOthersSql, [name, version]);
-    try {
-      const changed = await store.exec(enableSql, [name, version]);
-      if (changed > 0) {
-        await refreshRegisterSnapshot();
+  try {
+    if (!enabled) {
+      try {
+        await store.exec(disableSql, [name, version]);
         return true;
+      } catch (error) {
+        console.error(`[db] setRegisterEnabled failed for ${table}/${name}@${version} (database error, nothing changed): ${errorText(error)}`);
+        return false;
       }
-      return false; // the row vanished between probe and update — refuse
-    } catch { /* a concurrent activation won the index — supersede it and retry */ }
+    }
+    for (let attempt = 0; attempt < MAX_REGISTER_WRITE_ATTEMPTS; attempt++) {
+      try {
+        const changed = await store.exec(enableSql, [name, version]);
+        if (changed > 0) return true;
+        return false; // the row vanished between probe and update — refuse (nothing demoted: the CTE guard saw it gone too)
+      } catch (error) {
+        // Atomic statement: a failure changed nothing. Retry only a concurrent
+        // activation's unique-index conflict; report anything else honestly.
+        if (!isUniqueViolation(error)) {
+          console.error(`[db] setRegisterEnabled failed for ${table}/${name}@${version} (database error, nothing changed): ${errorText(error)}`);
+          return false;
+        }
+      }
+    }
+    console.error(`[db] setRegisterEnabled lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${table}/${name}@${version}`);
+    return false;
+  } finally {
+    // The snapshot must never outlive the rows it mirrors — refresh on every
+    // exit path once any mutating statement was issued.
+    await refreshRegisterSnapshot();
   }
-  console.error(`[db] setRegisterEnabled lost the one-active race ${MAX_REGISTER_WRITE_ATTEMPTS} times for ${table}/${name}@${version}`);
-  return false;
 }
 
 export async function setAgentRegisterEnabled(name: string, version: number, enabled: boolean): Promise<boolean> {

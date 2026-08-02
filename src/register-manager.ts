@@ -205,6 +205,21 @@ export async function registersView(): Promise<RouteResult> {
 // Saves (append-only new version — PG, never a file).
 // ---------------------------------------------------------------------------
 
+/** The trusted routing baseline for an agent name: the ACTIVE register row
+ *  when there is one (it is what routing actually reads), else the on-disk,
+ *  git-committed file the register would fall back to. Callers must have
+ *  charset-locked `name` first, so the file path cannot traverse. */
+async function agentRoutingBaseline(name: string): Promise<Record<string, string>> {
+  const active = await getActiveAgentRegisterRow(name);
+  if (active) return active.frontmatter;
+  try {
+    const file = fileURLToPath(new URL(`../agents/${name}.md`, import.meta.url));
+    return parseCardText(readFileSync(file, "utf8")).frontmatter;
+  } catch {
+    return {}; // new card — declares nothing
+  }
+}
+
 export async function saveRegisterEntry(input: unknown): Promise<RouteResult> {
   if (typeof input !== "object" || input === null) return bad(400, "body must be a JSON object");
   const { kind, name, content } = input as Record<string, unknown>;
@@ -227,23 +242,9 @@ export async function saveRegisterEntry(input: unknown): Promise<RouteResult> {
   if (kind === "skill" && !frontmatter.description) return bad(422, "skill frontmatter is missing a description field");
 
   if (kind === "agent") {
-    // Routing lock, identical to /catalog/save: baseline = the ACTIVE register
-    // row when there is one (it is what routing actually reads), else the
-    // on-disk file the register would fall back to. Same pure validator, so
-    // the two write paths refuse identically.
-    const active = await getActiveAgentRegisterRow(name);
-    let baseline: Record<string, string>;
-    if (active) {
-      baseline = active.frontmatter;
-    } else {
-      baseline = {};
-      try {
-        // `name` is charset-locked above, so this path cannot traverse.
-        const file = fileURLToPath(new URL(`../agents/${name}.md`, import.meta.url));
-        baseline = parseCardText(readFileSync(file, "utf8")).frontmatter;
-      } catch { /* new card — declares nothing */ }
-    }
-    const violation = validateAgentRoutingAgainst(name, frontmatter, baseline);
+    // Routing lock, identical to /catalog/save: same trusted baseline, same
+    // pure validator, so the two write paths refuse identically.
+    const violation = validateAgentRoutingAgainst(name, frontmatter, await agentRoutingBaseline(name));
     if (violation) return bad(422, violation);
   }
 
@@ -266,6 +267,19 @@ export async function rollbackRegisterVersion(input: unknown): Promise<RouteResu
   if (typeof name !== "string" || !NAME_RE.test(name)) return bad(400, `name must match ${NAME_RE}`);
   if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
     return bad(400, "version must be a positive integer");
+  }
+  if (kind === "agent") {
+    // The same routing lock as the save route, applied to the version being
+    // RE-ENABLED: a rollback re-points which card serves a stage just as
+    // surely as a save does, so a target version whose `role:`/`match:`
+    // differs from the trusted baseline — or whose `tools:` line differs
+    // (undoing a later least-privilege narrowing) — is refused. Without this,
+    // rolling back to a historical importer-sourced version would mint from
+    // the browser exactly the routing authority /registers/save refuses.
+    const target = (await listAgentRegisterRows(name)).find((r) => r.version === version);
+    if (!target) return bad(404, `no agent register version ${name}@${version} to enable`);
+    const violation = validateAgentRoutingAgainst(name, target.frontmatter, await agentRoutingBaseline(name), { lockTools: true });
+    if (violation) return bad(422, violation);
   }
   const ok = kind === "agent"
     ? await setAgentRegisterEnabled(name, version, true)
@@ -349,7 +363,7 @@ export async function setSkillAttach(input: unknown): Promise<RouteResult> {
     contentHash: skillContentHash(active.content),
     createdBy: "dashboard",
   });
-  if (!inserted) return bad(500, "register write refused (closed store or a lost concurrent-write race)");
+  if (!inserted) return bad(500, "register write refused (closed store or a database error — see the daemon log)");
   return { status: 200, json: { ok: true, name, version: inserted.version, attach: validated.attach } };
 }
 
@@ -365,12 +379,12 @@ export async function setSkillEnabledState(input: unknown): Promise<RouteResult>
     if (active) return { status: 200, json: { ok: true, name, version: active.version, enabled: true } };
     const newest = rows.reduce((a, b) => (b.version > a.version ? b : a));
     const ok = await setSkillRegisterEnabled(name, newest.version, true);
-    if (!ok) return bad(500, "enable refused (closed store or a lost concurrent-write race)");
+    if (!ok) return bad(500, "enable refused (closed store or a database error — see the daemon log)");
     return { status: 200, json: { ok: true, name, version: newest.version, enabled: true } };
   }
   if (!active) return { status: 200, json: { ok: true, name, version: null, enabled: false } };
   const ok = await setSkillRegisterEnabled(name, active.version, false);
-  if (!ok) return bad(500, "disable refused (closed store or a lost concurrent-write race)");
+  if (!ok) return bad(500, "disable refused (closed store or a database error — see the daemon log)");
   return { status: 200, json: { ok: true, name, version: null, enabled: false } };
 }
 

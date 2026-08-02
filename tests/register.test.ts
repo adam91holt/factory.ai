@@ -171,6 +171,48 @@ describe("register row helpers (db.ts)", () => {
     expect(await listSkillRegisterRows()).toEqual([]);
   });
 
+  test("a write that FAILS at the database leaves the active version standing and the snapshot in sync (atomic deactivate+insert)", async () => {
+    const v1 = await insertAgentRegisterVersion(CARD("GOOD PROMPT v1"));
+    expect(v1?.version).toBe(1);
+
+    // A frontmatter value with a NUL byte passes the structural gate (Postgres
+    // only sees it as the escaped-NUL jsonb sequence) and fails INSIDE the database -
+    // the representative of the whole DB-side error class (statement timeout,
+    // disk full, …). The atomic statement must roll the deactivate back with
+    // the failed insert: the register keeps its active row.
+    const nul = String.fromCharCode(0);
+    const failed = await insertAgentRegisterVersion({
+      ...CARD("EVIL PROMPT"), frontmatter: { name: "reg-card", evil: `x${nul}y` },
+    });
+    expect(failed).toBeNull();
+
+    const active = await getActiveAgentRegisterRow("reg-card");
+    expect(active?.version).toBe(1);
+    expect(active?.prompt).toBe("GOOD PROMPT v1");
+    expect((await listAgentRegisterRows("reg-card")).map((r) => [r.version, r.enabled])).toEqual([[1, true]]);
+    // The snapshot the daemon serves from must agree with the DB — the failed
+    // write may never leave a stale row behind.
+    expect(activeAgentRegisterSnapshot().get("reg-card")?.prompt).toBe("GOOD PROMPT v1");
+
+    // A raw NUL in the prompt itself is refused at the structural gate before
+    // any SQL is issued — same outcome, clearer error.
+    expect(await insertAgentRegisterVersion(CARD(`EVIL${nul}PROMPT`))).toBeNull();
+    expect((await getActiveAgentRegisterRow("reg-card"))?.version).toBe(1);
+
+    // Skill twin: a NUL inside the attach jsonb fails at the database; the
+    // active version and its snapshot entry both keep standing.
+    const s1 = await insertSkillRegisterVersion({
+      name: "reg-skill", description: "d", content: "GOOD SKILL v1", attach: {}, contentHash: "h1", createdBy: "t",
+    });
+    expect(s1?.version).toBe(1);
+    expect(await insertSkillRegisterVersion({
+      name: "reg-skill", description: "d", content: "EVIL", attach: { evil: `x${nul}y` }, contentHash: "h2", createdBy: "t",
+    })).toBeNull();
+    expect((await getActiveSkillRegisterRow("reg-skill"))?.content).toBe("GOOD SKILL v1");
+    expect((await listSkillRegisterRows("reg-skill")).map((r) => [r.version, r.enabled])).toEqual([[1, true]]);
+    expect(activeSkillRegisterSnapshot().get("reg-skill")?.content).toBe("GOOD SKILL v1");
+  });
+
   test("the snapshot mirrors the active rows and the generation bumps on every write", async () => {
     const g0 = registerGeneration();
     await insertAgentRegisterVersion(CARD("prompt one"));
