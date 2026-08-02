@@ -234,6 +234,14 @@ export async function bootstrapProject(issue: linear.Issue): Promise<void> {
     // every other Linear write (the idea is untrusted-delimited AND scrubbed).
     const epicDesc = redactSecrets(epic.description).clean.slice(0, 40_000);
     const epicId = await linear.createIssue(issue.teamKey, epic.title, epicDesc).catch((e) => { console.error(`[${issue.identifier}] build-epic create failed: ${e}`); return null; });
+    // Child-link the build epic so the bootstrap ticket has a closeable
+    // lifecycle: steward/reconcile close a parent when its children are all
+    // terminal, and an unlinked epic means "no children" = never closes
+    // (live-found: FAC-54). Best-effort — a failed link is the old behaviour.
+    if (epicId) {
+      const linked = await linear.setIssueParent(epicId, issue).catch(() => false);
+      if (!linked) console.error(`[${issue.identifier}] could not child-link build epic ${epicId} — the bootstrap ticket will need a manual close`);
+    }
     const card = buildProjectCard(plan);
     await linear.postComment(issue, [
       linear.SENTINEL, "",
