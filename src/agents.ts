@@ -414,6 +414,14 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
     LOGNAME: process.env.LOGNAME ?? process.env.USER ?? "",
     TMPDIR: process.env.TMPDIR ?? "/tmp",
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+    // Reasoning-model headroom (owner decision 2026-08-02): the whole test
+    // roster (qwen3.8 / deepseek-flash) reasons before answering, and the
+    // SDK's output cap is shared between thinking and answer — a tight cap
+    // returns an EMPTY result rather than an error (measured: 24 tokens →
+    // "", 600 → correct answer + reasoning). The whitelist otherwise drops
+    // this var, so without the pass-through the SDK default silently applies
+    // to every worker. Operator-set via .env; 64000 default.
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ?? "64000",
   };
   if (viaProxy) {
     env.ANTHROPIC_BASE_URL = config.proxyBaseUrl;
