@@ -555,10 +555,18 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
       ...(out.error ? { error: out.error } : {}), ...(modelUsage ? { modelUsage } : {}) });
     return out;
   } catch (error) {
+    // When WE aborted the stage (claim-loss sweep, deadline, kill switch),
+    // the SDK throws its own generic "Claude Code process aborted by user" —
+    // which routed a claim-lost abort into the PARK path live (2026-08-02:
+    // sweep-aborted FAC-58, a canceled ticket, got park labels/comments).
+    // The abort REASON we set on the controller is the authoritative story;
+    // prefer it whenever the signal fired.
+    const reason = abort.signal.aborted && abort.signal.reason instanceof Error
+      ? abort.signal.reason.message : null;
     const out: StageResult = {
       label, text: "", costUsd: 0, turns: 0,
       wallSeconds: Math.round((Date.now() - t0) / 1000),
-      error: redactSecrets(error instanceof Error ? error.message : String(error)).clean,
+      error: redactSecrets(reason ?? (error instanceof Error ? error.message : String(error))).clean,
     };
     opts.onEvent?.({ kind: "stage_finished", stage: label, costUsd: 0, turns: 0,
       wallSeconds: out.wallSeconds, resultText: "",

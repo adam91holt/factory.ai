@@ -103,3 +103,29 @@ describe("claim-lost is never transient — a lost claim must not retry or fail 
     expect(isTransientStageError(`${CLAIM_LOST}: issue left In Progress (confirmed across two reconcile passes)`)).toBe(false);
   });
 });
+
+describe("abort reason propagation — the SDK's generic abort message never masks CLAIM_LOST", () => {
+  test("a stage whose SDK throws a generic abort error still reports the controller's reason", async () => {
+    // The live gap: the SDK threw "Claude Code process aborted by user" so
+    // park() never saw the CLAIM_LOST prefix and parked a canceled ticket.
+    const deps: StageDeps = {
+      query: (params) => {
+        const abort = (params.options as { abortController: AbortController }).abortController;
+        return (async function* (): AsyncGenerator<unknown> {
+          yield { type: "system", subtype: "init", session_id: "s" };
+          await new Promise((_, reject) => {
+            abort.signal.addEventListener("abort", () =>
+              reject(new Error("Claude Code process aborted by user")), { once: true }); // SDK's own message
+          });
+        })();
+      },
+      sleep: async () => {},
+    };
+    const stage = runStage("implementer", "p", { model: "sonnet", maxTurns: 5, budgetUsd: 1, deadlineMs: Date.now() + 60_000, issueKey: "FAC-77" }, deps);
+    await new Promise((r) => setTimeout(r, 20));
+    abortIssueStages("FAC-77", "issue left In Progress");
+    const result = await stage;
+    expect(result.error ?? "").toContain(CLAIM_LOST);
+    expect(result.error ?? "").not.toBe("Claude Code process aborted by user");
+  });
+});
