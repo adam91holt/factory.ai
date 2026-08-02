@@ -3,6 +3,7 @@ import {
   openTestDatabase, closeTestDatabase,
   ensureProjectRow, replaceProjectRepos, getProjectRowByName, listProjectRepos,
   projectOwningRepo, updateProjectDescriptive,
+  insertPendingPolicy, approveProjectPolicy, activeMergePolicyForRepo,
 } from "../src/db.ts";
 import { createProject } from "../src/project-config.ts";
 
@@ -45,6 +46,41 @@ describe("projectOwningRepo (the gate reader)", () => {
     await closeTestDatabase();
     expect(await projectOwningRepo("acme/anything")).toEqual({ status: "unavailable" });
     await openTestDatabase(); // leave the seam usable for afterEach
+  });
+});
+
+describe("activeMergePolicyForRepo (the per-project auto-merge grant)", () => {
+  test("no policy / pending-only policy → null (a proposal confers nothing until approved)", async () => {
+    const id = await ensureProjectRow("orbital", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/eval-orbital-01"], "test");
+    expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBeNull();
+    await insertPendingPolicy(id!, "merge", JSON.stringify("auto"), "test");
+    expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBeNull();
+  });
+
+  test("approved merge:auto policy resolves for the project's repos", async () => {
+    const id = await ensureProjectRow("orbital", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/eval-orbital-01"], "test");
+    const policyId = await insertPendingPolicy(id!, "merge", JSON.stringify("auto"), "test");
+    expect(await approveProjectPolicy(policyId!, "test")).not.toBeNull();
+    expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBe("auto");
+    // scoped: a repo outside the project sees nothing
+    expect(await activeMergePolicyForRepo("acme/other")).toBeNull();
+  });
+
+  test("an archived project's policy stops governing (active-project join)", async () => {
+    const id = await ensureProjectRow("orbital", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/eval-orbital-01"], "test");
+    const policyId = await insertPendingPolicy(id!, "merge", JSON.stringify("auto"), "test");
+    await approveProjectPolicy(policyId!, "test");
+    await updateProjectDescriptive(id!, "status", "archived", "test");
+    expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBeNull();
+  });
+
+  test("closed store → null (fail-safe: less authority, never more)", async () => {
+    await closeTestDatabase();
+    expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBeNull();
+    await openTestDatabase();
   });
 });
 

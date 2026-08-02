@@ -27,6 +27,27 @@ describe("effectiveMergeTier — AUTO_MERGE_ALL override", () => {
   });
 });
 
+describe("effectiveMergeTier — per-project merge policy (PG authority lane)", () => {
+  const shadowEarned = { repo: "acme/widgets", tier: "shadow" as const, cleanStreak: 0, totalShadow: 0 };
+
+  test("policy 'auto' forces auto — including over ladder enrollment's earning hold", () => {
+    expect(effectiveMergeTier("acme/widgets", null, { policyMerge: "auto" })).toBe("auto");
+    expect(effectiveMergeTier("acme/widgets", shadowEarned, { policyMerge: "auto" })).toBe("auto");
+  });
+  test("policy withholds beat every grant: review → human, shadow → shadow, even with overrideAll", () => {
+    expect(effectiveMergeTier("acme/widgets", null, { policyMerge: "review", overrideAll: true })).toBe("human");
+    expect(effectiveMergeTier("acme/widgets", null, { policyMerge: "shadow", overrideAll: true })).toBe("shadow");
+  });
+  test("policy 'auto' can never touch the self-repo or a ticket's merge:review withhold", () => {
+    expect(effectiveMergeTier("acme/factory", null, { policyMerge: "auto" })).toBe("human");
+    expect(effectiveMergeTier("acme/widgets", null, { policyMerge: "auto", humanReview: true })).toBe("human");
+  });
+  test("no policy (null/undefined) → behavior unchanged", () => {
+    expect(effectiveMergeTier("acme/widgets", null, { policyMerge: null })).toBe("human");
+    expect(effectiveMergeTier("acme/widgets", null, {})).toBe("human");
+  });
+});
+
 describe("decideMerge — minStrength 'real' floor (the AUTO_MERGE_ALL leg)", () => {
   const AUTO = "auto" as const;
   const RELAXED = { lowRiskMaxDiff: 40, minStrength: "real" as const };

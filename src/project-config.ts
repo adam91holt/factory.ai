@@ -8,7 +8,7 @@ import {
   upsertProjectModel, deleteProjectModel, listProjectModels,
   upsertProjectGroundskeeper, listProjectGroundskeepers,
   insertPendingPolicy, getProjectPolicy, listProjectPolicies,
-  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState,
+  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo,
   type ProjectModelRow, type ProjectRow,
 } from "./db.ts";
 
@@ -181,7 +181,7 @@ async function repoLadder(repos: string[]): Promise<ProjectView["ladder"]> {
     const earned = await getLadderState(repo);
     return {
       repo,
-      tier: effectiveMergeTier(repo, earned, { autoDefault: config.autoMergeDefault, overrideAll: config.autoMergeAll }),
+      tier: effectiveMergeTier(repo, earned, { autoDefault: config.autoMergeDefault, overrideAll: config.autoMergeAll, policyMerge: await activeMergePolicyForRepo(repo) }),
       cleanStreak: earned?.cleanStreak ?? 0,
     };
   }));

@@ -10,7 +10,7 @@ import { isDraining } from "./control.ts";
 import { parseFactoryMeta, resolveModel, resolveModelForRisk, resolveEffort } from "./meta.ts";
 import { deriveRiskClass, diffFilePaths, escalationModel, MAX_TIER_ESCALATIONS } from "./risk.ts";
 import { checkFreshness } from "./precondition.ts";
-import { activeAgentRegisterSnapshot, activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback } from "./db.ts";
+import { activeAgentRegisterSnapshot, activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback, activeMergePolicyForRepo } from "./db.ts";
 import { MATERIALIZED_SKILLS_SUBDIR, buildDelegateRoster, buildRegisterIndex, delegableSpecialists, indexBlockForStage, materializeSkills, refreshMaterializedSkills } from "./discovery.ts";
 import { fileApproval, shouldFileApproval } from "./approvals.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
@@ -1183,11 +1183,15 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // IGNORED here (only the operator flag can grant; withhold-only invariant).
     const metaMerge = parseFactoryMeta(issue.description).merge;
     const humanReview = metaMerge === "review" || metaMerge === "shadow";
-    const tier = effectiveMergeTier(repo, await getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview, overrideAll: config.autoMergeAll });
+    const policyMerge = await activeMergePolicyForRepo(repo);
+    const tier = effectiveMergeTier(repo, await getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview, overrideAll: config.autoMergeAll, policyMerge });
     const ev = buildMergeEvidence({ summary, guarded, needsHuman, security: securityVerdict, browser, diffLines });
-    // AUTO_MERGE_ALL also lowers the evidence floor to "real" (unit tests, no
-    // e2e requirement) — see config.ts. Every other decideMerge condition holds.
-    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(config.autoMergeAll ? { minStrength: "real" as const } : {}) });
+    // An explicit auto grant — blanket AUTO_MERGE_ALL or the repo's approved
+    // per-project merge:auto policy — also lowers the evidence floor to "real"
+    // (unit tests, no e2e requirement), else a repo without an e2e gate could
+    // never act on the grant. Every other decideMerge condition holds.
+    const relaxedFloor = config.autoMergeAll || policyMerge === "auto";
+    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(relaxedFloor ? { minStrength: "real" as const } : {}) });
     // Gap-1 interaction: a child that declares dependencies must NOT auto-merge
     // out of order — the steward owns epic merge ordering. Standalone tickets only.
     const hasDeps = (parseFactoryMeta(issue.description).depends_on ?? []).length > 0;

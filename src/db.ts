@@ -2115,6 +2115,28 @@ export async function activePoliciesByProjectName(): Promise<Array<{ name: strin
   });
 }
 
+/** The ACTIVE human-approved merge policy governing `repo` (via its owning
+ *  active project), for effectiveMergeTier's policyMerge leg. Absence, a closed
+ *  store, a malformed value, or a query failure all degrade to null — which the
+ *  tier resolution treats as "no policy", falling back to ladder/default. That
+ *  fail-safe direction matters: a missed read can only ever result in LESS
+ *  merge authority, never more. */
+export async function activeMergePolicyForRepo(repo: string): Promise<"auto" | "shadow" | "review" | null> {
+  if (!store) return null;
+  try {
+    const rows = await store.query<{ value: string }>(
+      "SELECT pol.value FROM project_policy pol JOIN projects p ON p.id = pol.project_id JOIN project_repos pr ON pr.project_id = p.id WHERE pr.repo = $1 AND p.status = 'active' AND pol.key = 'merge' AND pol.state = 'active' LIMIT 1",
+      [repo]);
+    if (!rows[0]) return null;
+    let v: unknown = null;
+    try { v = JSON.parse(rows[0].value) as unknown; } catch { return null; }
+    return v === "auto" || v === "shadow" || v === "review" ? v : null;
+  } catch (error) {
+    console.error(`[db] activeMergePolicyForRepo(${repo}) failed — treating as no policy: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+}
+
 /** Attempts the activate step makes when it keeps losing the one-active-row
  *  index to a concurrent approver. IN-CODE CONSTANT, not an env knob
  *  (CLAUDE.md) — same shape as MAX_APPROVAL_INSERT_ATTEMPTS. */

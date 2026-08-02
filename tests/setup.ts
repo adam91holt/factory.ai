@@ -15,6 +15,16 @@ process.env.PROXY_AUTH_TOKEN = "factory-test-proxy-token-a1b2c3";
 process.env.APPROVALS_NOTIFY ??= "0";
 process.env.GROUNDSKEEPERS_ENABLED ??= "";
 process.env.MERGE_AUTO_REPOS ??= "";
+// Merge-authority flags are FORCED (=, not ??=): Bun auto-loads the operator's
+// .env into every `bun test`, so a live AUTO_MERGE_ALL=1 / ladder enrollment
+// would otherwise leak into tier-resolution assertions (found live 2026-08-02:
+// the /projects ladder test saw tier "auto" the first run after the .env flip).
+// Tests that exercise these paths pass explicit opts to the pure functions —
+// they never need the env leg.
+process.env.AUTO_MERGE_ALL = "0";
+process.env.AUTO_MERGE_DEFAULT = "0";
+process.env.MERGE_LADDER_REPOS = "";
+process.env.MERGE_LADDER_CEILING = "";
 // The suite must NEVER create git commits (issue #8 F8 — a subagent exercising
 // POST /catalog/save once minted real commits on main). With this set,
 // saveCatalogEntry writes its file but never touches git; the one test that

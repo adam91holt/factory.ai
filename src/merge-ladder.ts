@@ -143,18 +143,28 @@ function ceilingFor(repo: string): MergeTier {
   return config.autoMergeRepos.includes(repo) ? "auto" : "auto-low-risk";
 }
 
-/** Resolve the tier actually in force: hard rules > operator override >
- * DB-earned > config ceiling. self-repo and un-enrolled repos are human-merge;
- * otherwise the earned tier (defaulting to shadow before any row exists)
- * capped by the ceiling. */
+/** Resolve the tier actually in force: hard rules > policy withholds >
+ * operator override > policy grant > DB-earned > config ceiling. self-repo and
+ * un-enrolled repos are human-merge; otherwise the earned tier (defaulting to
+ * shadow before any row exists) capped by the ceiling.
+ *
+ * `policyMerge` is the repo's ACTIVE human-approved per-project merge policy
+ * (db.ts activeMergePolicyForRepo — the propose→approve authority lane, so it
+ * carries the same "a human granted this" weight as an env flag). Its withhold
+ * values (review/shadow) beat every grant including AUTO_MERGE_ALL — the
+ * tighten-only direction — while its "auto" grant beats enrollment's earning
+ * hold (that is its purpose: force one project auto without a blanket flag). */
 export function effectiveMergeTier(
   repo: string,
   earned: LadderState | null,
-  opts?: { autoDefault?: boolean; humanReview?: boolean; overrideAll?: boolean },
+  opts?: { autoDefault?: boolean; humanReview?: boolean; overrideAll?: boolean; policyMerge?: "auto" | "shadow" | "review" | null },
 ): MergeTier {
   if (isSelfRepo(repo)) return "human";              // self-repo ALWAYS human (backstop, cannot be overridden)
   if (opts?.humanReview) return "human";             // epic opted INTO human review (merge:review — withhold-only)
-  if (opts?.overrideAll) return "auto";              // AUTO_MERGE_ALL: blanket operator override — beats enrollment/earned/ceiling (but never the two hard rules above)
+  if (opts?.policyMerge === "review") return "human";  // project-scoped withhold: beats every grant below
+  if (opts?.policyMerge === "shadow") return "shadow"; // project-scoped record-only hold: ditto
+  if (opts?.overrideAll) return "auto";              // AUTO_MERGE_ALL: blanket operator override — beats enrollment/earned/ceiling (but never the rules above)
+  if (opts?.policyMerge === "auto") return "auto";   // human-approved per-project grant — beats enrollment's earning hold
   if (isEnrolled(repo)) return minTier(earned?.tier ?? "shadow", ceilingFor(repo)); // explicit ladder enrollment wins
   if (opts?.autoDefault) return "auto";              // auto-merge-by-default (operator AUTO_MERGE_DEFAULT flag)
   return "human";                                    // default: human-merge (unchanged when the flag is off)
