@@ -13,7 +13,9 @@ import type { ApprovalItem } from "./approvals";
 //   POST /projects/save                  {name, goal?, description?, status?, team?}
 //   POST /projects/model                 {name, role, model|null, effort?}
 //   POST /projects/groundskeeper         {name, card, enabled, cadence?}
-//   POST /projects/policy/:id/approve    {}
+//   POST /projects/policy/:id/approve    {key, value}  ← MUST restate the
+//        reviewed revision; the backend refuses a blind approve-by-id (the
+//        approvals gatedHeadSha pattern applied to config authority)
 //   POST /projects/policy/:id/reject     {}
 //
 // TWO-TIER invariant mirrored from the backend: descriptive fields (goal,
@@ -220,13 +222,17 @@ export function currentAuthorityValue(project: ProjectView, key: string): string
 export interface AuthorityRow {
   key: string;
   current: string;
-  /** Awaiting-approval revision, when one is pending for this key. */
-  pending: { policyId: number; proposed: string; createdAt: number } | null;
+  /** Awaiting-approval revision, when one is pending for this key. `value` is
+   *  the RAW proposed value — the evidence an approve must restate so the
+   *  backend can bind the decision to what was actually rendered. */
+  pending: { policyId: number; proposed: string; value: unknown; createdAt: number } | null;
 }
 
 /** The read-only authority table: one row per authority key, each carrying the
  *  value in force and (when a revision awaits approval) the pending diff.
- *  When several revisions of one key are pending, the NEWEST is shown. Pure. */
+ *  When several revisions of one key are pending, the NEWEST is shown (the
+ *  backend supersedes older pendings on propose, so that is also the only
+ *  approvable one). Pure. */
 export function authorityRows(project: ProjectView): AuthorityRow[] {
   const pending = pendingPolicies(project.policies);
   return AUTHORITY_KEYS.map((key) => {
@@ -234,7 +240,7 @@ export function authorityRows(project: ProjectView): AuthorityRow[] {
     return {
       key,
       current: currentAuthorityValue(project, key),
-      pending: p ? { policyId: p.id, proposed: formatPolicyValue(p.value), createdAt: p.createdAt } : null,
+      pending: p ? { policyId: p.id, proposed: formatPolicyValue(p.value), value: p.value, createdAt: p.createdAt } : null,
     };
   });
 }
@@ -314,9 +320,17 @@ export async function setProjectGroundskeeper(
   return post("/projects/groundskeeper", { name, card, enabled, cadence });
 }
 
-export async function decidePolicy(policyId: number, action: "approve" | "reject"): Promise<ProjectActionResponse> {
+/** Approve/reject a pending authority revision. An APPROVE must carry the
+ *  reviewed {key, value} — the backend refuses a blind approve-by-id, so a
+ *  stale tab or retried request can never activate a revision the approver
+ *  did not actually see. Reject stays id-only (refusing is always safe). */
+export async function decidePolicy(
+  policyId: number,
+  action: "approve" | "reject",
+  evidence?: { key: string; value: unknown },
+): Promise<ProjectActionResponse> {
   if (isMockMode()) return mockDecidePolicy(policyId, action);
-  return post(`/projects/policy/${policyId}/${action}`, {});
+  return post(`/projects/policy/${policyId}/${action}`, action === "approve" && evidence ? { key: evidence.key, value: evidence.value } : {});
 }
 
 // ---------------------------------------------------------------------------

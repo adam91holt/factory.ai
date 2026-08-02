@@ -119,12 +119,26 @@ describe("diffFilePaths", () => {
 // ---------------------------------------------------------------------------
 
 describe("RISK_MODEL_TIERS invariants", () => {
-  test("the three cross-vendor gate stages never map BELOW standard (risk may strengthen a safety gate, never weaken it)", () => {
+  test("EVERY gate-verdict-producing stage never maps BELOW standard (risk may strengthen a safety gate, never weaken it)", () => {
+    // Any stage whose output reaches buildMergeEvidence or a hold reason
+    // belongs here: the three cross-vendor legs, PLUS the tester (sole source
+    // of the real→strong browser-evidence upgrade) and the design reviewer
+    // (sole source of the taste hold). Only the fixer — which produces no
+    // gate verdict — may run cheap.
     for (const risk of RISK_CLASSES) {
-      for (const stage of ["reviewerClaude", "reviewerCodex", "securityReviewer"] as const) {
-        expect(RISK_MODEL_TIERS[risk][stage]).not.toBe("cheap");
+      for (const stage of ["reviewerClaude", "reviewerCodex", "securityReviewer", "designReviewer", "tester"] as const) {
+        expect({ risk, stage, tier: RISK_MODEL_TIERS[risk][stage] }).not.toEqual({ risk, stage, tier: "cheap" });
       }
     }
+  });
+  test("LOW risk — the auto-merge-eligible class — floors tester and designReviewer at standard (regression: they were cheap)", () => {
+    // RISK_THRESHOLDS.mediumDiffLines is deliberately aligned with the merge
+    // ladder's lowRiskMaxDiff, so "low risk" = "auto-low-risk mergeable".
+    // The merge-evidence producers must not run the weakest roster model on
+    // exactly the runs that merge with zero human touch.
+    expect(RISK_MODEL_TIERS.low.tester).toBe("standard");
+    expect(RISK_MODEL_TIERS.low.designReviewer).toBe("standard");
+    expect(RISK_MODEL_TIERS.low.fixer).toBe("cheap"); // fixer produces no verdict — cheap stays fine
   });
   test("critical maps every stage to strong", () => {
     for (const tier of Object.values(RISK_MODEL_TIERS.critical)) expect(tier).toBe("strong");

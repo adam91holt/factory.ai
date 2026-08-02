@@ -21,7 +21,7 @@ export function AuthorityPanel({
   project: ProjectView;
   now: number;
   deciding: number | null;
-  onDecide: (policyId: number, action: "approve" | "reject") => void;
+  onDecide: (policyId: number, action: "approve" | "reject", evidence: { key: string; value: unknown }) => void;
   decisionError: string | null;
 }) {
   const rows = authorityRows(project);
@@ -72,7 +72,7 @@ export function AuthorityPanel({
                     <button
                       type="button"
                       disabled={deciding === row.pending.policyId}
-                      onClick={() => onDecide(row.pending!.policyId, "approve")}
+                      onClick={() => onDecide(row.pending!.policyId, "approve", { key: row.key, value: row.pending!.value })}
                       className="rounded-md border border-ok/40 bg-ok/10 px-2 py-0.5 font-mono text-[10.5px] text-ok transition-colors duration-100 hover:bg-ok/20 disabled:opacity-50"
                     >
                       approve
@@ -80,7 +80,7 @@ export function AuthorityPanel({
                     <button
                       type="button"
                       disabled={deciding === row.pending.policyId}
-                      onClick={() => onDecide(row.pending!.policyId, "reject")}
+                      onClick={() => onDecide(row.pending!.policyId, "reject", { key: row.key, value: row.pending!.value })}
                       className="rounded-md border border-err/40 bg-err/10 px-2 py-0.5 font-mono text-[10.5px] text-err transition-colors duration-100 hover:bg-err/20 disabled:opacity-50"
                     >
                       reject

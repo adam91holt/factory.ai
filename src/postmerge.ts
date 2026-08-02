@@ -145,9 +145,10 @@ export async function deployAndVerify(
 export async function postMergeTick(): Promise<void> {
   if (!config.deployEnabled) return; // global kill-switch — no git, no shell, no spend
   // effectiveProjects (issue #7): PG-approved authority overrides layered over
-  // the cards — deployEnabled can be governed from the approved policy rows,
-  // but the deploy/smoke COMMANDS still come only from the card file (see
-  // registry.ts applyPolicyOverlay), and no rows ⇒ cards exactly as before.
+  // the cards — an approved policy row can DISARM deployEnabled (narrow-only,
+  // see registry.ts applyPolicyOverlay) but never arm a card whose file says
+  // false; the deploy/smoke COMMANDS still come only from the card file, and
+  // no rows ⇒ cards exactly as before.
   const cards = (await effectiveProjects()).filter((c) => c.deployEnabled && c.deploy);
   if (cards.length === 0) return;
 

@@ -162,7 +162,9 @@ describe("two-tier display — authority is read-only with a pending diff", () =
     const p = project({ policies: [policy({ id: 7, key: "merge", value: "shadow" })] });
     const rows = authorityRows(p);
     const merge = rows.find((r) => r.key === "merge")!;
-    expect(merge.pending).toEqual({ policyId: 7, proposed: "shadow", createdAt: NOW });
+    // `value` carries the RAW proposed value — the evidence the approve POST
+    // must restate so the backend can bind the decision to what was rendered.
+    expect(merge.pending).toEqual({ policyId: 7, proposed: "shadow", value: "shadow", createdAt: NOW });
     expect(merge.current).toBe("review");
     for (const r of rows.filter((r) => r.key !== "merge")) expect(r.pending).toBeNull();
   });
@@ -220,5 +222,44 @@ describe("isRosterModel — the dropdown allowlist", () => {
     expect(isRosterModel(roster, "sonnet")).toBe(true);
     expect(isRosterModel(roster, "gpt-9-turbo-max")).toBe(false);
     expect(isRosterModel(roster, "")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: an authority APPROVE travels with the reviewed {key, value} —
+// the approvals-inbox gatedHeadSha binding applied to config policy. The
+// backend refuses a blind approve-by-id, so the client MUST restate what the
+// panel actually rendered.
+// ---------------------------------------------------------------------------
+import { afterAll, beforeAll } from "bun:test";
+import { decidePolicy } from "../ui/src/lib/projects.ts";
+
+describe("decidePolicy sends the evidence the panel rendered", () => {
+  const realFetch = globalThis.fetch;
+  let lastRequest: { url: string; body: unknown } | null = null;
+
+  beforeAll(() => {
+    (globalThis as { window?: unknown }).window = { location: { search: "" } };
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
+      lastRequest = { url: String(url), body: JSON.parse(String(init?.body ?? "null")) };
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    }) as typeof fetch;
+  });
+  afterAll(() => {
+    globalThis.fetch = realFetch;
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  test("approve carries {key, value} — the backend 400s a blind approve and 409s a mismatch", async () => {
+    const res = await decidePolicy(7, "approve", { key: "deployEnabled", value: false });
+    expect(res).toEqual({ ok: true });
+    expect(lastRequest?.url).toBe("/projects/policy/7/approve");
+    expect(lastRequest?.body).toEqual({ key: "deployEnabled", value: false });
+  });
+
+  test("reject stays id-only (refusing is always safe)", async () => {
+    await decidePolicy(8, "reject", { key: "merge", value: "auto" });
+    expect(lastRequest?.url).toBe("/projects/policy/8/reject");
+    expect(lastRequest?.body).toEqual({});
   });
 });

@@ -13,9 +13,11 @@ const KEY_RE = /^[A-Z]+-\d+$/;
 
 // The epic DAG: nodes are the epic's child tickets in live scheduling lanes,
 // solid edges are declared depends_on, dashed amber links are touches-overlap
-// serialisation. Everything is derived CLIENT-SIDE from data the dashboard
-// already serves (/issue + MissionState) — the daemon's scheduler stays the
-// only authority; this view just explains it.
+// serialisation. Lane/edge classification is derived CLIENT-SIDE from data
+// the dashboard serves (ONE /epic-dag read + MissionState) — the daemon's
+// scheduler stays the only authority; this view just explains it. The
+// refetch is deliberately slow (60s): each refetch is one Linear GraphQL
+// request on the daemon's own API key, and child meta rarely changes.
 
 export function EpicDagPanel({ drain }: { drain: { draining: boolean; reason: string | null } }) {
   // Board epics (label-derived) offer a quick pick; any TEAM-123 key works too.
@@ -36,8 +38,8 @@ export function EpicDagPanel({ drain }: { drain: { draining: boolean; reason: st
     queryKey: ["epic-dag", epicKey],
     queryFn: () => fetchEpicDag(epicKey),
     enabled: validKey,
-    staleTime: 15_000,
-    refetchInterval: 30_000,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
     retry: false,
   });
 
@@ -117,7 +119,7 @@ export function EpicDagPanel({ drain }: { drain: { draining: boolean; reason: st
           </div>
         ) : isError || !data ? (
           <div className="rounded-lg border border-err/30 bg-err/5 p-4 text-center font-mono text-[11px] text-err">
-            could not load {epicKey} — the /issue endpoint may be unavailable or the key wrong
+            could not load {epicKey} — the /epic-dag endpoint may be unavailable or the key wrong
           </div>
         ) : (
           <>

@@ -351,11 +351,27 @@ export async function proposeProjectPolicy(body: unknown): Promise<HandlerResult
   return { status: 200, json: { ok: true, name: resolved.row.name, policyId: id, key, state: "pending" } };
 }
 
-/** POST /projects/policy/:id/approve — the atomic claim (db.ts). 409 when the
- *  row was already decided (double-click, superseded, rejected). */
-export async function approvePolicyItem(id: number): Promise<HandlerResult> {
+/** POST /projects/policy/:id/approve {key, value} — the atomic claim (db.ts),
+ *  BOUND to the evidence the approver saw (the approvals.ts gatedHeadSha
+ *  pattern applied to config authority). The body must restate the reviewed
+ *  key AND proposed value; a mismatch refuses. This makes a blind approve-by-
+ *  id impossible: a stale tab, a retried POST, or an id pointing at a
+ *  revision the dashboard never rendered cannot activate a value no human
+ *  actually reviewed. 409 when the row was already decided (double-click,
+ *  superseded, rejected) or the evidence does not match. */
+export async function approvePolicyItem(id: number, body: unknown): Promise<HandlerResult> {
   const existing = await getProjectPolicy(id);
   if (!existing) return bad(404, "no such policy revision");
+  const b = (body ?? {}) as Record<string, unknown>;
+  if (typeof b.key !== "string" || !Object.hasOwn(b, "value")) {
+    return bad(400, "approve must restate the reviewed revision as {key, value} — blind approval by id is refused");
+  }
+  // Canonical-JSON compare against the STORED revision (values are the
+  // normalized output of validatePolicyValue: strings, bare booleans, sorted
+  // string arrays — JSON.stringify is stable for all of them).
+  if (b.key !== existing.key || JSON.stringify(b.value) !== JSON.stringify(existing.value)) {
+    return bad(409, "approve evidence mismatch: the pending revision is not the {key, value} you reviewed — reload and re-review");
+  }
   const activated = await approveProjectPolicy(id, DASHBOARD_ACTOR);
   if (!activated) return bad(409, "policy revision is not pending (already decided, superseded, or claimed)");
   return { status: 200, json: { ok: true, policyId: activated.id, key: activated.key, state: activated.state } };

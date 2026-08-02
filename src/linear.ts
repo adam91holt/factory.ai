@@ -1,5 +1,6 @@
 import { config } from "./config.ts";
 import { bus, type Lane } from "./events.ts";
+import { parseFactoryMeta } from "./meta.ts";
 
 // Linear GraphQL client. Personal API keys: raw key as Authorization (no
 // "Bearer"). Hardened per code-review verdict 2026-07-20: HTTP status checks +
@@ -419,6 +420,68 @@ export async function getIssueDetail(key: string): Promise<IssueDetail> {
     children: i.children.nodes.map(flat),
     siblings: (i.parent?.children.nodes ?? []).filter((n) => n.identifier !== i.identifier).map(flat),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Epic DAG (dashboard). ONE GraphQL request serves the whole panel: the epic
+// plus every child's description, whose start-anchored factory meta block
+// carries depends_on/touches. Before this, the UI issued 1 + N /issue calls
+// (N ≤ 40) every 30s refetch on the daemon's own API key — a single open tab
+// on a 40-child epic burned ~4,900 requests/hour against Linear's ~1,500/hour
+// budget and pushed the PIPELINE into rate-limit backoff. The meta parse now
+// happens daemon-side through the AUTHORITATIVE meta.ts parser (the same one
+// the scheduler uses), and raw descriptions never cross to the browser.
+// ---------------------------------------------------------------------------
+
+/** Children served per epic — a display cap, IN-CODE (CLAUDE.md: caps are
+ *  constants, never env knobs). Matches the UI's previous MAX_CHILDREN. */
+export const MAX_EPIC_DAG_CHILDREN = 40;
+
+export interface EpicDagPayload {
+  epic: { identifier: string; title: string };
+  tickets: Array<{
+    identifier: string; title: string; stateType: string; stateName: string;
+    labels: string[]; dependsOn: string[]; touches: string[];
+  }>;
+}
+
+interface RawEpicDagChild {
+  identifier: string; title: string; description: string | null;
+  state: { name: string; type?: string }; labels?: { nodes: Array<{ name: string }> };
+}
+export interface RawEpicDagIssue {
+  identifier: string; title: string;
+  children: { nodes: RawEpicDagChild[] };
+}
+
+/** Pure assembly of the wire payload from one GraphQL result — exported so
+ *  tests pin the cap and the start-anchored meta discipline without a network. */
+export function buildEpicDagPayload(issue: RawEpicDagIssue): EpicDagPayload {
+  const tickets = issue.children.nodes.slice(0, MAX_EPIC_DAG_CHILDREN).map((c) => {
+    // Authoritative parser (meta.ts): start-anchored, identifier-validated,
+    // count/length-capped — a block buried in prose or injected content draws
+    // no edges, exactly what the scheduler itself would honor.
+    const meta = parseFactoryMeta(c.description ?? "");
+    return {
+      identifier: c.identifier,
+      title: c.title,
+      stateType: c.state.type ?? "",
+      stateName: c.state.name,
+      labels: (c.labels?.nodes ?? []).map((l) => l.name),
+      dependsOn: meta.depends_on ?? [],
+      touches: meta.touches ?? [],
+    };
+  });
+  return { epic: { identifier: issue.identifier, title: issue.title }, tickets };
+}
+
+/** The epic + child meta for GET /epic-dag — exactly ONE Linear request. */
+export async function getEpicDag(key: string): Promise<EpicDagPayload> {
+  const data = await gql<{ issue: RawEpicDagIssue }>(
+    `query($key: String!) { issue(id: $key) {
+      identifier title
+      children { nodes { identifier title description state { name type } labels { nodes { name } } } } } }`, { key });
+  return buildEpicDagPayload(data.issue);
 }
 
 // ---------------------------------------------------------------------------

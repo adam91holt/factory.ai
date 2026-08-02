@@ -140,12 +140,27 @@ describe("two-tier writes over the wire", () => {
     expect(view.projects[0]?.policies.find((p) => p.id === policyId)?.state).toBe("pending");
     expect(view.projects[0]?.effective?.merge).toBe("review"); // unchanged until approved
 
-    expect((await post(`/projects/policy/${policyId}/approve`, {})).status).toBe(200);
-    expect((await post(`/projects/policy/${policyId}/approve`, {})).status).toBe(409);
+    // Approve is BOUND to the reviewed revision: a blind {} body refuses (400),
+    // a mismatched value refuses (409), and only the restated {key, value} lands.
+    expect((await post(`/projects/policy/${policyId}/approve`, {})).status).toBe(400);
+    expect((await post(`/projects/policy/${policyId}/approve`, { key: "merge", value: "auto" })).status).toBe(409);
+    expect((await post(`/projects/policy/${policyId}/approve`, { key: "merge", value: "shadow" })).status).toBe(200);
+    expect((await post(`/projects/policy/${policyId}/approve`, { key: "merge", value: "shadow" })).status).toBe(409);
     expect((await post(`/projects/policy/${policyId}/reject`, {})).status).toBe(409);
 
     view = await (await fetch(`${base}/projects`)).json() as typeof view;
     expect(view.projects[0]?.effective?.merge).toBe("shadow");
+  });
+
+  test("re-proposing a key supersedes the earlier pending revision over the wire — the stale id cannot be approved", async () => {
+    const first = await (await post("/projects/policy/propose", { name: "kiwi", key: "merge", value: "auto" })).json() as { policyId: number };
+    const second = await (await post("/projects/policy/propose", { name: "kiwi", key: "merge", value: "shadow" })).json() as { policyId: number };
+    // The retracted first proposal is dead even with matching evidence.
+    expect((await post(`/projects/policy/${first.policyId}/approve`, { key: "merge", value: "auto" })).status).toBe(409);
+    const view = await (await fetch(`${base}/projects`)).json() as { projects: Array<{ effective: { merge: string } | null; policies: Array<{ id: number; state: string }> }> };
+    expect(view.projects[0]?.policies.find((p) => p.id === first.policyId)?.state).toBe("superseded");
+    expect(view.projects[0]?.policies.find((p) => p.id === second.policyId)?.state).toBe("pending");
+    expect(view.projects[0]?.effective?.merge).toBe("review"); // nothing activated
   });
 
   test("propose validation refuses unknown keys and malformed values with 400", async () => {

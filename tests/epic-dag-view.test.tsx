@@ -252,3 +252,61 @@ describe("buildEpicDag — layout", () => {
     expect(input.map((t) => t.identifier)).toEqual(["FAC-2", "FAC-1"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regression: fetchEpicDag issues exactly ONE request. The previous shape —
+// GET /issue for the epic plus one per child (≤ 40), re-fired every refetch —
+// each proxied to a real Linear GraphQL call on the daemon's own API key, so
+// one open dashboard tab could exceed Linear's hourly budget by itself and
+// push the pipeline into rate-limit backoff. The daemon's /epic-dag route now
+// serves the whole panel from a single Linear query; the client must never
+// fan out per child again.
+// ---------------------------------------------------------------------------
+import { afterAll, beforeAll } from "bun:test";
+import { fetchEpicDag } from "../ui/src/lib/epicdag.ts";
+
+describe("fetchEpicDag — one /epic-dag read, never a per-child fan-out", () => {
+  const realFetch = globalThis.fetch;
+  let requests: string[] = [];
+
+  beforeAll(() => {
+    (globalThis as { window?: unknown }).window = { location: { search: "" } };
+    globalThis.fetch = ((url: string) => {
+      requests.push(String(url));
+      return Promise.resolve(new Response(JSON.stringify({
+        epic: { identifier: "FAC-30", title: "Epic" },
+        tickets: [
+          { identifier: "FAC-31", title: "child", stateType: "unstarted", stateName: "Todo", labels: ["Factory-Planned"], dependsOn: ["FAC-1"], touches: ["src/a/**"] },
+          { identifier: "FAC-32", title: "sparse child", stateName: "Todo" }, // older-wire tolerance
+        ],
+      }), { status: 200 }));
+    }) as typeof fetch;
+  });
+  afterAll(() => {
+    globalThis.fetch = realFetch;
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  test("a 2-child epic costs exactly ONE request, to /epic-dag (not 1 + N /issue reads)", async () => {
+    requests = [];
+    const result = await fetchEpicDag("FAC-30");
+    expect(requests).toEqual(["/epic-dag?key=FAC-30"]);
+    expect(result.epic).toEqual({ identifier: "FAC-30", title: "Epic" });
+    expect(result.tickets[0]).toEqual({
+      identifier: "FAC-31", title: "child", stateType: "unstarted", stateName: "Todo",
+      labels: ["Factory-Planned"], dependsOn: ["FAC-1"], touches: ["src/a/**"],
+    });
+    // Missing optional wire fields degrade to empties, never undefined.
+    expect(result.tickets[1]).toEqual({
+      identifier: "FAC-32", title: "sparse child", stateType: "", stateName: "Todo",
+      labels: [], dependsOn: [], touches: [],
+    });
+  });
+
+  test("the client module no longer contains a per-child /issue fetch at all (static pin)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../ui/src/lib/epicdag.ts", import.meta.url), "utf8");
+    expect(src).not.toContain("/issue?key=");
+    expect(src).toContain("/epic-dag?key=");
+  });
+});

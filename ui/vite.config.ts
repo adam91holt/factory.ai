@@ -55,9 +55,10 @@ export default defineConfig({
         bypass: (req) =>
           req.method === "GET" && req.headers.accept?.includes("text/html") ? "/index.html" : undefined,
       },
-      // /issue is JSON-only (ticket detail + the epic-DAG child reads) — never
-      // a SPA route, so no bypass needed.
+      // /issue is JSON-only (ticket detail) — never a SPA route, so no bypass
+      // needed. /epic-dag is the Epic DAG panel's single JSON read.
       "/issue": "http://127.0.0.1:8787",
+      "/epic-dag": "http://127.0.0.1:8787",
     },
   },
 });
