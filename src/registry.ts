@@ -146,8 +146,14 @@ export function projectForRepo(repo: string): ProjectCard | null {
 //   - repos: INTERSECTION with the card's repos — a DB row can only NARROW the
 //     repo set, never widen it (the projection in project_repos is likewise
 //     reconciled one-way FROM cards by project-config.ts).
-//   - deployEnabled: only a bare boolean true arms it (fail-closed), and the
-//     global DEPLOY_ENABLED kill-switch in postmerge.ts still sits above it.
+//   - deployEnabled: NARROW-ONLY, like repos. A policy row may DISARM a card
+//     (false wins over a card's true) but can never ARM one: a true value is
+//     honoured only when the CARD already declares deployEnabled: true. The
+//     card file lives on a guarded path, so arming deploy keeps requiring a
+//     human-reviewed PR — two loopback POSTs from the single 'dashboard'
+//     actor (propose + approve, no proposer/approver separation) must never
+//     substitute for that second gate. The global DEPLOY_ENABLED kill-switch
+//     in postmerge.ts still sits above all of it.
 //   - deploy/smoke are DELIBERATELY NOT overlaid: those strings reach `sh -c`
 //     (postmerge.ts runShellGate), so until typed deploy actions land
 //     (deferred by the owner), the shell command comes ONLY from the
@@ -164,7 +170,10 @@ export function applyPolicyOverlay(card: ProjectCard, policies: Record<string, u
     const allowed = new Set(repos.filter((r): r is string => typeof r === "string"));
     out.repos = card.repos.filter((r) => allowed.has(r)); // narrow-only: ∩ card repos
   }
-  if (Object.hasOwn(policies, "deployEnabled")) out.deployEnabled = policies.deployEnabled === true;
+  // Narrow-only (see header): a row can disarm, never arm. The card's own
+  // deployEnabled — from the guarded-path, human-reviewed file — is the AND
+  // gate a policy true cannot bypass.
+  if (Object.hasOwn(policies, "deployEnabled")) out.deployEnabled = card.deployEnabled && policies.deployEnabled === true;
   // deploy / smoke intentionally untouched — see header note.
   return out;
 }

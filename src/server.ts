@@ -7,7 +7,7 @@ import {
   projectsView, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
   proposeProjectPolicy, approvePolicyItem, rejectPolicyItem,
 } from "./project-config.ts";
-import { getIssueDetail, type IssueDetail } from "./linear.ts";
+import { getIssueDetail, getEpicDag, type IssueDetail, type EpicDagPayload } from "./linear.ts";
 import { redactSecrets } from "./agents.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
@@ -47,6 +47,20 @@ export function redactIssueDetail(detail: IssueDetail): IssueDetail {
     parent: detail.parent ? cleanNode(detail.parent) : null,
     children: detail.children.map(cleanNode),
     siblings: detail.siblings.map(cleanNode),
+  };
+}
+
+/** B10 discipline for /epic-dag: titles and touches globs are Linear-supplied
+ * free text — scrub them before they reach a browser. dependsOn identifiers
+ * are already charset-locked by meta.ts and need no scrub. */
+export function redactEpicDag(payload: EpicDagPayload): EpicDagPayload {
+  return {
+    epic: { ...payload.epic, title: redactSecrets(payload.epic.title).clean },
+    tickets: payload.tickets.map((t) => ({
+      ...t,
+      title: redactSecrets(t.title).clean,
+      touches: t.touches.map((g) => redactSecrets(g).clean),
+    })),
   };
 }
 
@@ -411,13 +425,15 @@ export function handleProjectRoutes(url: URL, req: IncomingMessage, res: ServerR
   }
 
   // Authority approve/reject — the pending→active claim. Mirrors the approvals
-  // action route shape; the atomicity itself lives in db.ts.
+  // action route shape; the atomicity lives in db.ts, and approve is BOUND to
+  // the reviewed {key, value} in the body (approvals.ts gatedHeadSha pattern)
+  // so a blind or stale approve-by-id refuses.
   const policyAction = url.pathname.match(/^\/projects\/policy\/(\d{1,12})\/(approve|reject)$/);
   if (policyAction) {
     void guardedJsonBody(req, res).then((guarded) => {
       if (guarded === null) return; // refusal already written
       const id = Number(policyAction[1]);
-      respond(policyAction[2] === "approve" ? approvePolicyItem(id) : rejectPolicyItem(id), `policy ${policyAction[2]}`);
+      respond(policyAction[2] === "approve" ? approvePolicyItem(id, guarded.body) : rejectPolicyItem(id), `policy ${policyAction[2]}`);
     });
     return true;
   }
@@ -657,6 +673,21 @@ export async function startDashboard(): Promise<{
       if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
       getIssueDetail(key)
         .then((detail) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(redactIssueDetail(detail))); })
+        .catch((error: unknown) => {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: String(error instanceof Error ? error.message : error).slice(0, 200) }));
+        });
+      return;
+    }
+
+    if (url.pathname === "/epic-dag") {
+      // The Epic DAG panel's ONE read: epic + child meta assembled daemon-side
+      // from a SINGLE Linear query (linear.ts getEpicDag) — never 1 + N /issue
+      // round-trips from the browser on the daemon's API key.
+      const key = url.searchParams.get("key") ?? "";
+      if (!/^[A-Z]+-\d+$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
+      getEpicDag(key)
+        .then((payload) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(redactEpicDag(payload))); })
         .catch((error: unknown) => {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: String(error instanceof Error ? error.message : error).slice(0, 200) }));

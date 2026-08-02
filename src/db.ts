@@ -1497,13 +1497,25 @@ export async function projectGroundskeeperRowsForCard(card: string): Promise<Arr
 }
 
 /** AUTHORITY-tier write: land a PENDING policy revision + its audit row in one
- *  statement. The config in force is unchanged until approveProjectPolicy
- *  claims and activates this row. Returns the new policy id, or null. */
+ *  statement, SUPERSEDING any earlier still-pending revision for the same
+ *  (project, key) in that same statement (the insertApproval supersede-then-
+ *  insert pattern). At most ONE pending revision per key can therefore exist —
+ *  the newest proposal is always the only approvable one. Load-bearing: the
+ *  dashboard renders only the newest pending revision per key, so without the
+ *  supersede an older pending row (e.g. a retracted deployEnabled=true) would
+ *  be permanently INVISIBLE yet permanently APPROVABLE by id — a stale tab or
+ *  a retried POST could activate a revision no human ever saw. The config in
+ *  force is unchanged until approveProjectPolicy claims and activates this
+ *  row. Returns the new policy id, or null. */
 export async function insertPendingPolicy(projectId: number, key: string, valueJson: string, actor: string): Promise<number | null> {
   if (!store) return null;
   const now = Date.now();
   const rows = await store.query<{ id: unknown }>(
-    `WITH audit AS (
+    `WITH superseded AS (
+       UPDATE project_policy SET state = 'superseded'
+       WHERE project_id = $1 AND key = $2 AND state = 'pending'
+     ),
+     audit AS (
        INSERT INTO project_config_audit (project_id, field, old_value, new_value, actor, at)
        SELECT $1, 'policy:' || $2 || ':proposed',
               (SELECT pol.value FROM project_policy pol WHERE pol.project_id = $1 AND pol.key = $2 AND pol.state = 'active'),

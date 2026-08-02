@@ -213,11 +213,31 @@ describe("the overlay itself (pure — registry.applyPolicyOverlay)", () => {
     expect(applyPolicyOverlay(card(), { merge: "auto" }).merge).toBe("auto");
   });
 
-  test("deployEnabled fails closed — only a bare boolean true arms it", () => {
+  test("deployEnabled is NARROW-ONLY: a policy row can disarm a card, never arm one (the card file stays the second gate)", () => {
+    // Card says false ('prepared but disarmed'): NO policy value may arm it —
+    // arming deploy requires a human-reviewed PR on the guarded projects/
+    // path, never two loopback POSTs from the same 'dashboard' actor.
+    expect(applyPolicyOverlay(card(), { deployEnabled: true }).deployEnabled).toBe(false);
     expect(applyPolicyOverlay(card(), { deployEnabled: "true" }).deployEnabled).toBe(false);
     expect(applyPolicyOverlay(card(), { deployEnabled: 1 }).deployEnabled).toBe(false);
-    expect(applyPolicyOverlay(card(), { deployEnabled: true }).deployEnabled).toBe(true);
     expect(applyPolicyOverlay(card(), { deployEnabled: false }).deployEnabled).toBe(false);
+    // Card says true: a policy row may keep it armed or DISARM it (narrow),
+    // and a non-boolean still fails closed.
+    const armed = { ...card(), deployEnabled: true };
+    expect(applyPolicyOverlay(armed, { deployEnabled: true }).deployEnabled).toBe(true);
+    expect(applyPolicyOverlay(armed, { deployEnabled: false }).deployEnabled).toBe(false);
+    expect(applyPolicyOverlay(armed, { deployEnabled: "true" }).deployEnabled).toBe(false);
+    // No policy key at all → the card's value stands untouched.
+    expect(applyPolicyOverlay(armed, {}).deployEnabled).toBe(true);
+    expect(applyPolicyOverlay(card(), {}).deployEnabled).toBe(false);
+  });
+
+  test("an approved deployEnabled=true policy CANNOT arm a card whose file says false (regression: overlay used to honour it)", async () => {
+    const id = await seedKiwi(); // kiwi card declares deployEnabled: false
+    const policyId = (await insertPendingPolicy(id, "deployEnabled", JSON.stringify(true), "d"))!;
+    await approveProjectPolicy(policyId, "owner");
+    const effective = await effectiveProjectForRepo("acme/kiwi");
+    expect(effective?.deployEnabled).toBe(false); // the guarded-path card still gates
   });
 
   test("deploy/smoke are INERT in the overlay — sh -c commands come only from the card", () => {
@@ -235,10 +255,14 @@ describe("the overlay itself (pure — registry.applyPolicyOverlay)", () => {
     expect(effective?.smoke).toBe("echo smoke-from-card");
   });
 
-  test("DEPLOY_ENABLED=0 still overrides an approved deployEnabled=true policy (double gate holds)", async () => {
-    const id = await seedKiwi();
-    const policyId = (await insertPendingPolicy(id, "deployEnabled", JSON.stringify(true), "d"))!;
-    await approveProjectPolicy(policyId, "owner");
+  test("DEPLOY_ENABLED=0 still overrides a card-armed deployEnabled (double gate holds)", async () => {
+    // The card ITSELF arms deploy (the only way to arm it — see the
+    // narrow-only overlay test above); the global env gate must still win.
+    writeCard("kiwi", [
+      "---", "name: kiwi", "team: FAC", "repos: [acme/kiwi, acme/kiwi-api]", "merge: review",
+      "deploy: echo deploy-from-card", "smoke: echo smoke-from-card", "deployEnabled: true", "---", "", "Kiwi notes.",
+    ]);
+    await syncProjectsFromCards();
     const effective = await effectiveProjectForRepo("acme/kiwi");
     expect(effective?.deployEnabled).toBe(true); // the per-card flag is armed…
     expect(config.deployEnabled).toBe(false);    // …but the global gate is off in this suite
@@ -389,17 +413,56 @@ describe("handler-level two-tier enforcement", () => {
     expect(await listProjectPolicies(row!.id)).toEqual([]);
   });
 
-  test("propose → approve → reject flow through the handlers", async () => {
+  test("propose → approve → reject flow through the handlers (approve bound to the reviewed {key, value})", async () => {
     await seedKiwi();
     const proposed = await proposeProjectPolicy({ name: "kiwi", key: "merge", value: "shadow" });
     expect(proposed.status).toBe(200);
     const policyId = (proposed.json as { policyId: number }).policyId;
     expect((await effectiveProjectForRepo("acme/kiwi"))?.merge).toBe("review"); // still pending
-    expect((await approvePolicyItem(policyId)).status).toBe(200);
-    expect((await approvePolicyItem(policyId)).status).toBe(409); // double-click
+    expect((await approvePolicyItem(policyId, { key: "merge", value: "shadow" })).status).toBe(200);
+    expect((await approvePolicyItem(policyId, { key: "merge", value: "shadow" })).status).toBe(409); // double-click
     expect((await rejectPolicyItem(policyId)).status).toBe(409);  // already decided
     expect((await effectiveProjectForRepo("acme/kiwi"))?.merge).toBe("shadow");
-    expect((await approvePolicyItem(999_999)).status).toBe(404);
+    expect((await approvePolicyItem(999_999, { key: "merge", value: "shadow" })).status).toBe(404);
+  });
+
+  test("approve is evidence-bound: a blind or mismatched approve-by-id refuses and activates NOTHING", async () => {
+    await seedKiwi();
+    const proposed = await proposeProjectPolicy({ name: "kiwi", key: "merge", value: "auto" });
+    const policyId = (proposed.json as { policyId: number }).policyId;
+    // Blind approve (no evidence) → 400, never applied.
+    expect((await approvePolicyItem(policyId, {})).status).toBe(400);
+    expect((await approvePolicyItem(policyId, undefined)).status).toBe(400);
+    // Wrong value / wrong key → 409, never applied.
+    expect((await approvePolicyItem(policyId, { key: "merge", value: "shadow" })).status).toBe(409);
+    expect((await approvePolicyItem(policyId, { key: "deployEnabled", value: "auto" })).status).toBe(409);
+    expect((await effectiveProjectForRepo("acme/kiwi"))?.merge).toBe("review"); // untouched throughout
+    expect((await getProjectPolicy(policyId))?.state).toBe("pending");
+    // The matching evidence still works.
+    expect((await approvePolicyItem(policyId, { key: "merge", value: "auto" })).status).toBe(200);
+  });
+
+  test("proposing a new revision SUPERSEDES the earlier pending one — a never-rendered pending cannot be activated by id", async () => {
+    // The dashboard renders only the NEWEST pending revision per key, so an
+    // older pending row would be invisible yet approvable. Regression for the
+    // deployEnabled retract scenario: propose true, think better of it,
+    // propose false — the retracted true must be dead, not lurking.
+    const id = await seedKiwi();
+    const first = (await insertPendingPolicy(id, "merge", JSON.stringify("auto"), "d"))!;
+    const second = (await insertPendingPolicy(id, "merge", JSON.stringify("review"), "d"))!;
+    expect((await getProjectPolicy(first))?.state).toBe("superseded");
+    expect((await getProjectPolicy(second))?.state).toBe("pending");
+    // The stale id refuses even WITH matching evidence — it is no longer pending.
+    expect((await approvePolicyItem(first, { key: "merge", value: "auto" })).status).toBe(409);
+    expect(await approveProjectPolicy(first, "owner")).toBeNull();
+    expect(await activePoliciesByProjectName()).toEqual([]); // nothing took force
+    // Only the newest pending remains for the key.
+    const all = await listProjectPolicies(id);
+    expect(all.filter((p) => p.key === "merge" && p.state === "pending").map((p) => p.id)).toEqual([second]);
+    // Different keys never supersede each other.
+    const other = (await insertPendingPolicy(id, "repos", JSON.stringify(["acme/kiwi"]), "d"))!;
+    expect((await getProjectPolicy(second))?.state).toBe("pending");
+    expect((await getProjectPolicy(other))?.state).toBe("pending");
   });
 
   test("unknown project (no card, no row) → 404; groundskeeper toggle refuses coerced booleans", async () => {

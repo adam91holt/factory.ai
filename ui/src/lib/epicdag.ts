@@ -7,10 +7,10 @@ import { isMockMode } from "./fixtures";
 // stays the single AUTHORITY: nothing here decides anything. This module
 // re-derives, for DISPLAY, the same frontier/mutex classification from data
 // the dashboard already has:
-//   • GET /issue?key=<epic>  → the epic's children (identifier/title/state);
-//   • GET /issue?key=<child> → each child's description, whose START-ANCHORED
-//     factory meta block carries depends_on + touches (src/meta.ts);
-//   • MissionState           → in-flight runs + wipLimit (live from /state+SSE).
+//   • GET /epic-dag?key=<epic> → the epic's children WITH their depends_on +
+//     touches, resolved daemon-side in ONE Linear query (src/linear.ts
+//     getEpicDag, meta parsed by the authoritative src/meta.ts);
+//   • MissionState             → in-flight runs + wipLimit (live from /state+SSE).
 // The overlap test is the SAME conservative approximation as src/dag.ts
 // (duplicated by design, like the events shared block): biased toward
 // "overlap", because under-reporting a serialisation the daemon WILL apply
@@ -78,7 +78,9 @@ export interface DagView {
 // START-ANCHORED like the authoritative parser: a block buried in prose (or in
 // pasted/injected content) is ignored, so the graph can only show edges the
 // daemon itself would honor. Malformed identifiers are dropped; both arrays
-// are capped (same constants as meta.ts).
+// are capped (same constants as meta.ts). NOTE: the live fetch path no longer
+// calls this — /epic-dag ships meta parsed daemon-side by the authoritative
+// parser itself; this stays as the pinned display-side parity reference.
 // ---------------------------------------------------------------------------
 
 const BLOCK = /^\s*<!--\s*factory\b([\s\S]*?)-->/i;
@@ -315,52 +317,40 @@ export function buildEpicDag(tickets: DagTicket[], ctx: DagContext): DagView {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch: assemble DagTickets for one epic from GET /issue (the epic's children,
-// then each child's description for its meta block). Read-only, loopback.
+// Fetch: ONE GET /epic-dag round-trip. The daemon (src/linear.ts getEpicDag)
+// resolves the epic's children AND their depends_on/touches meta in a single
+// Linear GraphQL query, parsed by the AUTHORITATIVE src/meta.ts parser. The
+// previous shape — 1 + N /issue calls per refetch, N ≤ 40, every 30s — alone
+// exceeded Linear's hourly API-key budget from one open tab and pushed the
+// daemon's own pipeline traffic into rate-limit backoff. Never reintroduce a
+// per-child fetch here.
 // ---------------------------------------------------------------------------
 
-interface WireIssueDetail {
-  identifier: string;
-  title: string;
-  description: string;
-  stateName: string;
-  labels: string[];
-  children: Array<{ identifier: string; title: string; stateName: string; stateType?: string; labels?: string[] }>;
-}
-
-/** Children fetched per epic — a display cap, not a scheduling one. */
-const MAX_CHILDREN = 40;
-
-async function fetchIssue(key: string): Promise<WireIssueDetail> {
-  const res = await fetch(`/issue?key=${encodeURIComponent(key)}`);
-  if (!res.ok) throw new Error(`GET /issue?key=${key} → ${res.status}`);
-  return (await res.json()) as WireIssueDetail;
+interface WireEpicDag {
+  epic: { identifier: string; title: string };
+  tickets: Array<{
+    identifier: string; title: string; stateType?: string; stateName: string;
+    labels?: string[]; dependsOn?: string[]; touches?: string[];
+  }>;
 }
 
 export async function fetchEpicDag(epicKey: string): Promise<{ epic: { identifier: string; title: string }; tickets: DagTicket[] }> {
   if (isMockMode()) return mockEpicDag();
-  const epic = await fetchIssue(epicKey);
-  const children = epic.children.slice(0, MAX_CHILDREN);
-  const tickets = await Promise.all(children.map(async (c) => {
-    let meta = { dependsOn: [] as string[], touches: [] as string[] };
-    try {
-      meta = parseDagMeta((await fetchIssue(c.identifier)).description);
-    } catch {
-      // A child whose detail read fails still renders as a node — just with no
-      // declared edges (the daemon would fail closed; the VIEW degrades open
-      // because it decides nothing).
-    }
-    return {
-      identifier: c.identifier,
-      title: c.title,
-      stateType: c.stateType ?? "",
-      stateName: c.stateName,
-      labels: c.labels ?? [],
-      dependsOn: meta.dependsOn,
-      touches: meta.touches,
-    };
-  }));
-  return { epic: { identifier: epic.identifier, title: epic.title }, tickets };
+  const res = await fetch(`/epic-dag?key=${encodeURIComponent(epicKey)}`);
+  if (!res.ok) throw new Error(`GET /epic-dag?key=${epicKey} → ${res.status}`);
+  const wire = (await res.json()) as WireEpicDag;
+  return {
+    epic: { identifier: wire.epic.identifier, title: wire.epic.title },
+    tickets: (wire.tickets ?? []).map((t) => ({
+      identifier: t.identifier,
+      title: t.title,
+      stateType: t.stateType ?? "",
+      stateName: t.stateName,
+      labels: t.labels ?? [],
+      dependsOn: t.dependsOn ?? [],
+      touches: t.touches ?? [],
+    })),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -170,14 +170,21 @@ export type TierConfig = Partial<Record<RiskRoutedStage, { cheap?: string; stron
  *  config: the SHAPE of "how much model does this risk buy" is policy this
  *  repo owns, and an env knob that could dial a critical-risk reviewer down
  *  to cheap isn't a cap. Invariants (pinned by tests/risk.test.ts):
- *    - the three cross-vendor gate stages (reviewerClaude, reviewerCodex,
- *      securityReviewer) NEVER map below "standard" — risk routing may only
- *      strengthen a safety gate, never weaken one below the operator's
- *      configured default;
+ *    - EVERY stage whose output reaches buildMergeEvidence or a hold reason
+ *      (reviewerClaude, reviewerCodex, securityReviewer, designReviewer,
+ *      tester — i.e. every gate-verdict producer; only the fixer is exempt,
+ *      it produces no verdict) NEVER maps below "standard" — risk routing may
+ *      only strengthen a safety gate, never weaken one below the operator's
+ *      configured default. This matters most at LOW risk: the low class is
+ *      threshold-aligned with the merge ladder's lowRiskMaxDiff, so "low
+ *      risk" describes exactly the runs that can auto-merge unattended —
+ *      the tester (the only source of the real→strong browser-evidence
+ *      upgrade) and the design reviewer (the only source of the taste hold)
+ *      must not be the roster's weakest models on precisely those runs;
  *    - every stage at "critical" maps to "strong";
  *    - "medium" is all-standard — the exact pre-feature behavior. */
 export const RISK_MODEL_TIERS: Readonly<Record<RiskClass, Readonly<Record<RiskRoutedStage, ModelTier>>>> = Object.freeze({
-  low: Object.freeze({ fixer: "cheap", reviewerClaude: "standard", reviewerCodex: "standard", securityReviewer: "standard", designReviewer: "cheap", tester: "cheap" } as const),
+  low: Object.freeze({ fixer: "cheap", reviewerClaude: "standard", reviewerCodex: "standard", securityReviewer: "standard", designReviewer: "standard", tester: "standard" } as const),
   medium: Object.freeze({ fixer: "standard", reviewerClaude: "standard", reviewerCodex: "standard", securityReviewer: "standard", designReviewer: "standard", tester: "standard" } as const),
   high: Object.freeze({ fixer: "standard", reviewerClaude: "strong", reviewerCodex: "strong", securityReviewer: "strong", designReviewer: "standard", tester: "standard" } as const),
   critical: Object.freeze({ fixer: "strong", reviewerClaude: "strong", reviewerCodex: "strong", securityReviewer: "strong", designReviewer: "strong", tester: "strong" } as const),

@@ -78,8 +78,8 @@ export function ProjectDetailPage({ name }: { name: string }) {
     onSettled: () => setGkSaving(null),
   });
   const decide = useMutation({
-    mutationFn: ({ policyId, action }: { policyId: number; action: "approve" | "reject" }) =>
-      decidePolicy(policyId, action),
+    mutationFn: ({ policyId, action, evidence }: { policyId: number; action: "approve" | "reject"; evidence: { key: string; value: unknown } }) =>
+      decidePolicy(policyId, action, evidence),
     onMutate: ({ policyId }) => setDeciding(policyId),
     onSuccess: (res) => settle("policy", res),
     onError: (e) => setError("policy", e instanceof Error ? e.message : "decision failed"),
@@ -179,7 +179,7 @@ export function ProjectDetailPage({ name }: { name: string }) {
           project={project}
           now={now}
           deciding={deciding}
-          onDecide={(policyId, action) => decide.mutate({ policyId, action })}
+          onDecide={(policyId, action, evidence) => decide.mutate({ policyId, action, evidence })}
           decisionError={errors.policy ?? null}
         />
         <div className="flex flex-col gap-3">
