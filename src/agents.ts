@@ -55,6 +55,8 @@ interface StageOptions {
   budgetUsd: number;      // REMAINING issue budget, not a constant (C11)
   deadlineMs: number;     // absolute epoch ms; stage aborts at this time (C12)
   onEvent?: (event: AgentStreamEvent) => void;   // live stage telemetry (UI observes)
+  /** Materialized-skill pins: relPath → "name@version" (skillReadDetail). */
+  skillPins?: Record<string, string>;
   resume?: string;                               // resume a prior session (interrupted-run recovery)
   // Fired ONCE per stage on the system/init message, before any tool call —
   // persist for resume. May be async (the store is Postgres now): runStage
@@ -214,7 +216,10 @@ export function delegateRosterViolations(roster: DelegateRoster | undefined, par
   for (const [name, def] of Object.entries(roster.agents)) {
     if (name === "worker") violations.push(`delegate "${name}": reserved subagent name`);
     if (def.model !== "inherit") violations.push(`delegate "${name}": model must be "inherit" (proxied stages 502 on named models)`);
-    if (def.maxTurns > SUBAGENT_MAX_TURNS || def.maxTurns < 1) violations.push(`delegate "${name}": maxTurns must be within the in-code subagent cap (${SUBAGENT_MAX_TURNS})`);
+    // Number.isInteger first: NaN fails BOTH comparisons below, which would
+    // fail OPEN on a cap check (review finding) — a cap that NaN walks past
+    // is not a cap.
+    if (!Number.isInteger(def.maxTurns) || def.maxTurns > SUBAGENT_MAX_TURNS || def.maxTurns < 1) violations.push(`delegate "${name}": maxTurns must be an integer within the in-code subagent cap (${SUBAGENT_MAX_TURNS})`);
     for (const t of SUBAGENT_DISALLOWED_TOOLS) {
       if (!def.disallowedTools.includes(t)) violations.push(`delegate "${name}": must deny ${t} (depth-1 / side-channel invariant)`);
     }
@@ -236,8 +241,29 @@ export function subagentSpawnDetail(tool: string, input: unknown, pins: Record<s
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "";
   const subagentType = (input as Record<string, unknown>).subagent_type;
   if (typeof subagentType !== "string") return "";
-  const pin = pins?.[subagentType];
-  return pin === undefined ? "" : `subagent_type=${pin}`;
+  // Own-property only: `subagent_type: "constructor"` must not resolve an
+  // Object.prototype member into a fabricated delegation record (review
+  // finding — the event trail is audit evidence).
+  const pin = pins !== undefined && Object.hasOwn(pins, subagentType) ? pins[subagentType] : undefined;
+  return typeof pin === "string" ? `subagent_type=${pin}` : "";
+}
+
+/** #17 skill-usage observability (spec bullet: "a skill Read surfaces in
+ *  events with name@version"): when a tool call's file path targets a
+ *  MATERIALIZED register skill, resolve it to the pinned "skill=name@version"
+ *  for the tool-use event detail. `pins` maps the materialized relPath
+ *  (".factory/skills/<name>.md") to its pin — built by loop.ts from the
+ *  MaterializeReport, so only files the factory actually wrote this run
+ *  resolve. Every other tool use returns "" (the additive pin). */
+export function skillReadDetail(tool: string, input: unknown, pins: Record<string, string> | undefined): string {
+  if (pins === undefined || tool === "" || typeof input !== "object" || input === null || Array.isArray(input)) return "";
+  const raw = (input as Record<string, unknown>).file_path ?? (input as Record<string, unknown>).path;
+  if (typeof raw !== "string" || raw === "") return "";
+  const norm = raw.replaceAll("\\", "/");
+  for (const [rel, pin] of Object.entries(pins)) {
+    if (norm === rel || norm.endsWith(`/${rel}`)) return `skill=${pin}`;
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -627,9 +653,13 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
             // resolves its subagent_type to "name@version" in the detail; every
             // other tool use (worker spawns included) is byte-identical to before.
             const spawn = subagentSpawnDetail(block.name, block.input, opts.delegates?.pins);
+            // #17 skill observability: a Read of a materialized register skill
+            // carries its name@version pin (usage-attribution seam for #11).
+            const skill = skillReadDetail(block.name, block.input, opts.skillPins);
             const summary = summarizeToolInput(block.input);
+            const prefix = [spawn, skill].filter((s) => s !== "").join(" ");
             opts.onEvent?.({ kind: "tool_use", stage: label, tool: block.name,
-              detail: redactSecrets(spawn === "" ? summary : `${spawn} ${summary}`.trim()).clean.slice(0, 160) });
+              detail: redactSecrets(prefix === "" ? summary : `${prefix} ${summary}`.trim()).clean.slice(0, 160) });
           } else if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
             opts.onEvent?.({ kind: "assistant_text", stage: label,
               text: redactSecrets(block.text).clean.slice(0, 500) });

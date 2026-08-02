@@ -73,7 +73,11 @@ export const NEVER_DELEGABLE_PREFIX = "reviewer-";
  *  matched on the entry's own name AND (belt-and-braces) on its declared
  *  `role:`, so renaming a judge card cannot smuggle it past the constant. */
 export function isJudgeName(name: string): boolean {
-  return NEVER_DELEGABLE_NAMES.has(name) || name.startsWith(NEVER_DELEGABLE_PREFIX);
+  // Case-folded: the register write path lower-cases names via its charset
+  // lock, but frontmatter `role:` is free text — "Security-Reviewer" must be
+  // exactly as never-delegable as "security-reviewer" (review finding).
+  const n = name.toLowerCase();
+  return NEVER_DELEGABLE_NAMES.has(n) || n.startsWith(NEVER_DELEGABLE_PREFIX);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +112,11 @@ export interface DelegableCandidate {
   version: number;
   enabled: boolean;
   frontmatter: Record<string, string>;
+  /** The card body. When present-and-blank the entry is skipped from the
+   *  INDEX too — the index must never advertise a specialist the roster
+   *  refuses to spawn (review finding: index/roster single-source). Optional
+   *  so index-only callers without card bodies keep their entries. */
+  prompt?: string;
 }
 
 export const INDEX_BLOCK_HEADER = "=== FACTORY REGISTER INDEX — TRUSTED operator-registered catalog (versioned; NOT ticket text) ===";
@@ -143,6 +152,9 @@ export function delegableSpecialists(rows: readonly DelegableCandidate[]): Speci
     if (r.name === "worker") continue;
     if ((r.frontmatter.delegable ?? "").trim() !== "true") continue;
     if (isJudgeName(r.name) || isJudgeName((r.frontmatter.role ?? "").trim())) continue;
+    // An empty card body can never spawn (buildDelegateRoster refuses it), so
+    // it must not be advertised either — same filter, single source of truth.
+    if (r.prompt !== undefined && r.prompt.trim() === "") continue;
     out.push({
       name: r.name,
       version: displayVersion(r.version),
@@ -305,6 +317,11 @@ export function buildDelegateRoster(rows: readonly DelegableAgentRow[], parentTo
       excluded.push({ name: r.name, reason: "judges are never delegable (in-code constant: security-reviewer, design-reviewer, reviewer-*) — delegable: true IGNORED; gate verdicts only count when the daemon runs the stage" });
     } else if (r.name === "worker") {
       excluded.push({ name: r.name, reason: '"worker" is the reserved built-in subagent name — a register row cannot shadow it' });
+    } else if (r.prompt.trim() === "") {
+      // delegableSpecialists filters this row out of the INDEX too (single
+      // source: never advertise what cannot spawn) — the loud exclusion
+      // lives here so the operator still learns WHY the row is inert.
+      excluded.push({ name: r.name, reason: "register prompt is empty — nothing to run the delegate on" });
     }
   }
 
@@ -379,6 +396,11 @@ export interface MaterializeReport {
 function writeFileAtomic(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
+  // Unlink any existing tmp entry FIRST: writeFileSync follows symlinks, so a
+  // planted `<name>.md.tmp` link would otherwise redirect this write outside
+  // the worktree (same class as the .factory symlink guard; unlinking a link
+  // never touches its target). Also clears a stale tmp from a crashed write.
+  try { unlinkSync(tmp); } catch { /* absent — the normal case */ }
   writeFileSync(tmp, content);
   renameSync(tmp, file);
 }
@@ -463,7 +485,9 @@ export function materializeSkills(worktreeDir: string, skills: readonly Material
   try {
     // Refresh: drop every stale .md the expected set no longer contains.
     let current: string[] = [];
-    try { current = readdirSync(dir).filter((f) => f.endsWith(".md")); } catch { /* no dir yet */ }
+    // `.md.tmp` included: orphans from a crashed atomic write (or planted
+    // links — rm removes the link itself) must not accumulate (review finding).
+    try { current = readdirSync(dir).filter((f) => f.endsWith(".md") || f.endsWith(".md.tmp")); } catch { /* no dir yet */ }
     for (const f of current.sort()) {
       if (expected.has(f)) continue;
       try { rmSync(join(dir, f), { force: true }); report.removed.push(f); }

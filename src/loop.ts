@@ -596,6 +596,14 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       delegableSpecialists(agentRows));
     /** The TRUSTED index block for a routed stage — "" for non-orchestrators. */
     const indexFor = (route: StageRoute): string => indexBlockForStage(route.tools, registerIndex);
+    /** Materialized-skill pins for event detail (agents.ts skillReadDetail):
+     *  relPath → "name@version", built from what ACTUALLY materialized — a
+     *  worker Read of `.factory/skills/<name>.md` then surfaces in the event
+     *  trail with its version pin (issue #17 Verification bullet; the usage-
+     *  attribution seam #11 consumes). Empty map → omitted → additive. */
+    const skillPins: Record<string, string> = Object.fromEntries(
+      materialization.materialized.map((m) => [m.relPath, `${m.name}@${m.version}`]));
+    const skillPinsOpt = Object.keys(skillPins).length > 0 ? { skillPins } : {};
     /** Stage-boundary skill REFRESH (finding fix): setup's materialization runs
      *  ONCE, but the implementer (bare Write) and the fixer family run in this
      *  same worktree before later stages read `.factory/skills/` — so a
@@ -726,7 +734,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${implSpec}`);
     const implDelegates = delegatesFor(implRoute);
     const implOpts = { model: implModel, effort: implEffort, cwd: ws.dir, allowedTools: implRoute.tools, maxTurns: config.caps.turnsImplementer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
-      ...(implDelegates ? { delegates: implDelegates } : {}),
+      ...(implDelegates ? { delegates: implDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "implementer", id) };
     // Resume an interrupted implementer: a lingering session row means the prior
     // run was cut off mid-build (process killed) — pick up its actual conversation
@@ -847,7 +855,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${specForFixer}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`);
     const fixDelegates = delegatesFor(fixerRoute);
     const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
-      ...(fixDelegates ? { delegates: fixDelegates } : {}),
+      ...(fixDelegates ? { delegates: fixDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
     const priorFixSession = await getStageSession(issue.identifier, "fixer");
     let fixer = await runStage("fixer", fixPrompt, { ...fixOpts, ...(priorFixSession ? { resume: priorFixSession } : {}) });
@@ -1015,7 +1023,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${specForTester}`);
       const testerDelegates = delegatesFor(testerRoute);
       const testerOpts = { model: resolveModelForRisk("tester", meta, risk.class), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card)), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT,
-        ...(testerDelegates ? { delegates: testerDelegates } : {}),
+        ...(testerDelegates ? { delegates: testerDelegates } : {}), ...skillPinsOpt,
         onSessionId: (id: string) => recordStageSession(issue.identifier, "tester", id) };
       const priorTesterSession = await getStageSession(issue.identifier, "tester");
       let tester = await runStage("tester", testerPrompt, { ...testerOpts, ...(priorTesterSession ? { resume: priorTesterSession } : {}) });
