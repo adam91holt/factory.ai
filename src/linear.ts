@@ -233,7 +233,7 @@ export function queueLane(labels: readonly string[], stateDescription: string | 
 const QUEUE_PAGE = 50;
 
 /** Every label that holds an issue OUT of the claimable queue. This is BOTH the
- *  server-side `labels: { none: ... }` exclusion in fetchQueue's GraphQL filter
+ *  server-side `labels: { every: { name: { nin } } }` exclusion in fetchQueue's GraphQL filter
  *  AND the client-side skip-set (belt-and-braces) — one list, so the two can
  *  never disagree about what "held" means. */
 export const HOLD_LABELS: readonly string[] = [
@@ -248,7 +248,12 @@ export const HOLD_LABELS: readonly string[] = [
  * crowd fresh Todo tickets past the page boundary (label filtering only
  * happened client-side, AFTER server truncation). Now:
  *   - `queue`: unstarted MINUS hold labels, excluded SERVER-side
- *     (`labels: { none: { name: { in: HOLD_LABELS } } }`) — held backlog can no
+ *     (`labels: { every: { name: { nin: HOLD_LABELS } } }`) — held backlog can no
+ *     NOTE the shape: Linear's IssueLabelCollectionFilter has NO `none` field
+ *     (live 400, first live tick 2026-08-02 — the unit tests pin the query
+ *     string, not Linear's acceptance of it). `every.nin` is the exclusion
+ *     form Linear accepts, and its vacuous truth on unlabeled issues is
+ *     load-bearing: a fresh unlabeled ticket must be eligible.
  *     longer crowd this page, however large it grows.
  *   - `held`: the complement (`labels: { some: ... }`), fetched ONLY so the
  *     queue_snapshot keeps rendering parked/needs-human cards on the dashboard
@@ -263,7 +268,7 @@ export async function fetchQueue(deps: LinearTransportDeps = defaultDeps): Promi
       queue: issues(first: $first, filter: {
         team: { key: { in: $teams } },
         state: { type: { eq: "unstarted" } },
-        labels: { none: { name: { in: $hold } } }
+        labels: { every: { name: { nin: $hold } } }
       }) { nodes { ${ISSUE_FIELDS} } }
       held: issues(first: $first, filter: {
         team: { key: { in: $teams } },

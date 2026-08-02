@@ -5,7 +5,8 @@
 // reads — label filtering only happened client-side, AFTER truncation, so a
 // backlog of blocked/needs-human issues could crowd fresh Todo tickets out of
 // the page entirely (the daemon would see an "empty" queue). The fix sends the
-// exclusion to the SERVER (`labels: { none: { name: { in: HOLD_LABELS } } }`)
+// exclusion to the SERVER (`labels: { every: { name: { nin: HOLD_LABELS } } }` —
+// Linear's IssueLabelCollectionFilter has NO `none` field; live 400, 2026-08-02)
 // and fetches the held complement as a second aliased page in the same request
 // so the dashboard's queue_snapshot keeps rendering parked/needs-human cards
 // (the WP3 promise). These tests pin, via the injectable transport deps:
@@ -63,7 +64,7 @@ describe("fetchQueue — server-side hold-label exclusion", () => {
     ].sort());
   });
 
-  test("ONE request carries BOTH server-side filters: none-in for the queue page, some-in for the held page", async () => {
+  test("ONE request carries BOTH server-side filters: every-nin for the queue page, some-in for the held page", async () => {
     const { deps, bodies } = queueDeps([node("FAC-1")], []);
     await fetchQueue(deps);
     expect(bodies.length).toBe(1); // aliased pages, not a second round-trip
@@ -71,7 +72,7 @@ describe("fetchQueue — server-side hold-label exclusion", () => {
     // The queue page excludes hold labels ON THE SERVER — this filter existing
     // in the request is the whole fix: held backlog can no longer crowd the
     // server-truncated page before any client code runs.
-    expect(query.replace(/\s+/g, " ")).toContain("labels: { none: { name: { in: $hold } } }");
+    expect(query.replace(/\s+/g, " ")).toContain("labels: { every: { name: { nin: $hold } } }");
     // The held complement is fetched only for the dashboard snapshot.
     expect(query.replace(/\s+/g, " ")).toContain("labels: { some: { name: { in: $hold } } }");
     // And the variable really carries every hold label.
@@ -124,7 +125,7 @@ describe("fetchQueue — server-side hold-label exclusion", () => {
   });
 
   test("a hand-dragged Blocked card (state tag, NO label) stays out of the claimable queue via its lane source", async () => {
-    // No factory label ⇒ the server's none-in filter can NOT exclude it, and
+    // No factory label ⇒ every.nin is vacuously TRUE (load-bearing: fresh unlabeled tickets stay eligible), and
     // the client skip-set won't either — it lands in the queue page. That is
     // today's (pre-existing) claim behaviour, pinned here so a change to it is
     // a decision, not an accident; its LANE must still render as parked.
