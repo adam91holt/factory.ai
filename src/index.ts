@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import { fetchQueue, fetchStatesByIdentifiers, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
 import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
@@ -77,6 +78,7 @@ function acquireLease(): void {
 }
 
 let draining = false;
+let restartAfterDrain = false;
 // identifier → its declared `touches` globs (the file-mutex key). Was a Set;
 // now a Map so the scheduler can read in-flight children's touches to serialize
 // any candidate whose globs would overlap. .size/.has/.delete are unchanged.
@@ -274,6 +276,13 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => { draining = true; console.log("draining — will exit after current tick"); });
   process.on("SIGTERM", () => { draining = true; });
+  // Config/code reload without operator choreography (fix-list #5: every cap
+  // or roster change used to need kill + wait-for-drain + manual restart,
+  // observed twice live 2026-08-02). SIGHUP drains exactly like SIGTERM, then
+  // the exit path below execs a fresh daemon that re-reads .env and the code
+  // on disk. In-flight work is never cut — this is drain-then-exec, not a
+  // hot reload.
+  process.on("SIGHUP", () => { restartAfterDrain = true; draining = true; console.log("SIGHUP — draining, then self-restarting on current code/.env"); });
 
   // #2: a single transient 503/429 used to park EVERY tick for a flat 300s —
   // freezing all claiming for five minutes over one blip. This grows from a
@@ -320,6 +329,16 @@ async function main(): Promise<void> {
   await flushEvents();
   await dashboard?.close();
   rmSync(LEASE, { force: true });
+  if (restartAfterDrain) {
+    // Lease already released above, so the child acquires it cleanly. stdio
+    // inherit keeps the operator's existing log redirection; detached+unref
+    // lets THIS process exit without reaping the child.
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [fileURLToPath(new URL("index.ts", import.meta.url)), ...process.argv.slice(2)],
+      { detached: true, stdio: "inherit" });
+    child.unref();
+    console.log(`[restart] fresh daemon spawned (pid ${child.pid}) — this process exits now`);
+  }
 }
 
 main().catch((error) => {

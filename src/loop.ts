@@ -691,10 +691,21 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     if (budget.expired) { await park(issue, repo, stages, budget.expiredReason, ws); return; }
 
     // ---- fixer (fresh context; reviewer output is untrusted too — M6)
-    const fixer = await runStage("fixer",
-      ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec, reviews: untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`) },
-        `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`),
-      { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+    // Resume seam (fix-list #3 follow-through): the fixer is a long write
+    // stage exactly like the implementer, so an interrupted daemon resumes it
+    // instead of paying for a fresh run. Reviewer legs stay stateless by
+    // design — they are cheap to rerun and their independence is the point.
+    const fixPrompt = ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec, reviews: untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`) },
+        `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`);
+    const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+      onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
+    const priorFixSession = await getStageSession(issue.identifier, "fixer");
+    let fixer = await runStage("fixer", fixPrompt, { ...fixOpts, ...(priorFixSession ? { resume: priorFixSession } : {}) });
+    if (priorFixSession && fixer.error) {
+      console.error(`[${issue.identifier}] fixer resume failed (${fixer.error}); retrying fresh`);
+      fixer = await runStage("fixer", fixPrompt, fixOpts);
+    }
+    await clearStageSession(issue.identifier, "fixer");
     stages.push(fixer);
     await postStageComment(issue, fixer);
     if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`, ws); return; }
@@ -845,10 +856,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     let verificationReport: string | null = null;
     let browser: BrowserEvidence = requiresBrowserEvidence(ws) ? "missing" : "not-required";
     if ((requiresBrowserEvidence(ws) || wantsBrowserVerification(issue.description)) && hasPlaywright(ws) && !budget.expired) {
-      const tester = await runStage("tester",
-        renderPrompt(testerRoute.card, { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
-          `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`),
-        { model: resolveModelForRisk("tester", meta, risk.class), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card)), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT });
+      const testerPrompt = renderPrompt(testerRoute.card, { spec, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
+          `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${spec}`);
+      const testerOpts = { model: resolveModelForRisk("tester", meta, risk.class), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card)), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT,
+        onSessionId: (id: string) => recordStageSession(issue.identifier, "tester", id) };
+      const priorTesterSession = await getStageSession(issue.identifier, "tester");
+      let tester = await runStage("tester", testerPrompt, { ...testerOpts, ...(priorTesterSession ? { resume: priorTesterSession } : {}) });
+      if (priorTesterSession && tester.error) {
+        console.error(`[${issue.identifier}] tester resume failed (${tester.error}); retrying fresh`);
+        tester = await runStage("tester", testerPrompt, testerOpts);
+      }
+      await clearStageSession(issue.identifier, "tester");
       stages.push(tester);
       // Structured resolution (schema → fenced json → VERDICT token → null).
       // "uncertain" is the structured spelling of the old "VERDICT: partial";

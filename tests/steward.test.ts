@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { childrenAllTerminal, stewardEligible } from "../src/steward.ts";
+import { childrenAllTerminal, stewardEligible, sanitizeFollowUpTitle } from "../src/steward.ts";
 import { liftPreconditions, parsePreconditions } from "../src/precondition.ts";
 import { withFactoryMeta } from "../src/meta.ts";
 
@@ -120,5 +120,24 @@ describe("stewardEligible — canceled epics are never closed out (live bug 2026
 
   test("completed epics remain eligible — closeout of finished work is the steward's job", () => {
     expect(stewardEligible({ ...base, stateType: "completed" })).toBe(true);
+  });
+});
+
+describe("sanitizeFollowUpTitle — model-guessed identifiers never reach a title (live bug 2026-08-02)", () => {
+  test("THE PIN: the exact live shapes — predicted FAC-49/FAC-50 prefixes stripped", () => {
+    expect(sanitizeFollowUpTitle("FAC-49 — Verify merged-but-canceled Stack Attack"))
+      .toBe("Verify merged-but-canceled Stack Attack");
+    expect(sanitizeFollowUpTitle("FAC-50 — Rebuild missing FAC-42 scope: Royal Roll minigame"))
+      .toBe("Rebuild missing FAC-42 scope: Royal Roll minigame"); // mid-title FAC-42 reference kept
+  });
+
+  test("bracketed / colon / stacked prefixes all strip; plain titles untouched", () => {
+    expect(sanitizeFollowUpTitle("[FAC-12] Fix the flaky gate")).toBe("Fix the flaky gate");
+    expect(sanitizeFollowUpTitle("FAC-9: FAC-10 - Chained guesses")).toBe("Chained guesses");
+    expect(sanitizeFollowUpTitle("Ship the DAG view")).toBe("Ship the DAG view");
+  });
+
+  test("a genuine reference later in the title survives", () => {
+    expect(sanitizeFollowUpTitle("Clean up worktrees left by FAC-42")).toBe("Clean up worktrees left by FAC-42");
   });
 });

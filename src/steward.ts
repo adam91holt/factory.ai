@@ -128,7 +128,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         "Consider: which PRs are mergeable and in what order (shared files = order matters — pull the diffs to confirm overlap rather than guessing); whether an integration/conflict-resolution follow-up ticket is needed; whether parked/needs-human children need a retry ticket or human escalation; what the parent's status summary should say.",
         "OUTPUT PROTOCOL (files in your working directory):",
         "- summary.md (REQUIRED): the parent-ticket comment — outcome overview, recommended merge order with reasoning, what you decided and why, what the human must do. Write for a busy human.",
-        "- tickets/<NN>-<slug>.md (OPTIONAL, 0-3): follow-up tickets you decided to file. First line '# <title>'; body MUST follow the factory ticket contract (## Goal, ## Why, ## Outcomes, ## Repo, ## Verifications; add ## Area).",
+        "- tickets/<NN>-<slug>.md (OPTIONAL, 0-3): follow-up tickets you decided to file. First line '# <title>' — NEVER include an issue identifier (FAC-12 etc.) in the title, Linear assigns those; body MUST follow the factory ticket contract (## Goal, ## Why, ## Outcomes, ## Repo, ## Verifications; add ## Area).",
         "  Each follow-up SHOULD carry a '## Precondition' line stating the machine-checkable premise under which it is worth running, so the factory self-cancels it if the premise is already satisfied by the time it's picked up. One per line, from this vocabulary: `pr-open <url|org/repo#N|#N>` (worth running only while that PR is still open), `path-missing <relpath>` (only while that file is still absent), `path-exists <relpath>`, `text-present <relpath>::<needle>` (only while the file still contains the needle — e.g. the bug is still there), `text-absent <relpath>::<needle>`. Omit the section if no liveness premise fits — never invent one.",
         "Reply with one line: what you decided.",
         "",
@@ -167,7 +167,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
       for (const f of ticketFiles.slice(0, 3)) {
         const body = readFileSync(join(scratch, "tickets", f), "utf8").trim();
         const lines = body.split("\n");
-        const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
+        const title = sanitizeFollowUpTitle((lines[0] ?? "").replace(/^#\s*/, "").trim());
         const description = lines.slice(1).join("\n").trim();
         // Stamp factory-authored follow-ups with a TRUSTED block at offset 0
         // (and strip any block the model embedded after reading untrusted epic/
@@ -232,6 +232,23 @@ export function stewardEligible(epic: { labels: readonly string[]; stateType: st
   if (epic.labels.includes(linear.STEWARDED_LABEL)) return false;
   if (epic.stateType === "canceled") return false;
   return true;
+}
+
+/** Strip model-GUESSED issue identifiers from a follow-up title's front.
+ *  Live 2026-08-02: the steward predicted its follow-ups would be FAC-49/50
+ *  and baked those into the titles — the canaries already owned those
+ *  numbers, so the board showed two tickets cross-referencing unrelated
+ *  work. Linear assigns identifiers; a title never carries one. Deliberately
+ *  ONLY strips the leading prefix — a genuine mid-title reference to an
+ *  EXISTING ticket ("clean up after FAC-42") is legitimate context. */
+export function sanitizeFollowUpTitle(raw: string): string {
+  let title = raw.trim();
+  for (;;) {
+    const next = title.replace(/^\[?[A-Z][A-Z0-9]*-\d+\]?\s*(?:[—–:-]\s*)?/, "");
+    if (next === title) break;
+    title = next.trim();
+  }
+  return title;
 }
 
 export async function stewardTick(): Promise<void> {
