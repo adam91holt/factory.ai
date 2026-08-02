@@ -50,7 +50,7 @@ async function pace(sleep: (ms: number) => Promise<void> = (ms) => new Promise((
 async function runBackgroundPasses(): Promise<void> {
   await stewardTick().catch((error) => console.error(`[steward] ${error instanceof Error ? error.message : error}`));
   await pace();
-  await reconcileTick().catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
+  await reconcileTick(new Set(inFlight.keys())).catch((error) => console.error(`[reconcile] ${error instanceof Error ? error.message : error}`));
   await pace();
   await groundskeeperTick().catch((error) => console.error(`[groundskeeper] ${error instanceof Error ? error.message : error}`));
   await pace();

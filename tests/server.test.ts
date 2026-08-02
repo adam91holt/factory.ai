@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { Readable } from "node:stream";
+import { config } from "../src/config.ts";
+import { guardedJsonBody } from "../src/server.ts";
 import { applyEvent, redactIssueDetail } from "../src/server.ts";
 import type { FactoryEvent, FactoryEventBody, MissionState } from "../src/events.ts";
 import type { IssueDetail } from "../src/linear.ts";
@@ -227,5 +230,58 @@ describe("redactIssueDetail (B10)", () => {
 
   test("a null parent stays null", () => {
     expect(redactIssueDetail(detail()).parent).toBeNull();
+  });
+});
+
+
+// Minimal HTTP fakes for guardedJsonBody: a Readable carrying a JSON body
+// (readBoundedBody consumes data/end events) + a response stub capturing the
+// verdict. 200 here means "the guard resolved a body" — routes decide the rest.
+async function runGuard(headers: { origin?: string; host?: string }): Promise<{ res: { statusCode: number }; out: string }> {
+  const req = Readable.from([Buffer.from('{"ok":true}')]) as unknown as import("node:http").IncomingMessage;
+  (req as unknown as { method: string }).method = "POST";
+  (req as unknown as { headers: Record<string, string> }).headers = {
+    "content-type": "application/json",
+    ...(headers.origin ? { origin: headers.origin } : {}),
+    ...(headers.host ? { host: headers.host } : {}),
+  };
+  const state = { statusCode: 200, out: "" };
+  const res = {
+    writeHead: (code: number) => { state.statusCode = code; },
+    end: (s?: string) => { state.out = s ?? ""; },
+  } as unknown as import("node:http").ServerResponse;
+  const body = await guardedJsonBody(req, res);
+  if (body !== null) state.statusCode = 200;
+  return { res: { statusCode: state.statusCode }, out: state.out };
+}
+
+describe("guardedJsonBody — operator-trusted origins (tailscale serve)", () => {
+  // config.trustedOrigins is empty in tests (env unset); mutate + restore the
+  // same way postmerge.test.ts toggles config.deployEnabled.
+  const TS = "https://dreamteam.taild7c7a.ts.net";
+  afterEach(() => { config.trustedOrigins = []; });
+
+  test("a ts.net origin is REFUSED by default — empty allowlist keeps loopback-only behavior", async () => {
+    const { res, out } = await runGuard({ origin: TS, host: "dreamteam.taild7c7a.ts.net" });
+    expect(res.statusCode).toBe(403);
+    expect(out).toContain("refused");
+  });
+
+  test("an exact-match trusted origin is accepted, Origin and Host legs both", async () => {
+    config.trustedOrigins = [TS];
+    const { res } = await runGuard({ origin: TS, host: "dreamteam.taild7c7a.ts.net" });
+    expect(res.statusCode).toBe(200);
+  });
+
+  test("a DIFFERENT https origin is still refused even with the allowlist populated — exact match only", async () => {
+    config.trustedOrigins = [TS];
+    const { res } = await runGuard({ origin: "https://evil.example.com", host: "dreamteam.taild7c7a.ts.net" });
+    expect(res.statusCode).toBe(403);
+  });
+
+  test("DNS-rebinding shape stays dead: attacker Host with attacker Origin matches nothing", async () => {
+    config.trustedOrigins = [TS];
+    const { res } = await runGuard({ origin: "https://attacker.example", host: "attacker.example" });
+    expect(res.statusCode).toBe(403);
   });
 });

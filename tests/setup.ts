@@ -40,3 +40,4 @@ process.env.FACTORY_CATALOG_NO_COMMIT ??= "1";
 //    write-behind queue is the thing it exists to pin.
 //  - The SQL is byte-identical to production's; PGlite is real Postgres.
 process.env.FACTORY_DATABASE_URL = "";
+process.env.FACTORY_TRUSTED_ORIGINS = ""; // guard tests pin the loopback-only DEFAULT; the operator's real .env value must not leak in

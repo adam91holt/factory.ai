@@ -35,6 +35,11 @@ export interface StageResult {
 
 interface StageOptions {
   model: string;
+  /** The Linear issue this stage serves — lets reconcile's claim-loss sweep
+   *  abort exactly this issue's stages (abortIssueStages). Optional: stages
+   *  outside an issue context (groundskeepers, catalog probes) omit it and
+   *  are only reachable by the global kill switch. */
+  issueKey?: string;
   cwd?: string;
   allowedTools?: string[];
   maxTurns: number;
@@ -230,7 +235,17 @@ export function forbiddenToolViolations(tools: string[]): string[] {
 // registry and aborts everything in one shot. Keyed by a per-call id, not
 // `label` — multiple concurrent issues can run the same stage label at once.
 // ---------------------------------------------------------------------------
-const activeStages = new Map<string, { label: string; controller: AbortController }>();
+const activeStages = new Map<string, { label: string; issueKey?: string; controller: AbortController }>();
+
+/** Marker prefix for a stage aborted because the ISSUE left the factory's
+ *  control mid-stage (human moved/canceled it, label stripped). loop.ts's
+ *  park() routes any stage error carrying this prefix to abortExternal —
+ *  abandon quietly — instead of parking, because parking posts labels and
+ *  comments onto a ticket a human just took away from us. Deliberately never
+ *  matched by isTransientStageError: retrying a stage whose claim is gone
+ *  only burns budget on work nobody wants (observed live 2026-08-02: FAC-64
+ *  kept implementing for minutes after the ticket was moved to Done). */
+export const CLAIM_LOST = "claim lost";
 
 /** Abort every in-flight stage's AbortController right now. Returns the stage
  *  labels that were aborted (server.ts's /stop response). Safe with zero
@@ -240,6 +255,20 @@ export function abortAllStages(): string[] {
   const labels = [...activeStages.values()].map((s) => s.label);
   for (const { controller } of activeStages.values()) {
     controller.abort(new Error("kill switch: /stop invoked"));
+  }
+  return labels;
+}
+
+/** Abort every in-flight stage belonging to ONE issue (mid-stage claim
+ *  re-verification — reconcile.ts's claim-loss sweep calls this when the
+ *  issue has verifiably left the factory's control). Returns the aborted
+ *  stage labels; [] when the issue has nothing in flight. */
+export function abortIssueStages(issueKey: string, why: string): string[] {
+  const labels: string[] = [];
+  for (const s of activeStages.values()) {
+    if (s.issueKey !== issueKey) continue;
+    labels.push(s.label);
+    s.controller.abort(new Error(`${CLAIM_LOST}: ${why}`));
   }
   return labels;
 }
@@ -274,7 +303,7 @@ const RETRY_MAX_MS = 8_000;
  *  exhaustion, which reflects real work the stage did, not a provider outage.
  *  Exported for tests. */
 export function isTransientStageError(error: string): boolean {
-  if (/stage deadline reached|kill switch:/i.test(error)) return false;
+  if (/stage deadline reached|kill switch:|claim lost/i.test(error)) return false;
   if (/error_max_turns|error_max_budget_usd/i.test(error)) return false;
   // error_during_execution / [ede_diagnostic]: the SDK's own "the run died
   // mid-stream" shape — observed live 2026-08-02 as `[ede_diagnostic]
@@ -431,7 +460,7 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(new Error("stage deadline reached")), remainingMs);
   const stageId = randomUUID();
-  activeStages.set(stageId, { label, controller: abort });
+  activeStages.set(stageId, { label, controller: abort, ...(opts.issueKey ? { issueKey: opts.issueKey } : {}) });
   try {
     let result: Record<string, unknown> | null = null;
     const q = deps.query({

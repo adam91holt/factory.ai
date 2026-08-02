@@ -224,6 +224,17 @@ export const config = {
   // APPROVALS_NOTIFY=0 disables. No-op off macOS regardless.
   approvalsNotify: (process.env.APPROVALS_NOTIFY ?? "1").trim() !== "0",
 
+  // Extra origins the dashboard's write-route guard (server.ts
+  // guardedJsonBody) accepts IN ADDITION to loopback — exact full-origin
+  // matches only (scheme+host+port). Purpose: the owner serving mission
+  // control over `tailscale serve`, where the browser's Origin/Host are the
+  // ts.net name, not 127.0.0.1. Operator-set env, never ticket-derived, and
+  // an empty default keeps the guard byte-identical to its loopback-only
+  // behavior. DNS-rebinding stays dead: a rebound attacker page carries the
+  // ATTACKER'S domain in Origin/Host, which exact-matches nothing here.
+  trustedOrigins: (process.env.FACTORY_TRUSTED_ORIGINS ?? "").split(",")
+    .map((o) => o.trim().replace(/\/+$/, "").toLowerCase()).filter((o) => /^https?:\/\//.test(o)),
+
   proxyAll: (process.env.PROXY_ALL ?? "1") !== "0",
   // The factory's OWN repo slug — NEVER auto-merged regardless of enrollment or
   // ceiling (isSelfRepo in merge-ladder.ts also matches any `.../factory`).

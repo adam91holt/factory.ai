@@ -4,7 +4,7 @@ import { config } from "./config.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { childrenAllTerminal } from "./steward.ts";
-import { redactSecrets } from "./agents.ts";
+import { abortIssueStages, redactSecrets } from "./agents.ts";
 
 const execFileP = promisify(execFile);
 
@@ -38,12 +38,59 @@ async function prMerged(repo: string, branch: string): Promise<boolean> {
   }
 }
 
-export async function reconcileTick(): Promise<void> {
+
+// ---------------------------------------------------------------------------
+// (3) Mid-stage claim re-verification (fix-list #6, live 2026-08-02: FAC-64
+// was moved to Done mid-implementer and the stage kept burning until its next
+// mutating-step stillOurs check). Each reconcile pass compares the daemon's
+// in-flight set against the live board — an issue that no longer carries the
+// executing label, or is no longer in a started-type state, has been taken
+// away by a human, so its in-flight stages are aborted (abortIssueStages →
+// the CLAIM_LOST error → park() routes to abortExternal's quiet abandon).
+//
+// DEBOUNCED over two consecutive passes: Linear reads can be briefly stale
+// (a just-claimed issue's label/state may lag the claim mutation), and a
+// false positive here kills a legitimate paid-for run. One suspicious pass
+// warns; two in a row abort. In-code constant by design.
+// ---------------------------------------------------------------------------
+
+export interface LiveClaimView { labels: readonly string[]; stateType: string }
+
+/** Pure sweep decision (decision logic stays I/O-free — CLAUDE.md). `started`
+ *  maps issue identifier → live view for every started-type issue fetched this
+ *  pass; an in-flight key ABSENT from it has left the started states entirely.
+ *  `pending` is the cross-pass debounce memory — mutated in place. */
+export function claimLossSweep(
+  inFlight: ReadonlySet<string>,
+  started: ReadonlyMap<string, LiveClaimView>,
+  pending: Set<string>,
+): { abort: string[]; warn: string[] } {
+  const abort: string[] = [];
+  const warn: string[] = [];
+  for (const key of inFlight) {
+    const live = started.get(key);
+    const lost = live === undefined
+      || !live.labels.includes(linear.EXECUTING_LABEL)
+      || live.stateType !== "started";
+    if (!lost) { pending.delete(key); continue; }
+    if (pending.has(key)) { pending.delete(key); abort.push(key); }
+    else { pending.add(key); warn.push(key); }
+  }
+  // An issue that left the in-flight set (run ended) must not haunt the memory.
+  for (const key of [...pending]) if (!inFlight.has(key)) pending.delete(key);
+  return { abort, warn };
+}
+
+const pendingClaimLoss = new Set<string>();
+
+export async function reconcileTick(inFlightKeys: ReadonlySet<string> = new Set()): Promise<void> {
+  const startedByKey = new Map<string, LiveClaimView>();
   // (1) In-Review tickets with a merged PR → Done.
   for (const teamKey of config.teamKeys) {
     const inReview = await linear.fetchIssuesByStateType("started", teamKey)
       .catch(() => [] as linear.Issue[]);
     for (const issue of inReview) {
+      startedByKey.set(issue.identifier, { labels: issue.labels, stateType: issue.stateType });
       // Only the review lane, not "In Progress". WP3: tag-anchored
       // (`[factory:review]` in the state description) so renaming the column
       // cannot silently break the merge→Done link; falls back to the pre-WP3
@@ -75,6 +122,21 @@ export async function reconcileTick(): Promise<void> {
       if (config.dryRun) { console.log(`[dry-run] [reconcile] ${epic.identifier} all children closed → would close`); continue; }
       const moved = await linear.transition(epic, "done");
       if (moved) console.log(`[reconcile] ${epic.identifier} all children closed → Done`);
+    }
+  }
+
+  // (3) Claim-loss sweep — see claimLossSweep above. Uses the started-type
+  // fetch pass (1) already paid for; no additional Linear calls. Dry-run has
+  // no live claims and must never abort anything.
+  if (!config.dryRun && inFlightKeys.size > 0) {
+    const { abort, warn } = claimLossSweep(inFlightKeys, startedByKey, pendingClaimLoss);
+    for (const key of warn) {
+      console.error(`[reconcile] ${key} looks externally moved (label/state gone) — will abort its stages if still gone next pass`);
+    }
+    for (const key of abort) {
+      const labels = abortIssueStages(key, "issue left In Progress / lost executing label (confirmed across two reconcile passes)");
+      if (labels.length > 0) console.error(`[reconcile] ${key} claim lost — aborted in-flight stage(s): ${labels.join(", ")}`);
+      else console.error(`[reconcile] ${key} claim lost — no stage in flight to abort (between stages); the next stillOurs check ends the run`);
     }
   }
 }

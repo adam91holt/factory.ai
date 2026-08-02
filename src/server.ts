@@ -346,16 +346,24 @@ export async function guardedJsonBody(req: IncomingMessage, res: ServerResponse)
     return null;
   }
   const isLoopbackHostname = (h: string): boolean => h === "127.0.0.1" || h === "localhost";
+  // Operator-declared extra origins (config.trustedOrigins — e.g. the
+  // tailscale-serve HTTPS name). Exact full-origin match; the host leg
+  // accepts the same names, so Origin and Host stay mutually consistent.
+  const trusted = config.trustedOrigins;
+  const trustedHosts = new Set(trusted.map((o) => { try { return new URL(o).host; } catch { return ""; } }).filter(Boolean));
   const origin = req.headers.origin;
   let originOk = true;
   if (origin !== undefined) {
     try {
       const u = new URL(origin);
-      originOk = (u.protocol === "http:" || u.protocol === "https:") && isLoopbackHostname(u.hostname);
+      originOk = ((u.protocol === "http:" || u.protocol === "https:") && isLoopbackHostname(u.hostname))
+        || trusted.includes(origin.trim().replace(/\/+$/, "").toLowerCase());
     } catch { originOk = false; }
   }
   const host = req.headers.host;
-  const hostOk = host === undefined || isLoopbackHostname(host.replace(/:\d+$/, "").toLowerCase());
+  const hostOk = host === undefined
+    || isLoopbackHostname(host.replace(/:\d+$/, "").toLowerCase())
+    || trustedHosts.has(host.toLowerCase());
   const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
   if (contentType !== "application/json" || !originOk || !hostOk) {
     res.writeHead(403, { "content-type": "application/json" });
