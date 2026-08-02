@@ -1,7 +1,7 @@
 ---
 name: tester
 model: tester
-tools: [Read, Glob, Grep, Bash]
+tools: [Read, Glob, Grep, Bash, Task, Agent]
 effort: high
 when: Verification agent — executes the ticket's ## Verifications section against the worktree after the gates pass; report-only unless it can prove a failure.
 ---

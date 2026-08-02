@@ -1,0 +1,46 @@
+# CLIProxyAPI — the multi-vendor leg of the factory's model roster.
+#
+# Carries ONLY the tool-less Codex reviewer (`gpt-5.6-sol`) and security-reviewer
+# stages, so a Claude author is never the sole judge of its own diff. If this is
+# down, src/agents.ts falls back to a Claude reviewer and tags the run `degraded`
+# — the pipeline still completes.
+#
+# SECURITY: every port is bound to 127.0.0.1 only. This is an authenticated
+# proxy in front of your real LLM accounts; it must never be reachable from the
+# network. src/config.ts enforces the matching constraint on PROXY_BASE_URL
+# ("PROXY_BASE_URL must be loopback").
+#
+#   docker compose -f docker-compose.cliproxy.yml up -d
+#   docker compose -f docker-compose.cliproxy.yml exec cli-proxy-api \
+#     /CLIProxyAPI/CLIProxyAPI -no-browser --codex-login
+#
+# The login flow prints a URL, you approve it in a browser, and paste the code
+# back. Credentials persist to ./docker/cliproxy/auths, so they survive
+# restarts and image upgrades.
+
+services:
+  cli-proxy-api:
+    image: eceasy/cli-proxy-api:latest
+    container_name: factory-cli-proxy-api
+    restart: unless-stopped
+    ports:
+      # API endpoint the daemon talks to (PROXY_BASE_URL).
+      - "127.0.0.1:8317:8317"
+      # OAuth callback listeners used by the various --*-login flows.
+      - "127.0.0.1:8085:8085"
+      - "127.0.0.1:1455:1455"
+      - "127.0.0.1:54545:54545"
+      - "127.0.0.1:51121:51121"
+      - "127.0.0.1:11451:11451"
+    volumes:
+      - ./docker/cliproxy/config.yaml:/CLIProxyAPI/config.yaml
+      - ./docker/cliproxy/auths:/root/.cli-proxy-api
+      - ./docker/cliproxy/logs:/CLIProxyAPI/logs
+      - ./docker/cliproxy/plugins:/CLIProxyAPI/plugins
+    healthcheck:
+      # /v1/models requires auth; a 401 still proves the server is serving.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8317/v1/models 2>&1 || true; nc -z 127.0.0.1 8317 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

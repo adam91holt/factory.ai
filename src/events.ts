@@ -148,7 +148,22 @@ export type FactoryEventBody =
   | { type: "approval_created"; issueKey: string; approvalId: number; prUrl: string; holdReasons: string }
   | { type: "approval_granted"; issueKey: string; approvalId: number; prUrl: string; sha: string }
   | { type: "approval_pushed_back"; issueKey: string; approvalId: number; feedback: string }
-  | { type: "approval_stale"; issueKey: string; approvalId: number; reason: string };
+  | { type: "approval_stale"; issueKey: string; approvalId: number; reason: string }
+  // ---- Agent routing (routing.ts): which CARD ran each stage and how many
+  // tools it actually held. Emitted ONCE per run and ONLY when something is
+  // worth saying — a specialist card was selected, a card narrowed its own
+  // allowlist below the code ceiling, an unknown tool selector was dropped, or
+  // a specialist candidate was rejected. A repo that routes to the default
+  // cards with full ceilings emits NOTHING, so this feature adds no event to
+  // the ordinary path (the additive guarantee, made observable).
+  // `facts` are the repo-derived selector terms (routing.ts factTerms) — the
+  // audit trail for WHY a specialist matched. Ticket text is not an input to
+  // any field here. Daemon-only addition like park_mutation_failed above — not
+  // mirrored to the UI's copy of this union.
+  | { type: "run_routing"; issueKey: string; facts: string[];
+      stages: Array<{ stage: string; card: string; role: string; specialist: boolean;
+                      matched: string[]; toolCount: number; narrowed: boolean;
+                      unknownTools: string[] }> };
 
 /** Wire type: what SSE frames and the ring buffer contain. */
 export type FactoryEvent = FactoryEventBody & { seq: number; at: number };

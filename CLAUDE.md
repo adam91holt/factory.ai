@@ -10,7 +10,8 @@ everything; agents do the work; humans set direction and merge — until a repo
 
 ```bash
 bun run typecheck      # tsc --noEmit
-bun test
+bun test               # no container needed — runs on the in-process PGlite seam
+bun run db:up          # Postgres for the daemon (docker compose up -d)
 bun run factory:dry    # one tick, no Linear writes, no PRs — start here
 bun run factory:once   # one live tick
 bun run factory        # watch mode
@@ -23,7 +24,7 @@ When working here, treat these loops as the product:
 
 - **Lessons** (`src/lessons.ts`): every failure — park, needs-human, taste-fail —
   is distilled *at the moment it happens* into a one-line "when X, do Y" lesson,
-  stored in `factory.db`, and injected into future runs on the same repo. The
+  stored in Postgres, and injected into future runs on the same repo. The
   next run never starts naive.
 - **Groundskeepers** (`src/groundskeepers.ts`, cards in `groundskeepers/`):
   scheduled work *generators*. `groundskeepers/factory.md` is the factory
@@ -41,7 +42,9 @@ When working here, treat these loops as the product:
   stale follow-ups self-cancel.
 
 Telemetry lives in `🤖 Factory report` PR/issue comments (prose + YAML) and
-`factory.db`. That data feeds the loops above — don't break its shape casually.
+Postgres (`bun run db:up`; `src/store.ts` is the only file that touches a
+driver, `src/db.ts` owns every SQL string and stays the single writer). That
+data feeds the loops above — don't break its shape casually.
 
 ## Layout
 
@@ -60,6 +63,13 @@ Telemetry lives in `🤖 Factory report` PR/issue comments (prose + YAML) and
   set to infinity isn't a cap. Follow the existing pattern (see `lessons.ts`).
 - **Dangerous capabilities ship double-gated OFF** (global env gate AND per-card
   flag — groundskeepers, deploy). Preserve both gates.
+- **Agent cards select, they never author** (`src/routing.ts`). A card's
+  `tools:` frontmatter is load-bearing but strictly SUBTRACTIVE: it picks
+  entries out of the code-defined `ROLE_CEILINGS`, so `resolveTools(ceiling,
+  anything) ⊆ ceiling` for any string. A `role:` + `match:` card is a
+  specialist chosen on REPO FACTS ONLY (`verify.ts repoFacts`) — never on
+  ticket text, which has no routing key at all. Unknown selector, unknown
+  match term, unknown role → fail closed (grant nothing / keep the default).
 - **Guarded paths** (tests, CI, `CLAUDE.md`, `.claude/`, skills) force human
   review by design — this file is one of them.
 - The factory never merges by default (ADR-0001); autonomy comes only through

@@ -79,10 +79,17 @@ describe("forbiddenToolViolations — predicate", () => {
     }
   });
 
-  test("flags hard-denied orchestration tools appearing in an allowlist (confused config)", () => {
-    for (const tool of ["Task", "SendMessage", "CronCreate", "Skill"]) {
+  test("flags hard-denied side-channel tools appearing in an allowlist (confused config)", () => {
+    for (const tool of ["SendMessage", "CronCreate", "CronDelete", "Skill", "Workflow", "PushNotification", "ScheduleWakeup", "TaskCreate"]) {
       expect(forbiddenToolViolations([tool])).toHaveLength(1);
     }
+  });
+
+  test("subagent tools (Task/Agent) are a legitimate grant since orchestration enablement 2026-08-02", () => {
+    // Per-role gating lives in ROLE_CEILINGS (routing.ts), not here: the audit
+    // must not reject the work roles' fan-out grant, and the side-channel set
+    // above must stay rejected — the split is the safety property.
+    expect(forbiddenToolViolations(["Task", "Agent"])).toHaveLength(0);
   });
 
   test("reports one violation per offending entry, none for clean ones", () => {

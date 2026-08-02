@@ -10,15 +10,15 @@ import { buildReport } from "../src/report.ts";
 // report (report.ts buildReport) renders a "merged" outcome sensibly.
 
 describe("getTelemetry — B16 'merged' outcome is its own bucket, not folded into pr_open", () => {
-  afterEach(() => closeTestDatabase());
+  afterEach(async () => { await closeTestDatabase(); });
 
-  test("a run_finished(outcome: merged) row counts under outcomes.merged / totals.merged, not pr_open", () => {
-    openTestDatabase();
-    insertTestEvent("run_finished", {
+  test("a run_finished(outcome: merged) row counts under outcomes.merged / totals.merged, not pr_open", async () => {
+    await openTestDatabase();
+    await insertTestEvent("run_finished", {
       issueKey: "FAC-1", outcome: "merged", prUrl: "https://github.com/acme/x/pull/1",
       costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false,
     });
-    const t = getTelemetry();
+    const t = await getTelemetry();
     expect(t.outcomes.merged).toBe(1);
     expect(t.totals.merged).toBe(1);
     expect(t.outcomes.pr_open).toBe(0);
@@ -26,21 +26,21 @@ describe("getTelemetry — B16 'merged' outcome is its own bucket, not folded in
     expect(t.totals.runs).toBe(1); // still counted as one delivery
   });
 
-  test("merged and pr_open runs are tallied independently in the same aggregate", () => {
-    openTestDatabase();
-    insertTestEvent("run_finished", { issueKey: "FAC-1", outcome: "merged", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
-    insertTestEvent("run_finished", { issueKey: "FAC-2", outcome: "pr_open", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
-    insertTestEvent("run_finished", { issueKey: "FAC-3", outcome: "pr_open", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
-    const t = getTelemetry();
+  test("merged and pr_open runs are tallied independently in the same aggregate", async () => {
+    await openTestDatabase();
+    await insertTestEvent("run_finished", { issueKey: "FAC-1", outcome: "merged", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
+    await insertTestEvent("run_finished", { issueKey: "FAC-2", outcome: "pr_open", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
+    await insertTestEvent("run_finished", { issueKey: "FAC-3", outcome: "pr_open", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: false });
+    const t = await getTelemetry();
     expect(t.outcomes.merged).toBe(1);
     expect(t.outcomes.pr_open).toBe(2);
     expect(t.totals.runs).toBe(3);
   });
 
-  test("a dry-run merged event is excluded from delivery counts, like every other outcome", () => {
-    openTestDatabase();
-    insertTestEvent("run_finished", { issueKey: "FAC-1", outcome: "merged", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: true });
-    const t = getTelemetry();
+  test("a dry-run merged event is excluded from delivery counts, like every other outcome", async () => {
+    await openTestDatabase();
+    await insertTestEvent("run_finished", { issueKey: "FAC-1", outcome: "merged", prUrl: null, costUsd: 1, stages: [], gateStrength: "strong", guardedPaths: [], dryRun: true });
+    const t = await getTelemetry();
     expect(t.outcomes.merged).toBe(0);
     expect(t.totals.runs).toBe(0);
   });

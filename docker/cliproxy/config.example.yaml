@@ -1,0 +1,26 @@
+# CLIProxyAPI config for the software factory.
+# Carries ONLY the tool-less Codex reviewer + security-reviewer legs
+# (see README "Stack"). Claude roles use direct SDK auth and never touch this.
+#
+# GENERATED — contains a live api-key. Gitignored; see config.example.yaml.
+
+# Listen on all interfaces INSIDE the container. The host port binding in
+# docker-compose.cliproxy.yml is pinned to 127.0.0.1, so this is reachable
+# from the daemon only — never from the network. src/config.ts enforces the
+# matching loopback constraint on PROXY_BASE_URL.
+host: ""
+port: 8317
+
+# Client auth. The daemon sends this as ANTHROPIC_AUTH_TOKEN (agents.ts
+# runOneAttempt) and it must equal PROXY_AUTH_TOKEN in .env.
+api-keys:
+  - "REPLACE_WITH_A_RANDOM_TOKEN"
+
+# Provider credentials from the --codex-login flow land here. Mounted to
+# ./auths on the host so a container rebuild never loses the login.
+auth-dir: "/root/.cli-proxy-api"
+
+# Management API stays local and off — the factory never uses it.
+remote-management:
+  allow-remote: false
+  secret-key: ""

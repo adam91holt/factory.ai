@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { RoutableCard } from "./routing.ts";
 
 // Agent card catalog. Each role's system prompt lives as a Markdown card in
 // agents/*.md (YAML frontmatter + prompt body); loop/plan/steward read their
@@ -10,12 +11,17 @@ import { fileURLToPath } from "node:url";
 // rather than crashing the daemon — cards are additive, never load-bearing.
 
 export interface Card {
-  /** Frontmatter as flat string values. tools/model/when remain reference-only
-   *  (runStage still takes model/allowedTools from config/code — model
-   *  resolution never reads the card). `effort` is the one exception
-   *  (execution-profiles): cardEffort() below reads it as the fallback tier in
-   *  meta.ts's resolveEffort precedence, so a card's `effort:` frontmatter is
-   *  now load-bearing, not just documentation. */
+  /** Frontmatter as flat string values. `model` and `when` remain
+   *  reference-only — runStage still takes the model from config/code, and
+   *  meta.ts's resolveModel never reads a card, so no card can name a model
+   *  the operator did not configure. THREE keys are load-bearing:
+   *   - `effort` (execution-profiles) via cardEffort() below, the fallback
+   *     tier in meta.ts's resolveEffort precedence;
+   *   - `tools` (agent routing) via cardTools() below — a purely SUBTRACTIVE
+   *     selection over routing.ts's code-defined ROLE_CEILINGS, so a card can
+   *     narrow a stage's allowlist but can never widen it;
+   *   - `role` + `match` (agent routing) via listRoutableCards() below — a
+   *     specialist card's repo-fact selector. */
   frontmatter: Record<string, string>;
   /** The prompt body verbatim, with {{placeholder}} tokens for runtime values. */
   prompt: string;
@@ -82,6 +88,37 @@ export function listCards(): string[] {
  *  re-implementing it. */
 export function cardEffort(name: string): string | undefined {
   return getCard(name)?.frontmatter.effort;
+}
+
+/** A card's own frontmatter `tools:` value, or undefined when the card is
+ *  missing or declares none. Handed to routing.ts's resolveTools(), which
+ *  treats undefined as "no declaration → the code ceiling verbatim" (the
+ *  pre-routing behaviour) and treats the string as a SELECTION over that
+ *  ceiling. Deliberately unvalidated here for the same reason cardEffort is:
+ *  resolveTools is the single enforcement point, and it cannot return anything
+ *  outside the ceiling regardless of what this string says. */
+export function cardTools(name: string): string | undefined {
+  return getCard(name)?.frontmatter.tools;
+}
+
+/** Every card on disk, reduced to the fields routing.ts consumes. This is the
+ *  ONLY disk I/O in the routing path — routeStage/selectCard themselves stay
+ *  pure, so every routing decision is testable without a filesystem. Cards
+ *  that fail to load are simply absent (a broken card can never become a
+ *  specialist), which is the fail-closed direction. */
+export function listRoutableCards(): RoutableCard[] {
+  const out: RoutableCard[] = [];
+  for (const name of listCards()) {
+    const card = getCard(name);
+    if (!card) continue;
+    out.push({
+      name,
+      role: card.frontmatter.role,
+      match: card.frontmatter.match,
+      tools: card.frontmatter.tools,
+    });
+  }
+  return out;
 }
 
 /**

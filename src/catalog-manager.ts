@@ -6,6 +6,7 @@ import { redactSecrets } from "./agents.ts";
 import { invalidateCard } from "./catalog.ts";
 import { catalogUsage, type CardUsage } from "./db.ts";
 import { validateGroundskeeperContent, type GroundskeeperCard } from "./groundskeepers.ts";
+import { ceilingForRole, resolveTools, SPECIALIST_ROLES } from "./routing.ts";
 
 // Catalog manager — the read/write half of the mission-control catalog page
 // (roadmap "Queued build: catalog manager UI"). GET /catalog lists every agent
@@ -37,6 +38,27 @@ export interface AgentEntry {
   prompt: string;
   content: string; // full file text — editor source + diff baseline
   usage: UsageStat | null;
+  // Agent routing (routing.ts). `tools:`/`role:`/`match:` used to be inert
+  // documentation; they are load-bearing now, so the catalog shows what the
+  // card ACTUALLY resolves to rather than what it claims:
+  //   role         — the stage slot it serves (its own name for a default card,
+  //                  its `role:` frontmatter for a specialist), or null when
+  //                  the card is not wired to any stage.
+  //   match        — the repo-fact terms that select a specialist ([] for a
+  //                  default card).
+  //   tools        — the RESOLVED allowlist: the card's selection applied to
+  //                  routing.ts's code ceiling. null when the card is not
+  //                  wired to a stage (its `tools:` line would be inert).
+  //   unknownTools — declared selectors that match nothing in the ceiling.
+  //                  They grant nothing; surfacing them is how a typo becomes
+  //                  visible instead of silently shrinking a stage.
+  routing: {
+    role: string | null;
+    match: string[];
+    tools: string[] | null;
+    unknownTools: string[];
+    specialist: boolean;
+  };
 }
 export interface SkillEntry {
   name: string;
@@ -97,6 +119,34 @@ function groundskeeperFrontmatter(card: GroundskeeperCard): GroundskeeperEntry["
   };
 }
 
+/** The stage slot a card serves: a specialist's declared `role:` (only when
+ *  that role is actually routable), otherwise the card's own name if that name
+ *  is a wired role, otherwise null (an unwired card runs nothing). */
+function roleOfCard(name: string, frontmatter: Record<string, string>): string | null {
+  const declared = (frontmatter.role ?? "").trim();
+  if (declared !== "" && SPECIALIST_ROLES.has(declared) && declared !== name) return declared;
+  return ceilingForRole(name) !== null ? name : null;
+}
+
+/** Resolve one card's routing frontmatter for the catalog view — what the card
+ *  ACTUALLY grants, not what it claims. Pure over the parsed frontmatter. */
+function cardRouting(name: string, frontmatter: Record<string, string>): AgentEntry["routing"] {
+  const role = roleOfCard(name, frontmatter);
+  const ceiling = role === null ? null : ceilingForRole(role);
+  const declaredRole = (frontmatter.role ?? "").trim();
+  const selection = ceiling === null
+    ? { tools: null, unknown: [] as string[] }
+    : (() => { const r = resolveTools(ceiling, frontmatter.tools); return { tools: r.tools, unknown: r.unknown }; })();
+  const match = (frontmatter.match ?? "").replace(/^\[/, "").replace(/\]$/, "")
+    .split(/[,\s]+/).map((s) => s.trim()).filter(Boolean).slice(0, 8);
+  // A specialist is a card that declares a routable role OTHER than its own
+  // name. The catalog view never performs a SELECTION — that happens per run
+  // against a real worktree's facts (loop.ts) — it only reports the
+  // declaration and the tools it resolves to.
+  return { role, match, tools: selection.tools, unknownTools: selection.unknown,
+    specialist: declaredRole !== "" && declaredRole !== name };
+}
+
 function listMarkdown(dir: string): string[] {
   try {
     return readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
@@ -105,8 +155,8 @@ function listMarkdown(dir: string): string[] {
   }
 }
 
-export function readCatalog(): CatalogPayload {
-  const { byStage, byIssueKey } = catalogUsage();
+export async function readCatalog(): Promise<CatalogPayload> {
+  const { byStage, byIssueKey } = await catalogUsage();
 
   const agents: AgentEntry[] = [];
   for (const file of listMarkdown(AGENTS_DIR)) {
@@ -114,7 +164,8 @@ export function readCatalog(): CatalogPayload {
     let content: string;
     try { content = readFileSync(join(AGENTS_DIR, file), "utf8"); } catch { continue; }
     const { frontmatter, body } = splitFrontmatter(content);
-    agents.push({ name, frontmatter, prompt: body, content, usage: toUsage(byStage[name]) });
+    agents.push({ name, frontmatter, prompt: body, content, usage: toUsage(byStage[name]),
+      routing: cardRouting(name, frontmatter) });
   }
 
   // Skills live one directory deep: skills/<name>/SKILL.md.
@@ -165,6 +216,44 @@ export function readCatalog(): CatalogPayload {
 export interface SaveResult { status: number; json: unknown }
 
 const bad = (status: number, error: string): SaveResult => ({ status, json: { error } });
+
+/** Routing ceiling for POST /catalog/save on an AGENT card. Returns an error
+ *  string to reject with, or null when the save is allowed. `file` is the
+ *  on-disk path so the current (trusted, git-committed) routing declaration
+ *  can be compared against the incoming one. A card with no readable file on
+ *  disk is treated as declaring nothing — so a NEW card may be created from
+ *  the UI, but never one that routes. */
+export function validateAgentCardRouting(
+  name: string,
+  incoming: Record<string, string>,
+  file: string,
+): string | null {
+  let onDisk: Record<string, string> = {};
+  try { onDisk = splitFrontmatter(readFileSync(file, "utf8")).frontmatter; } catch { /* new card */ }
+  const norm = (v: string | undefined): string => (v ?? "").trim().replace(/^\[/, "").replace(/\]$/, "")
+    .split(/[,\s]+/).filter(Boolean).join(" ");
+  for (const key of ["role", "match"] as const) {
+    if (norm(incoming[key]) !== norm(onDisk[key])) {
+      return `refusing to change an agent card's \`${key}:\` routing declaration from the UI (on disk it is ${JSON.stringify(onDisk[key] ?? null)}) — routing decides which agent runs a stage, so it is an on-disk, git-committed edit only. The prompt body is freely editable here.`;
+    }
+  }
+  // Which ceiling this card's tools are measured against: a specialist's
+  // declared role, else the card's own name when that is a wired stage.
+  const declaredRole = (incoming.role ?? "").trim();
+  const role = declaredRole !== "" && SPECIALIST_ROLES.has(declaredRole) && declaredRole !== name
+    ? declaredRole
+    : (ceilingForRole(name) !== null ? name : null);
+  const ceiling = role === null ? null : ceilingForRole(role);
+  if (incoming.tools === undefined) return null;
+  if (ceiling === null) {
+    return `agents/${name}.md is not wired to any stage, so a \`tools:\` line on it grants nothing — remove it (or wire the card on disk first).`;
+  }
+  const { unknown } = resolveTools(ceiling, incoming.tools);
+  if (unknown.length > 0) {
+    return `\`tools:\` names ${unknown.length} selector(s) that are not in this stage's ceiling and would grant nothing: ${unknown.join(", ")}. Allowed here: ${ceiling.join(", ") || "(none — this stage is tool-less by design)"}.`;
+  }
+  return null;
+}
 
 /** Validate an untrusted POST /catalog/save body, then write + commit one file.
  *  `input` is the parsed JSON body; every field is treated as untrusted. */
@@ -227,6 +316,29 @@ export function saveCatalogEntry(input: unknown): SaveResult {
     if (!frontmatter.name) return bad(422, "frontmatter is missing a name field");
     if (frontmatter.name !== name) return bad(422, `frontmatter name ${JSON.stringify(frontmatter.name)} must equal the save name ${JSON.stringify(name)}`);
     if (kind === "skill" && !frontmatter.description) return bad(422, "skill frontmatter is missing a description field");
+    if (kind === "agent") {
+      // Privilege-escalation ceiling on the write route. This block used to
+      // not exist: agent cards were exempt from any ceiling on the EXPLICIT
+      // grounds that their `tools:`/`when:` frontmatter was reference-only.
+      // Agent routing deletes that premise — `tools:` now selects a stage's
+      // real allowlist and `role:`/`match:` decide which card runs a stage —
+      // so the exemption has to go with it.
+      //
+      // Two rules, mirroring the groundskeeper "arming is an on-disk-only
+      // action" ceiling directly above:
+      //  (1) ROUTING DECLARATIONS ARE ON-DISK-ONLY. A browser-reachable route
+      //      must never mint a new specialist, repoint an existing one at
+      //      different repo facts, or promote a card into a stage slot. Those
+      //      edits are a human's `git` commit, not a POST. (Prompt BODY edits
+      //      stay fully allowed — that is what this page is for.)
+      //  (2) A `tools:` line may only name selectors that resolve inside the
+      //      card's code-defined ceiling. Runtime already guarantees the
+      //      subset property, so an unknown selector cannot widen anything —
+      //      but it silently NARROWS the stage, which is exactly the kind of
+      //      quiet capability change this route must not make by typo.
+      const v = validateAgentCardRouting(name, frontmatter, file);
+      if (v) return bad(422, v);
+    }
   }
 
   // A secret must never land in a tracked file. This is a hard reject, not a

@@ -1,7 +1,7 @@
 ---
 name: steward
 model: steward
-tools: [Write, Read]
+tools: [Write, Read, Bash]
 effort: high
 when: Closeout brain — runs once all children of a planned epic reach terminal state; decides merge order + follow-ups (never merges).
 ---

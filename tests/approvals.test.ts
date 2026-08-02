@@ -34,12 +34,13 @@ const MOVED = "b".repeat(40);
 const fakeIssue = (identifier: string): Issue => ({
   id: `uuid-${identifier}`, identifier, title: `t-${identifier}`, description: "",
   url: `https://linear.app/x/${identifier}`, teamKey: "FAC", teamId: "team-1",
-  stateName: "In Review", stateType: "started", labels: ["Factory-Needs-Human"],
+  stateName: "In Review", stateType: "started", stateDescription: "[factory:review]",
+  labels: ["Factory-Needs-Human"],
   createdAt: "2026-08-01T00:00:00.000Z",
 });
 
-function seedItem(overrides: Partial<Parameters<typeof insertApproval>[0]> = {}): number {
-  const id = insertApproval({
+async function seedItem(overrides: Partial<Parameters<typeof insertApproval>[0]> = {}): Promise<number> {
+  const id = await insertApproval({
     issueKey: "FAC-43", title: "guarded paths + incomplete design review", repo: "acme/widgets",
     prUrl: "https://github.com/acme/widgets/pull/7", gatedHeadSha: GATED,
     holdReasons: "guarded paths touched: .github/workflows/ci.yml",
@@ -77,7 +78,7 @@ function pushbackDeps(opts: { transitionOk?: boolean } = {}): { deps: PushbackDe
   const calls = { merged: [] as string[][], comments: [] as string[], transitions: [] as string[], removedLabels: [] as string[], postMerge: 0, feedback: [] as string[] };
   const deps: PushbackDeps = {
     getApproval, claimApproval, finalizeApproval,
-    recordFeedback: (issueKey, feedback) => { calls.feedback.push(`${issueKey}: ${feedback}`); return recordPushbackFeedback(issueKey, feedback); },
+    recordFeedback: async (issueKey, feedback) => { calls.feedback.push(`${issueKey}: ${feedback}`); return await recordPushbackFeedback(issueKey, feedback); },
     getIssue: (key) => Promise.resolve(fakeIssue(key)),
     postComment: (_i, body) => { calls.comments.push(body); return Promise.resolve(); },
     transition: (_i, kind) => { calls.transitions.push(kind); return Promise.resolve(opts.transitionOk ?? true); },
@@ -86,8 +87,8 @@ function pushbackDeps(opts: { transitionOk?: boolean } = {}): { deps: PushbackDe
   return { deps, calls };
 }
 
-beforeEach(() => openTestDatabase());
-afterEach(() => closeTestDatabase());
+beforeEach(async () => { await openTestDatabase(); });
+afterEach(async () => { await closeTestDatabase(); });
 
 describe("human lane rule (shouldFileApproval)", () => {
   test("files only when a PR is open and no auto-merge closed it", () => {
@@ -99,38 +100,38 @@ describe("human lane rule (shouldFileApproval)", () => {
 });
 
 describe("approval rows (db)", () => {
-  test("filing supersedes a prior pending item for the same issue", () => {
-    const first = seedItem();
-    const second = seedItem();
-    expect(getApproval(first)?.status).toBe("stale");
-    expect(getApproval(first)?.resolution).toContain("superseded");
-    expect(getApproval(second)?.status).toBe("pending");
-    expect(pendingApprovalCount()).toBe(1);
-    expect(listPendingApprovals().map((i) => i.id)).toEqual([second]);
+  test("filing supersedes a prior pending item for the same issue", async () => {
+    const first = await seedItem();
+    const second = await seedItem();
+    expect((await getApproval(first))?.status).toBe("stale");
+    expect((await getApproval(first))?.resolution).toContain("superseded");
+    expect((await getApproval(second))?.status).toBe("pending");
+    expect(await pendingApprovalCount()).toBe(1);
+    expect((await listPendingApprovals()).map((i) => i.id)).toEqual([second]);
   });
 
-  test("claimApproval is atomic: exactly one of two claims wins", () => {
-    const id = seedItem();
-    expect(claimApproval(id, "approved")).toBe(true);
-    expect(claimApproval(id, "pushed_back")).toBe(false); // already decided
-    expect(getApproval(id)?.status).toBe("approved");
+  test("claimApproval is atomic: exactly one of two claims wins", async () => {
+    const id = await seedItem();
+    expect(await claimApproval(id, "approved")).toBe(true);
+    expect(await claimApproval(id, "pushed_back")).toBe(false); // already decided
+    expect((await getApproval(id))?.status).toBe("approved");
   });
 
-  test("pushback feedback is a take-once handoff", () => {
-    recordPushbackFeedback("FAC-43", "tighten the null handling");
-    expect(takePushbackFeedback("FAC-43")).toBe("tighten the null handling");
-    expect(takePushbackFeedback("FAC-43")).toBeNull(); // consumed
+  test("pushback feedback is a take-once handoff", async () => {
+    await recordPushbackFeedback("FAC-43", "tighten the null handling");
+    expect(await takePushbackFeedback("FAC-43")).toBe("tighten the null handling");
+    expect(await takePushbackFeedback("FAC-43")).toBeNull(); // consumed
   });
 });
 
 describe("approve — the human merge authority", () => {
   test("merges through the pinned mergePr path when head == gated SHA, then closes out Linear", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps();
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(200);
     expect(calls.merged).toEqual([["acme/widgets", "https://github.com/acme/widgets/pull/7", GATED]]);
-    expect(getApproval(id)?.status).toBe("approved");
+    expect((await getApproval(id))?.status).toBe("approved");
     expect(calls.transitions).toEqual(["after-merge"]); // the SHARED linear.transitionAfterMerge closeout
     expect(calls.removedLabels).toContain("Factory-Needs-Human");
     expect(calls.postMerge).toBe(1);
@@ -138,56 +139,56 @@ describe("approve — the human merge authority", () => {
   });
 
   test("NEVER merges when the PR head moved since gating — item goes stale", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps({ head: MOVED });
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(0); // the invariant: no merge call at all
-    const item = getApproval(id);
+    const item = await getApproval(id);
     expect(item?.status).toBe("stale");
     expect(item?.resolution).toBe("branch moved since gating — needs re-gate");
   });
 
   test("NEVER merges when no gated SHA was recorded", async () => {
-    const id = seedItem({ gatedHeadSha: null });
+    const id = await seedItem({ gatedHeadSha: null });
     const { deps, calls } = approveDeps();
     // The card rendered no SHA either, so the evidence binding matches and the
     // refusal comes from the rule that matters here: nothing to pin to.
     const r = await approveItem(id, null, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(0);
-    expect(getApproval(id)?.status).toBe("stale");
+    expect((await getApproval(id))?.status).toBe("stale");
   });
 
   test("an unreadable PR head refuses the merge but stays retryable (pending)", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps({ head: null });
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(502);
     expect(calls.merged).toHaveLength(0);
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
   });
 
   test("a --match-head-commit refusal (headMoved backstop) marks stale, never retries the new head", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps({ mergeOk: false, headMoved: true });
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(409);
     expect(calls.merged).toHaveLength(1); // one pinned attempt, refused by GitHub
-    expect(getApproval(id)?.status).toBe("stale");
+    expect((await getApproval(id))?.status).toBe("stale");
   });
 
   test("a non-head merge failure rolls back to pending (retryable), no Linear transition", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps({ mergeOk: false });
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(502);
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
     expect(calls.transitions).toHaveLength(0);
   });
 
   test("double-click cannot double-merge: second call is a 409 and merge ran once", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps();
     const first = await approveItem(id, GATED, deps);
     const second = await approveItem(id, GATED, deps);
@@ -197,13 +198,13 @@ describe("approve — the human merge authority", () => {
   });
 
   test("no endpoint can flip a decided item (pushback after approve refused)", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps } = approveDeps();
     await approveItem(id, GATED, deps);
     const pb = pushbackDeps();
     const r = await pushbackItem(id, "do it differently", pb.deps);
     expect(r.status).toBe(409);
-    expect(getApproval(id)?.status).toBe("approved"); // decision stands
+    expect((await getApproval(id))?.status).toBe("approved"); // decision stands
   });
 
   test("a missing item is a 404, never an action", async () => {
@@ -213,7 +214,7 @@ describe("approve — the human merge authority", () => {
   });
 
   test("self-repo items CAN be approved — the human IS the merge authority, still pinned", async () => {
-    const id = seedItem({ repo: "adam91holt/factory.ai", prUrl: "https://github.com/adam91holt/factory.ai/pull/5" });
+    const id = await seedItem({ repo: "adam91holt/factory.ai", prUrl: "https://github.com/adam91holt/factory.ai/pull/5" });
     const { deps, calls } = approveDeps();
     const r = await approveItem(id, GATED, deps);
     expect(r.status).toBe(200);
@@ -223,24 +224,24 @@ describe("approve — the human merge authority", () => {
 
 describe("approve is bound to the evidence the human SAW", () => {
   test("a card rendered against a different gated SHA is refused — no claim, no merge, still approvable", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps();
     const r = await approveItem(id, MOVED, deps);
     expect(r.status).toBe(409);
     expect(String(r.json.error)).toContain("card is out of date");
     expect(calls.merged).toHaveLength(0);
     // The row is untouched: a stale tab costs a refresh, never the item.
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
     expect((await approveItem(id, GATED, deps)).status).toBe(200);
   });
 
   test("an approve with no gatedHeadSha at all cannot merge an item that has one", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = approveDeps();
     expect((await approveItem(id, undefined, deps)).status).toBe(409);
     expect((await approveItem(id, "", deps)).status).toBe(409);
     expect(calls.merged).toHaveLength(0);
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
   });
 
   test("approvalEvidenceMatches: case/whitespace-insensitive, both-absent matches, one-sided never does", () => {
@@ -253,8 +254,8 @@ describe("approve is bound to the evidence the human SAW", () => {
   });
 
   test("a superseded card cannot merge the run that replaced it", async () => {
-    seedItem();                                      // the card the human is looking at
-    const fresh = seedItem({ gatedHeadSha: MOVED }); // a re-run supersedes it
+    await seedItem();                                      // the card the human is looking at
+    const fresh = await seedItem({ gatedHeadSha: MOVED }); // a re-run supersedes it
     const { deps, calls } = approveDeps({ head: MOVED });
     // The human clicks approve on the OLD card; its id is stale, but even the
     // NEW row refuses the old card's SHA.
@@ -266,7 +267,7 @@ describe("approve is bound to the evidence the human SAW", () => {
 describe("integrity-hold prominence (regateFailed)", () => {
   const ws = { dir: "/tmp/x", branch: "factory/FAC-1", baseRef: "origin/main" } as Workspace;
 
-  test("the flag is set by the LIVE preMergeIntegrity red-re-gate hold (marker coupling)", () => {
+  test("the flag is set by the LIVE preMergeIntegrity red-re-gate hold (marker coupling)", async () => {
     const result = preMergeIntegrity(ws, GATED, {
       fetchBase: () => ({ ok: true, out: "" }),
       commitsBehindBase: () => 3,
@@ -291,7 +292,7 @@ describe("integrity-hold prominence (regateFailed)", () => {
   });
 
   test("fileApproval persists the flag so the card can shout, and approve is still allowed", async () => {
-    const id = fileApproval({
+    const id = await fileApproval({
       issueKey: "FAC-60", title: "t", repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/60",
       gatedHeadSha: GATED,
       holdReasons: "merge-integrity: branch was 3 commit(s) behind origin/main; after updating, gates FAILED against the combined head (test)",
@@ -299,7 +300,7 @@ describe("integrity-hold prominence (regateFailed)", () => {
       tasteVerdict: "not-required", findingsDigest: "", diffStat: "", costUsd: 1, turns: 5,
     }, () => {});
     expect(id).not.toBeNull();
-    expect(getApproval(id!)?.regateFailed).toBe(true);
+    expect((await getApproval(id!))?.regateFailed).toBe(true);
     // Presentation + flag, NOT a new block: informed human authority stands.
     const { deps, calls } = approveDeps();
     expect((await approveItem(id!, GATED, deps)).status).toBe(200);
@@ -314,94 +315,94 @@ describe("owner pushback directive survives a run that never delivered", () => {
       restored,
       deps: {
         take: takePushbackFeedback,
-        restore: (key: string, fb: string) => { restored.push(`${key}: ${fb}`); return restorePushbackFeedback(key, fb); },
+        restore: async (key: string, fb: string) => { restored.push(`${key}: ${fb}`); return restorePushbackFeedback(key, fb); },
       },
     };
   };
 
-  test("an EARLY park never consumes it — the next run still gets the directive", () => {
-    recordPushbackFeedback("FAC-70", "use the existing helper");
+  test("an EARLY park never consumes it — the next run still gets the directive", async () => {
+    await recordPushbackFeedback("FAC-70", "use the existing helper");
     const { deps, restored } = handoffDeps();
     // Workspace error / deps failure / freshness park / budget expiry: the run
     // ends before the implementer prompt is built, so take() was never called.
-    ownerFeedbackHandoff("FAC-70", deps).settle(false);
+    await ownerFeedbackHandoff("FAC-70", deps).settle(false);
     expect(restored).toEqual([]);              // nothing to put back — nothing was taken
-    expect(takePushbackFeedback("FAC-70")).toBe("use the existing helper");
+    expect(await takePushbackFeedback("FAC-70")).toBe("use the existing helper");
   });
 
-  test("a park AFTER the implementer read it puts it back for the next attempt", () => {
-    recordPushbackFeedback("FAC-71", "use the existing helper");
+  test("a park AFTER the implementer read it puts it back for the next attempt", async () => {
+    await recordPushbackFeedback("FAC-71", "use the existing helper");
     const { deps } = handoffDeps();
     const h = ownerFeedbackHandoff("FAC-71", deps);
-    expect(h.take()).toBe("use the existing helper");
-    expect(takePushbackFeedback("FAC-71")).toBeNull(); // genuinely consumed mid-run
-    h.settle(false);                                   // run parked before any PR
-    expect(takePushbackFeedback("FAC-71")).toBe("use the existing helper");
+    expect(await h.take()).toBe("use the existing helper");
+    expect(await takePushbackFeedback("FAC-71")).toBeNull(); // genuinely consumed mid-run
+    await h.settle(false);                                   // run parked before any PR
+    expect(await takePushbackFeedback("FAC-71")).toBe("use the existing helper");
   });
 
-  test("a delivering run consumes it exactly once — settle twice cannot resurrect it", () => {
-    recordPushbackFeedback("FAC-72", "split the endpoint");
+  test("a delivering run consumes it exactly once — settle twice cannot resurrect it", async () => {
+    await recordPushbackFeedback("FAC-72", "split the endpoint");
     const { deps, restored } = handoffDeps();
     const h = ownerFeedbackHandoff("FAC-72", deps);
-    expect(h.take()).toBe("split the endpoint");
-    h.settle(true);
-    h.settle(false); // a stray second settle must not restore a spent directive
+    expect(await h.take()).toBe("split the endpoint");
+    await h.settle(true);
+    await h.settle(false); // a stray second settle must not restore a spent directive
     expect(restored).toEqual([]);
-    expect(takePushbackFeedback("FAC-72")).toBeNull();
+    expect(await takePushbackFeedback("FAC-72")).toBeNull();
   });
 
-  test("take is memoized: two reads in one run hit the store once", () => {
-    recordPushbackFeedback("FAC-73", "one directive");
+  test("take is memoized: two reads in one run hit the store once", async () => {
+    await recordPushbackFeedback("FAC-73", "one directive");
     const { deps } = handoffDeps();
     const h = ownerFeedbackHandoff("FAC-73", deps);
-    expect(h.take()).toBe("one directive");
-    expect(h.take()).toBe("one directive"); // not null — the take-once already happened
+    expect(await h.take()).toBe("one directive");
+    expect(await h.take()).toBe("one directive"); // not null — the take-once already happened
   });
 
-  test("restoring never clobbers a directive the owner recorded DURING the run", () => {
-    recordPushbackFeedback("FAC-74", "old direction");
+  test("restoring never clobbers a directive the owner recorded DURING the run", async () => {
+    await recordPushbackFeedback("FAC-74", "old direction");
     const { deps } = handoffDeps();
     const h = ownerFeedbackHandoff("FAC-74", deps);
-    h.take();
-    recordPushbackFeedback("FAC-74", "actually, do this instead"); // owner pushes back again
-    h.settle(false);
-    expect(takePushbackFeedback("FAC-74")).toBe("actually, do this instead");
+    await h.take();
+    await recordPushbackFeedback("FAC-74", "actually, do this instead"); // owner pushes back again
+    await h.settle(false);
+    expect(await takePushbackFeedback("FAC-74")).toBe("actually, do this instead");
   });
 });
 
 describe("pushback — the feedback loop", () => {
   test("posts OWNER FEEDBACK, stores the directive, requeues via the existing mechanism — and cannot merge", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps, calls } = pushbackDeps();
     const r = await pushbackItem(id, "split the endpoint and add a test for the 409 path", deps);
     expect(r.status).toBe(200);
-    expect(getApproval(id)?.status).toBe("pushed_back");
+    expect((await getApproval(id))?.status).toBe("pushed_back");
     expect(calls.comments.join("\n")).toContain("OWNER FEEDBACK");
     expect(calls.removedLabels).toEqual(["Factory-Needs-Human", "Factory-Parked"]);
     expect(calls.transitions).toEqual(["queue"]);
     // The directive reaches the next run through the take-once handoff.
-    expect(takePushbackFeedback("FAC-43")).toBe("split the endpoint and add a test for the 409 path");
+    expect(await takePushbackFeedback("FAC-43")).toBe("split the endpoint and add a test for the 409 path");
     // Structural: PushbackDeps has no merge member at all.
     expect("mergePr" in deps).toBe(false);
   });
 
   test("rejects an empty / non-string feedback body without claiming the item", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps } = pushbackDeps();
     expect((await pushbackItem(id, "", deps)).status).toBe(400);
     expect((await pushbackItem(id, 42, deps)).status).toBe(400);
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
   });
 
   test("a failed requeue rolls the item back to pending (retryable)", async () => {
-    const id = seedItem();
+    const id = await seedItem();
     const { deps } = pushbackDeps({ transitionOk: false });
     const r = await pushbackItem(id, "please fix", deps);
     expect(r.status).toBe(502);
-    expect(getApproval(id)?.status).toBe("pending");
+    expect((await getApproval(id))?.status).toBe("pending");
   });
 
-  test("feedback is redact-scanned and length-capped", () => {
+  test("feedback is redact-scanned and length-capped", async () => {
     expect(normalizeFeedback(`use env var lin_api_${"a".repeat(24)} here`)).toContain("[REDACTED-SECRET]");
     expect(normalizeFeedback("x".repeat(9000))?.length).toBe(4000);
     expect(normalizeFeedback("   ")).toBeNull();
@@ -409,10 +410,10 @@ describe("pushback — the feedback loop", () => {
 });
 
 describe("filing + view", () => {
-  test("the owner notification gets the REDACTED, clamped title — not the raw ticket text", () => {
+  test("the owner notification gets the REDACTED, clamped title — not the raw ticket text", async () => {
     const notices: ApprovalNotice[] = [];
     const leak = `deploy with lin_api_${"c".repeat(24)} ${"x".repeat(400)}`;
-    fileApproval({
+    await fileApproval({
       issueKey: "FAC-52", title: leak, repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/12",
       gatedHeadSha: GATED, holdReasons: "guarded paths touched: src/config.ts",
       gateSummary: null, securityVerdict: "pass", tasteVerdict: "not-required",
@@ -424,8 +425,8 @@ describe("filing + view", () => {
     expect(notice.title.length).toBe(300); // clamped like the stored row
   });
 
-  test("fileApproval persists a redacted card and approvalsView serves it with a count", () => {
-    const id = fileApproval({
+  test("fileApproval persists a redacted card and approvalsView serves it with a count", async () => {
+    const id = await fileApproval({
       issueKey: "FAC-50", title: "add auth", repo: "acme/widgets", prUrl: "https://github.com/acme/widgets/pull/9",
       gatedHeadSha: GATED, holdReasons: `security review FAIL — token lin_api_${"b".repeat(24)} leaked`,
       gateSummary: { green: true, strength: "strong", tests: [{ name: "test", from: 10, to: 12 }] },
@@ -433,7 +434,7 @@ describe("filing + view", () => {
       diffStat: "2 files · 30 changed lines", costUsd: 2.5, turns: 30,
     }, () => {});
     expect(id).not.toBeNull();
-    const view = approvalsView();
+    const view = await approvalsView();
     expect(view.count).toBe(1);
     const item = view.pending[0]!;
     expect(item.issueKey).toBe("FAC-50");
@@ -442,15 +443,15 @@ describe("filing + view", () => {
     expect(item.gateSummary?.tests).toEqual([{ name: "test", from: 10, to: 12 }]);
   });
 
-  test("fileApproval returns null (and files nothing durable) when the store is closed", () => {
-    closeTestDatabase();
-    const id = fileApproval({
+  test("fileApproval returns null (and files nothing durable) when the store is closed", async () => {
+    await closeTestDatabase();
+    const id = await fileApproval({
       issueKey: "FAC-51", title: "x", repo: "a/b", prUrl: "https://github.com/a/b/pull/1",
       gatedHeadSha: GATED, holdReasons: "r", gateSummary: null, securityVerdict: "none",
       tasteVerdict: "not-required", findingsDigest: "", diffStat: "", costUsd: 0, turns: 0,
     }, () => {});
     expect(id).toBeNull();
-    openTestDatabase(); // afterEach closes again
+    await openTestDatabase(); // afterEach closes again
   });
 });
 

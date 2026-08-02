@@ -1,5 +1,5 @@
 import { config } from "./config.ts";
-import { bus } from "./events.ts";
+import { bus, type Lane } from "./events.ts";
 
 // Linear GraphQL client. Personal API keys: raw key as Authorization (no
 // "Bearer"). Hardened per code-review verdict 2026-07-20: HTTP status checks +
@@ -144,6 +144,11 @@ export interface Issue {
   teamId: string;
   stateName: string;
   stateType: string;
+  /** The workflow state's DESCRIPTION — carries the immutable `[factory:<kind>]`
+   *  tag (see "Board stages" below) so pipeline position survives a rename. "" when
+   *  the board has not been tagged; every consumer degrades to the pre-tag name
+   *  heuristic in that case. */
+  stateDescription: string;
   labels: string[];
   createdAt: string;
 }
@@ -152,7 +157,7 @@ interface RawIssue {
   id: string; identifier: string; title: string; description: string | null; url: string;
   createdAt: string;
   team: { id: string; key: string };
-  state: { name: string; type: string };
+  state: { name: string; type: string; description?: string | null };
   labels: { nodes: Array<{ name: string }> };
 }
 
@@ -161,12 +166,13 @@ function toIssue(raw: RawIssue): Issue {
     id: raw.id, identifier: raw.identifier, title: raw.title,
     description: raw.description ?? "", url: raw.url, teamKey: raw.team.key, teamId: raw.team.id,
     stateName: raw.state.name, stateType: raw.state.type,
+    stateDescription: raw.state.description ?? "",
     labels: raw.labels.nodes.map((l) => l.name),
     createdAt: raw.createdAt,
   };
 }
 
-const ISSUE_FIELDS = `id identifier title description url createdAt team { id key } state { name type } labels { nodes { name } }`;
+const ISSUE_FIELDS = `id identifier title description url createdAt team { id key } state { name type description } labels { nodes { name } }`;
 
 /** Issues in the given teams (default: all watched) carrying a label (any state). */
 export async function fetchByLabel(label: string, teamKeys: string[] = config.teamKeys): Promise<Issue[]> {
@@ -193,25 +199,48 @@ export async function fetchTeamQueue(teamKey: string): Promise<Issue[]> {
 }
 
 /** Issues in a review-type state for ONE team — the "PR open" leg of the
- * groundskeeper attention cap (started-type states whose name reads "review"). */
+ * groundskeeper attention cap (started-type states tagged `[factory:review]`,
+ * or named "…review…" on an untagged board). */
 export async function fetchTeamInReview(teamKey: string): Promise<Issue[]> {
   const data = await gql<{ issues: { nodes: RawIssue[] } }>(
     `query($team: String!) {
       issues(first: 50, filter: { team: { key: { eq: $team } }, state: { type: { eq: "started" } } }) { nodes { ${ISSUE_FIELDS} } }
     }`, { team: teamKey });
-  return data.issues.nodes.map(toIssue).filter((i) => /review/i.test(i.stateName));
+  return data.issues.nodes.map(toIssue).filter((i) => isReviewLane(i.stateName, i.stateDescription));
 }
+
+/** Dashboard lane for one queued issue. LABELS ARE AUTHORITATIVE — they are what
+ *  fetchQueue's skip-set actually acts on, so the lane must never disagree with
+ *  whether the factory will pick the issue up. The state tag is consulted only
+ *  when no factory label is present, which is precisely the "a human dragged the
+ *  card into Blocked / Needs Human by hand" case: without this the card would
+ *  render as plain `todo` while visibly sitting in a human-owned column. Pure so
+ *  the mapping is testable without a network. */
+export function queueLane(labels: readonly string[], stateDescription: string | null | undefined): Lane {
+  if (labels.includes(PARKED_LABEL)) return "parked";
+  if (labels.includes(NEEDS_HUMAN_LABEL)) return "needs_human";
+  if (labels.includes(EXECUTING_LABEL)) return "claimed";
+  const kind = taggedKind(stateDescription);
+  if (kind === "blocked") return "parked";
+  if (kind === "needs_human") return "needs_human";
+  return "todo";
+}
+
+/** How many unstarted issues one queue poll reads. Server-side truncation, so it
+ *  bounds the queue BEFORE the client-side skip-filter runs — see the starvation
+ *  warning in fetchQueue. An in-code constant, never an env knob. */
+const QUEUE_PAGE = 50;
 
 /** Queue = unstarted issues in watched teams, minus claimed/parked/needs-human, oldest first. */
 export async function fetchQueue(): Promise<Issue[]> {
   const data = await gql<{ issues: { nodes: RawIssue[] } }>(
-    `query($teams: [String!]!) {
-      issues(first: 50, filter: {
+    `query($teams: [String!]!, $first: Int!) {
+      issues(first: $first, filter: {
         team: { key: { in: $teams } },
         state: { type: { eq: "unstarted" } }
       }) { nodes { ${ISSUE_FIELDS} } }
     }`,
-    { teams: config.teamKeys },
+    { teams: config.teamKeys, first: QUEUE_PAGE },
   );
   const all = data.issues.nodes.map(toIssue);
   const skip = new Set([EXECUTING_LABEL, PARKED_LABEL, NEEDS_HUMAN_LABEL, PLANNED_LABEL, STALE_LABEL, AWAITING_ANSWER_LABEL]);
@@ -220,14 +249,24 @@ export async function fetchQueue(): Promise<Issue[]> {
     issues: all.map((i) => ({
       id: i.id, identifier: i.identifier, title: i.title, url: i.url, teamKey: i.teamKey,
       stateName: i.stateName, stateType: i.stateType, labels: i.labels, createdAt: i.createdAt,
-      lane: i.labels.includes(PARKED_LABEL) ? "parked"
-        : i.labels.includes(NEEDS_HUMAN_LABEL) ? "needs_human"
-        : i.labels.includes(EXECUTING_LABEL) ? "claimed" : "todo",
+      lane: queueLane(i.labels, i.stateDescription),
     })),
   });
-  return all
+  const eligible = all
     .filter((issue) => !issue.labels.some((l) => skip.has(l)))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)); // FIFO regardless of server order (C21)
+  // STARVATION WARNING. `first: N` truncates SERVER-side, before the skip-filter
+  // above runs, so a large held backlog inside the unstarted type can hide fresh
+  // Todo tickets behind the page boundary. WP3 slightly widens that exposure: a
+  // needs-human hold used to be released in the started-type working column
+  // (outside this page) and now lands in the unstarted Needs Human column
+  // (inside it) — parked tickets always were in it. Nothing here is auto-tuned;
+  // a full page with everything filtered out is simply made LOUD so the operator
+  // can act, instead of the queue looking empty for no visible reason.
+  if (all.length >= QUEUE_PAGE && eligible.length === 0) {
+    console.error(`[queue] the ${QUEUE_PAGE}-issue unstarted page is FULL and every issue in it is held (parked / needs-human / awaiting-answer / planned / stale) — fresh Todo tickets past the page boundary are invisible to the daemon until some are cleared`);
+  }
+  return eligible;
 }
 
 /** All issues of a given state TYPE in a team (e.g. "started" = In Progress + In Review). */
@@ -350,36 +389,208 @@ export async function getIssueDetail(key: string): Promise<IssueDetail> {
   };
 }
 
-export type StateKind = "queue" | "working" | "review" | "done";
+// ---------------------------------------------------------------------------
+// Board stages (WP3).
+//
+// Linear offers exactly SIX state TYPES — backlog, unstarted, started,
+// completed, canceled, triage — so pipeline position CANNOT come from the type
+// alone: Todo, Blocked and Needs Human are all `unstarted`, and In Progress and
+// In Review are both `started`. Distinguishing them needs a second anchor, and
+// a state NAME is human-editable (someone renames a column and the daemon
+// silently starts driving the wrong one). So every factory-owned state carries
+// an immutable tag in its DESCRIPTION: `[factory:queue]`, `[factory:blocked]`,
+// `[factory:needs_human]`, `[factory:working]`, `[factory:review]`,
+// `[factory:done]`. scripts/board-setup.ts is what puts them there.
+//
+// C13/M4 IS PRESERVED VERBATIM: the state TYPE is still the outer filter, and a
+// tag is only ever honoured INSIDE the correct type. No human-editable string
+// can move an issue across a type boundary — the worst a wrong/forged tag can
+// do is pick a different column of the RIGHT type. Untagged boards degrade to
+// exactly the pre-WP3 name+position heuristics (see resolveBoardStates).
+//
+// Blocked and Needs Human are deliberately `unstarted`, NOT `started`:
+//   * fetchQueue filters on `type == unstarted`, so an issue parked into a
+//     started-type "Needs Human" would be unreachable and "remove the label to
+//     requeue" (the promise in every park/needs-human comment) would be a lie.
+//     Unstarted + the existing label skip-set keeps requeue a SINGLE reversible
+//     edit, exactly how Factory-Parked already works.
+//   * queue_snapshot is built from the same unstarted fetch and derives its
+//     lanes from labels, so blocked/needs-human issues keep rendering on the
+//     dashboard board instead of vanishing from it.
+// The LABEL, never the state, is what holds an issue out of the queue.
 
-/** Resolve a team state by TYPE with name as tiebreak only (C13/M4). */
-async function resolveState(issue: Issue, kind: StateKind): Promise<{ id: string; name: string } | null> {
-  const data = await gql<{ issue: { team: { states: { nodes: Array<{ id: string; name: string; type: string; position: number }> } } } }>(
-    `query($id: String!) { issue(id: $id) { team { states { nodes { id name type position } } } } }`, { id: issue.id });
-  const states = data.issue.team.states.nodes;
-  if (kind === "queue") {
-    return states.find((s) => s.type === "unstarted" && s.name === "Todo")
-      ?? states.find((s) => s.type === "unstarted") ?? null;
+export type StateKind = "queue" | "blocked" | "needs_human" | "working" | "review" | "done";
+
+/** Kinds the pipeline cannot run without — resolveBoardStates always returns a
+ *  state for these when the team has ANY state of the matching type. */
+export const REQUIRED_STATE_KINDS = ["queue", "working", "review", "done"] as const;
+/** Kinds that are a board UPGRADE, not a requirement. Absent (board-setup never
+ *  run, state deleted, tag stripped) → transition() degrades to "queue", which
+ *  is precisely the pre-WP3 behaviour. */
+export const OPTIONAL_STATE_KINDS = ["blocked", "needs_human"] as const;
+
+/** The immutable description tag for each kind. Lower-case; matched
+ *  case-insensitively so a human re-capitalising the line cannot break it. */
+export const STATE_TAG: Record<StateKind, string> = {
+  queue: "[factory:queue]",
+  blocked: "[factory:blocked]",
+  needs_human: "[factory:needs_human]",
+  working: "[factory:working]",
+  review: "[factory:review]",
+  done: "[factory:done]",
+};
+
+/** The Linear state TYPE each kind must live in — the outer filter that keeps
+ *  the by-TYPE hardening (C13/M4) intact. */
+export const STATE_TYPE: Record<StateKind, string> = {
+  queue: "unstarted", blocked: "unstarted", needs_human: "unstarted",
+  working: "started", review: "started", done: "completed",
+};
+
+/** Canonical column names. Used only BELOW the tag: as a name tiebreak for the
+ *  required kinds (pre-WP3 behaviour), and — for the optional kinds — to RESERVE
+ *  a hand-made "Blocked"/"Needs Human" column even when it carries no tag. */
+export const STATE_NAME: Record<StateKind, string> = {
+  queue: "Todo", blocked: "Blocked", needs_human: "Needs Human",
+  working: "In Progress", review: "In Review", done: "Done",
+};
+
+/** One workflow state as the board resolver sees it. */
+export interface TeamState {
+  id: string;
+  name: string;
+  type: string;
+  position: number;
+  description?: string | null;
+}
+
+const norm = (s: string): string => s.trim().toLowerCase();
+
+/** The kind a state description CLAIMS, or null when it carries no factory tag.
+ *  First tag wins (a description with two tags is a board-setup bug that
+ *  scripts/board-setup.ts reports; it must still resolve deterministically). */
+export function taggedKind(description: string | null | undefined): StateKind | null {
+  const d = norm(description ?? "");
+  if (d === "") return null;
+  for (const kind of Object.keys(STATE_TAG) as StateKind[]) {
+    if (d.includes(STATE_TAG[kind])) return kind;
   }
-  if (kind === "done") {
-    // Name-anchor "Done" before first-completed (mirrors queue→"Todo",
-    // working→"In Progress"): a team with multiple completed-type states (e.g.
-    // "Released" ordered before "Done") must not land closures in the wrong one.
-    return states.find((s) => s.type === "completed" && s.name === "Done")
-      ?? states.find((s) => s.type === "completed") ?? null;
+  return null;
+}
+
+/** Is this state the REVIEW lane (PR open, waiting on a human)? Tag first — so
+ *  renaming "In Review" to "Awaiting merge" cannot silently break reconcile's
+ *  merge→Done link — with the pre-WP3 name regex as the fallback for untagged
+ *  boards. A state that carries a DIFFERENT factory tag is authoritatively not
+ *  the review lane, whatever it is called. Pure so reconcile.ts, steward.ts and
+ *  fetchTeamInReview cannot drift apart. */
+export function isReviewLane(stateName: string, stateDescription: string | null | undefined = ""): boolean {
+  const kind = taggedKind(stateDescription);
+  if (kind !== null) return kind === "review";
+  return /review/i.test(stateName);
+}
+
+/**
+ * Pure, I/O-free board resolution: one team's raw state list → the state each
+ * kind maps to (null = the board has no state of that kind).
+ *
+ * Precedence per kind, all of it INSIDE the kind's required type:
+ *   1. the `[factory:<kind>]` description tag (rename-proof),
+ *   2. the canonical name (`review` keeps its historical /review/i match),
+ *   3. position: first state of the type, except `review` which takes the last
+ *      — byte-for-byte the pre-WP3 fallbacks.
+ *
+ * RESERVED-SET EXCLUSION. With three unstarted states, `queue`'s positional
+ * fallback ("any unstarted state") can now land on Blocked or Needs Human if
+ * "Todo" is ever renamed or untagged — which would make the factory claim work
+ * straight out of the two human-owned columns. So the OPTIONAL kinds resolve
+ * FIRST and their ids are subtracted from every required kind's candidate set.
+ * This is why the optional lookup also matches on name: a hand-made, untagged
+ * "Blocked" column must be reserved even though it is not authoritative enough
+ * to be transitioned INTO.
+ *
+ * The subtraction relaxes only in the degenerate case where it would leave a
+ * required kind with no candidate at all (a board whose ONLY unstarted state is
+ * Blocked). Reachable-but-odd beats unreachable, and it is exactly what the
+ * pre-WP3 code did.
+ */
+export function resolveBoardStates(raw: readonly TeamState[]): Record<StateKind, TeamState | null> {
+  const states = [...raw].sort((a, b) => a.position - b.position);
+  const ofType = (kind: StateKind): TeamState[] => states.filter((s) => s.type === STATE_TYPE[kind]);
+  const result = {} as Record<StateKind, TeamState | null>;
+  const reserved = new Set<string>();
+
+  for (const kind of OPTIONAL_STATE_KINDS) {
+    const pool = ofType(kind).filter((s) => !reserved.has(s.id));
+    const found = pool.find((s) => taggedKind(s.description) === kind)
+      ?? pool.find((s) => norm(s.name) === norm(STATE_NAME[kind]))
+      ?? null;
+    result[kind] = found;
+    if (found) reserved.add(found.id);
   }
-  const started = states.filter((s) => s.type === "started").sort((a, b) => a.position - b.position);
-  if (kind === "working") {
-    return started.find((s) => s.name === "In Progress") ?? started[0] ?? null;
+
+  const nameAnchor = (kind: StateKind, s: TeamState): boolean =>
+    kind === "review" ? /review/i.test(s.name) : norm(s.name) === norm(STATE_NAME[kind]);
+  const positional = (kind: StateKind, pool: TeamState[]): TeamState | null =>
+    (kind === "review" ? pool[pool.length - 1] : pool[0]) ?? null;
+  const pick = (kind: StateKind, pool: TeamState[]): TeamState | null =>
+    pool.find((s) => taggedKind(s.description) === kind)
+    ?? pool.find((s) => nameAnchor(kind, s))
+    ?? positional(kind, pool);
+
+  for (const kind of REQUIRED_STATE_KINDS) {
+    const all = ofType(kind);
+    result[kind] = pick(kind, all.filter((s) => !reserved.has(s.id))) ?? pick(kind, all);
   }
-  return started.find((s) => /review/i.test(s.name)) ?? started[started.length - 1] ?? null;
+  return result;
+}
+
+/** Fetch + resolve one team's whole board (via an issue, which is the only
+ *  handle most callers have). One query, all six kinds. */
+async function boardStatesForIssue(issue: Issue): Promise<Record<StateKind, TeamState | null>> {
+  const data = await gql<{ issue: { team: { states: { nodes: TeamState[] } } } }>(
+    `query($id: String!) { issue(id: $id) { team { states { nodes { id name type position description } } } } }`,
+    { id: issue.id });
+  return resolveBoardStates(data.issue.team.states.nodes);
+}
+
+/** Resolve a team state by TYPE with tag/name as tiebreaks only (C13/M4). */
+async function resolveState(issue: Issue, kind: StateKind): Promise<TeamState | null> {
+  return (await boardStatesForIssue(issue))[kind];
+}
+
+/**
+ * Which state a transition to `kind` must actually target. Pure, so the degrade
+ * path is testable without a network.
+ *
+ * DEGRADE SAFELY. When one of the two OPTIONAL columns is unreachable — the
+ * board was never upgraded (scripts/board-setup.ts not run), the column was
+ * renamed AND untagged, or a human deleted it — fall back to the QUEUE state.
+ * That is byte-for-byte the pre-WP3 behaviour for a park, and it keeps "remove
+ * the label to requeue" true, because the LABEL (never the state) is what holds
+ * an issue out of fetchQueue. Required kinds never degrade: a missing one is a
+ * genuine "this team has no state of that type", which the caller must see as
+ * `false` exactly as before.
+ */
+export function transitionTarget(
+  board: Readonly<Record<StateKind, TeamState | null>>,
+  kind: StateKind,
+): { state: TeamState; degradedFrom: StateKind | null } | null {
+  const direct = board[kind];
+  if (direct) return { state: direct, degradedFrom: null };
+  if (kind !== "blocked" && kind !== "needs_human") return null;
+  const fallback = board.queue;
+  return fallback ? { state: fallback, degradedFrom: kind } : null;
 }
 
 export async function transition(issue: Issue, kind: StateKind): Promise<boolean> {
-  const state = await resolveState(issue, kind);
-  if (!state) return false;
+  const target = transitionTarget(await boardStatesForIssue(issue), kind);
+  if (!target) return false;
+  if (target.degradedFrom !== null) {
+    console.log(`[${issue.identifier}] team ${issue.teamKey} has no "${STATE_NAME[target.degradedFrom]}" state — using "${target.state.name}" instead (run \`bun run board:setup\` to add it)`);
+  }
   await gql(`mutation($id: String!, $stateId: String!) {
-    issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`, { id: issue.id, stateId: state.id });
+    issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`, { id: issue.id, stateId: target.state.id });
   return true;
 }
 
@@ -414,17 +625,19 @@ const teamCache = new Map<string, { id: string; queueStateId: string | null }>()
 async function resolveTeamByKey(teamKey: string): Promise<{ id: string; queueStateId: string | null }> {
   const cached = teamCache.get(teamKey);
   if (cached) return cached;
-  const data = await gql<{ teams: { nodes: Array<{ id: string; states: { nodes: Array<{ id: string; name: string; type: string; position: number }> } }> } }>(
+  const data = await gql<{ teams: { nodes: Array<{ id: string; states: { nodes: TeamState[] } }> } }>(
     `query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1) {
-       nodes { id states { nodes { id name type position } } } } }`, { key: teamKey });
+       nodes { id states { nodes { id name type position description } } } } }`, { key: teamKey });
   const team = data.teams.nodes[0];
   if (!team) throw new Error(`no Linear team with key ${teamKey}`);
-  const states = team.states.nodes;
-  // Same rule as resolveState(kind:"queue"): prefer unstarted/"Todo", else any
-  // unstarted state — issueCreate would otherwise default to Backlog, which
-  // fetchQueue deliberately never reads.
-  const queue = states.find((s) => s.type === "unstarted" && s.name === "Todo")
-    ?? states.find((s) => s.type === "unstarted") ?? null;
+  // ONE resolver, shared with resolveState(kind:"queue") — this used to be a
+  // hand-copied duplicate of the old "unstarted/Todo else any unstarted" rule,
+  // which is exactly the fallback that can now land on Blocked / Needs Human.
+  // Going through resolveBoardStates means the reserved-set exclusion applies
+  // here too, so a filed ticket can never be created straight into a
+  // human-owned column (issueCreate's own default is Backlog, which fetchQueue
+  // deliberately never reads).
+  const queue = resolveBoardStates(team.states.nodes).queue;
   const resolved = { id: team.id, queueStateId: queue?.id ?? null };
   teamCache.set(teamKey, resolved);
   return resolved;

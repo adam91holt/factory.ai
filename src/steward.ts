@@ -2,12 +2,13 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
+import { roleTools } from "./routing.ts";
 import * as linear from "./linear.ts";
 import { repoFromTicket } from "./repos.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { parseFactoryMeta, withFactoryMeta, resolveModel, resolveEffort } from "./meta.ts";
 import { liftPreconditions } from "./precondition.ts";
-import { renderPrompt, cardEffort } from "./catalog.ts";
+import { renderPrompt, cardEffort, listRoutableCards } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 import { lastParkReasonForIssue } from "./db.ts";
 
@@ -51,7 +52,11 @@ function ghPr(repo: string, branch: string): string {
 // runStage refuses to run the stage at all; tests/tool-allowlist.test.ts pins
 // the shape (hence the export). Write is scratch-dir output (summary.md,
 // tickets/) — the daemon, not the steward, executes anything written there.
-export const STEWARD_TOOLS = ["Write", "Read", "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr checks:*)", "Bash(gh pr list:*)", "Bash(gh pr status:*)"];
+// The array itself now lives in routing.ts (agent routing) as the code-defined
+// CEILING that agents/steward.md's `tools:` frontmatter may only SELECT from;
+// re-exported here unchanged so every existing importer (and
+// tests/tool-allowlist.test.ts) is unaffected.
+export { STEWARD_TOOLS } from "./routing.ts";
 
 export function childrenAllTerminal(detail: Awaited<ReturnType<typeof linear.getIssueDetail>>): boolean {
   if (detail.children.length === 0) return false;
@@ -60,7 +65,11 @@ export function childrenAllTerminal(detail: Awaited<ReturnType<typeof linear.get
     if (labels.includes(linear.EXECUTING_LABEL)) return false;
     if (labels.includes(linear.PARKED_LABEL) || labels.includes(linear.NEEDS_HUMAN_LABEL)) return true;
     if (c.stateType === "completed" || c.stateType === "canceled") return true;
-    if (c.stateType === "started" && /review/i.test(c.stateName)) return true; // PR open
+    // PR open. isReviewLane with no state description degrades to the pre-WP3
+    // /review/i name match — getIssueDetail's child nodes carry no state
+    // description, so this is the untagged path by construction; routing it
+    // through the shared helper keeps the review-lane definition in ONE place.
+    if (c.stateType === "started" && linear.isReviewLane(c.stateName)) return true;
     return false; // queued or actively being worked
   });
 }
@@ -73,16 +82,16 @@ export function childrenAllTerminal(detail: Awaited<ReturnType<typeof linear.get
  *  outlive daemon versions in the durable log — redact again at this outbound
  *  seam (§2.2), and say "(no reason recorded)" out loud for legacy rows rather
  *  than silently omitting the field. */
-export function childStatusBlock(
+export async function childStatusBlock(
   c: { identifier: string; title: string; stateName: string; labels?: string[] },
   pr: string,
-  reasonLookup: (issueKey: string) => string | null = lastParkReasonForIssue,
-): string {
+  reasonLookup: (issueKey: string) => Promise<string | null> = lastParkReasonForIssue,
+): Promise<string> {
   const labels = c.labels ?? [];
   const lines = [`### ${c.identifier} — ${c.title}`,
     `state: ${c.stateName} · labels: ${labels.join(", ") || "none"}`];
   if (labels.includes(linear.PARKED_LABEL) || labels.includes(linear.NEEDS_HUMAN_LABEL)) {
-    const reason = reasonLookup(c.identifier);
+    const reason = await reasonLookup(c.identifier);
     lines.push(`reason: ${reason ? redactSecrets(reason).clean.replace(/\s+/g, " ").slice(0, 300) : "(no reason recorded)"}`);
   }
   lines.push(`PR: ${pr}`);
@@ -99,15 +108,17 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
   const epicMeta = parseFactoryMeta(epic.description);
   bus.emit({ type: "run_started", issueKey: epic.identifier, title: `[steward] ${epic.title}`, repo, dryRun: config.dryRun });
 
-  const childReports = detail.children.map((c) =>
+  const childReports = (await Promise.all(detail.children.map((c) =>
     childStatusBlock(c, repo ? ghPr(repo, `factory/${c.identifier.toLowerCase()}`) : "(no repo)"),
-  ).join("\n\n");
+  ))).join("\n\n");
 
   const scratch = join(config.workRoot, ".steward-scratch", epic.identifier);
   rmSync(scratch, { recursive: true, force: true });
   mkdirSync(join(scratch, "tickets"), { recursive: true });
 
   const deadline = Date.now() + config.caps.wallMinutesPerIssue * 60_000;
+  const stewardTools = roleTools("steward", listRoutableCards());
+  if (stewardTools.unknown.length > 0) console.error(`[${epic.identifier}] agents/steward.md declares unknown tool selector(s) [${stewardTools.unknown.join(", ")}] — they grant nothing`);
   const steward = await runStage("steward",
     renderPrompt("steward",
       { epic: untrusted(`EPIC: ${epic.identifier} — ${epic.title}\n\n${epic.description}`), children: untrusted(`CHILDREN STATUS + PRS:\n${childReports}`) },
@@ -126,7 +137,11 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         untrusted(`CHILDREN STATUS + PRS:\n${childReports}`),
       ].join("\n")),
     { model: resolveModel("steward", epicMeta), effort: resolveEffort("steward", epicMeta, cardEffort("steward")), cwd: scratch,
-      allowedTools: STEWARD_TOOLS,
+      // Agent routing: agents/steward.md's `tools:` selection over the
+      // STEWARD_TOOLS ceiling. No specialist exists for this role (it is not
+      // in SPECIALIST_ROLES), so this is tool resolution only — and it is
+      // subtractive, so it can never grant a verb the ceiling above lacks.
+      allowedTools: stewardTools.tools,
       maxTurns: config.caps.turnsFixer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline,
       onEvent: (e) => {
         if (e.kind === "stage_started") bus.emit({ type: "run_stage_started", issueKey: epic.identifier, stage: e.stage, model: e.model, viaProxy: e.viaProxy });
@@ -185,6 +200,10 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
     if (!config.dryRun) {
       await linear.addLabel(epic, linear.STEWARDED_LABEL).catch(() => {}); // don't loop a broken steward
       await linear.addLabel(epic, linear.NEEDS_HUMAN_LABEL).catch(() => {}); // surface the failed closeout; reconcile must not auto-close over it
+      // WP3 board stage: the factory STOPPED on this epic → Needs Human column,
+      // so a broken closeout is visible on the board and not just in the label
+      // list (degrades to the queue state on a board without the column).
+      await linear.transition(epic, "needs_human").catch(() => {});
     }
     // Error strings can interpolate HTTP bodies — redact at the outbound seam
     // (§2.2) so the Needs-Human label always ships with a safe, visible WHY.

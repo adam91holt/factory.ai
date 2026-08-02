@@ -28,6 +28,24 @@ export interface ReportInput {
   // #12b (FAC-34): set when park pushed the worktree's committed work
   // best-effort so a human can salvage it instead of it being silently lost.
   parkedBranchUrl?: string;
+  // Agent routing (routing.ts): the NOTABLE routing decisions for this run —
+  // a specialist card selected on repo facts, a card that narrowed its own
+  // allowlist below the code ceiling, or an unknown tool selector that was
+  // dropped. Omitted (and rendered as nothing at all) when every stage took
+  // its default card with the full ceiling, so an unrouted run's report is
+  // byte-identical to what it was before routing existed.
+  routing?: RoutingEntry[];
+}
+
+export interface RoutingEntry {
+  stage: string;
+  card: string;
+  specialist: boolean;
+  /** Repo-fact terms that selected the specialist ([] for a default card). */
+  matched: string[];
+  toolCount: number;
+  narrowed: boolean;
+  unknownTools: string[];
 }
 
 export function buildReport(input: ReportInput): string {
@@ -72,6 +90,18 @@ export function buildReport(input: ReportInput): string {
   if (input.verification) {
     lines.push("**Verification (tester):**", input.verification, "");
   }
+  const routing = input.routing ?? [];
+  if (routing.length > 0) {
+    lines.push("**Agent routing** (selected on repo facts — never on ticket text):");
+    for (const r of routing) {
+      const bits = [`\`${r.card}\``];
+      if (r.specialist) bits.push(`specialist · matched ${r.matched.join(" + ") || "(none)"}`);
+      if (r.narrowed) bits.push(`allowlist narrowed by the card to ${r.toolCount} tool(s)`);
+      if (r.unknownTools.length > 0) bits.push(`⚠️ unknown tool selector(s) dropped: ${r.unknownTools.join(", ")}`);
+      lines.push(`- ${r.stage}: ${bits.join(" · ")}`);
+    }
+    lines.push("");
+  }
   const gateLines = input.gates.map((g) =>
     `- ${g.name}: ${g.passed === null ? "no-gate (fails on baseline)" : g.passed ? "pass" : "FAIL"}`);
   if (gateLines.length > 0) lines.push("**Gates:**", ...gateLines, "");
@@ -91,6 +121,18 @@ export function buildReport(input: ReportInput): string {
   if (input.testRatchet) {
     lines.push(`  test_ratchet: ${input.testRatchet.verdict}`);
     lines.push(`  test_counts: ${JSON.stringify(input.testRatchet.evidence)}`);
+  }
+  if (routing.length > 0) {
+    lines.push("  routing:");
+    for (const r of routing) {
+      lines.push(`    - stage: ${r.stage}`);
+      lines.push(`      card: ${r.card}`);
+      lines.push(`      specialist: ${r.specialist}`);
+      if (r.matched.length > 0) lines.push(`      matched: ${JSON.stringify(r.matched.join(" "))}`);
+      lines.push(`      tools: ${r.toolCount}`);
+      if (r.narrowed) lines.push("      narrowed: true");
+      if (r.unknownTools.length > 0) lines.push(`      unknown_tools: ${JSON.stringify(r.unknownTools.join(" "))}`);
+    }
   }
   lines.push(`  guarded_paths: ${input.guardedPaths.length}`);
   lines.push(`  parked_branch: ${JSON.stringify(input.parkedBranchUrl ?? null)}`);

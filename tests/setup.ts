@@ -15,3 +15,22 @@ process.env.PROXY_AUTH_TOKEN = "factory-test-proxy-token-a1b2c3";
 process.env.APPROVALS_NOTIFY ??= "0";
 process.env.GROUNDSKEEPERS_ENABLED ??= "";
 process.env.MERGE_AUTO_REPOS ??= "";
+// Fail-CLOSED database guard. The suite runs entirely on db.ts's in-process
+// PGlite (WASM Postgres) seam — openTestDatabase() — so `bun test` needs NO
+// container, no port and no server. Blanking this means that even if some code
+// path ever reached startEventStore(), it could not connect to a real Postgres
+// and quietly read or write the owner's live factory store. The guard itself is
+// pinned by tests/db-closed-store.test.ts, not just asserted here.
+//
+// How the seam behaves, so nobody has to read db.ts to use it:
+//  - The WASM engine is a module-level SINGLETON. The first openTestDatabase()
+//    boots it plus the real DDL (~1.4s, paid once for the whole suite); every
+//    later call is one `TRUNCATE ... RESTART IDENTITY` (~2ms). RESTART IDENTITY
+//    matters — several tests assert on returned row ids.
+//  - closeTestDatabase() DETACHES the handle and quiesces any in-flight write;
+//    it deliberately does not close the engine, which would re-pay the boot.
+//  - No bus subscription by default: emitting events in a test costs nothing.
+//    tests/event-queue.test.ts opts in with { subscribeBus: true } because the
+//    write-behind queue is the thing it exists to pin.
+//  - The SQL is byte-identical to production's; PGlite is real Postgres.
+process.env.FACTORY_DATABASE_URL = "";

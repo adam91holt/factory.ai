@@ -8,3 +8,9 @@ factory.db
 factory.db-*
 *.db-wal
 *.db-shm
+
+# CLIProxyAPI: live api-key + provider OAuth credentials (see config.example.yaml)
+docker/cliproxy/config.yaml
+docker/cliproxy/auths/
+docker/cliproxy/logs/
+docker/cliproxy/plugins/

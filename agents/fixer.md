@@ -1,7 +1,7 @@
 ---
 name: fixer
 model: fixer
-tools: [Read, Glob, Grep, Edit, Bash]
+tools: [Read, Glob, Grep, Edit, Bash, Task, Agent]
 effort: high
 when: Applies adversarial-review feedback (and, when the taste gate fails, design findings) to the worktree.
 ---

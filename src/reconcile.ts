@@ -44,7 +44,11 @@ export async function reconcileTick(): Promise<void> {
     const inReview = await linear.fetchIssuesByStateType("started", teamKey)
       .catch(() => [] as linear.Issue[]);
     for (const issue of inReview) {
-      if (!/review/i.test(issue.stateName)) continue; // only the review lane, not "In Progress"
+      // Only the review lane, not "In Progress". WP3: tag-anchored
+      // (`[factory:review]` in the state description) so renaming the column
+      // cannot silently break the merge→Done link; falls back to the pre-WP3
+      // name regex on an untagged board.
+      if (!linear.isReviewLane(issue.stateName, issue.stateDescription)) continue;
       const repo = repoFromTicket(issue.description);
       if (!repo) continue;
       if (!(await prMerged(repo, `factory/${issue.identifier.toLowerCase()}`))) continue;

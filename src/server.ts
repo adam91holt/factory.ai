@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { startEventStore, issueEvents, getTelemetry } from "./db.ts";
+import { startEventStore, issueEvents, getTelemetry, flushEvents } from "./db.ts";
 import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
 import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
@@ -380,11 +380,11 @@ function contentType(path: string): string {
     : "application/octet-stream";
 }
 
-export function startDashboard(): {
-  close(): Promise<void> } | null {
+export async function startDashboard(): Promise<{
+  close(): Promise<void> } | null> {
   const port = resolvePort();
   if (port === null) return null;
-  startEventStore();
+  await startEventStore();
 
   const historyPath = join(config.workRoot, "factory-history.jsonl");
   const clients = new Set<{ res: ServerResponse; heartbeat: ReturnType<typeof setInterval> }>();
@@ -446,7 +446,7 @@ export function startDashboard(): {
     // archiveLesson() sets archived=1 — a lesson row is NEVER hard-deleted, it
     // just stops being listed and stops being injected into prompts.
     if (url.pathname === "/lessons/archive") {
-      void guardedJsonBody(req, res).then((guarded) => {
+      void guardedJsonBody(req, res).then(async (guarded) => {
         if (guarded === null) return; // refusal already written
         const id = (guarded.body as { id?: unknown } | null)?.id;
         if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
@@ -455,7 +455,7 @@ export function startDashboard(): {
           return;
         }
         try {
-          const archived = archiveLesson(id);
+          const archived = await archiveLesson(id);
           if (!archived) {
             res.writeHead(404, { "content-type": "application/json" });
             res.end('{"error":"no active lesson with that id"}');
@@ -564,11 +564,21 @@ export function startDashboard(): {
     if (url.pathname === "/run-events") {
       const key = url.searchParams.get("key") ?? "";
       // Wider than /issue: groundskeeper runs use GK-<card-name> issueKeys and
-      // their events live in the same local sqlite log. /issue stays strict —
+      // their events live in the same durable event log. /issue stays strict —
       // it forwards to Linear, where only ABC-123 identifiers exist.
       if (!/^[A-Z]+-[A-Za-z0-9-]{1,80}$/.test(key)) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"bad key"}'); return; }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(issueEvents(key)));
+      // Async store: adopt the promise idiom this file already uses at /issue
+      // and /catalog/save rather than making the whole handler async (that
+      // would perturb return-vs-writeHead ordering across the SSE/static
+      // branches). Every chain gets a terminal .catch, so a rejected read can
+      // never become an unhandled rejection or a hung response.
+      void issueEvents(key)
+        .then((events) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(events)); })
+        .catch((error: unknown) => {
+          console.error(`[dashboard] run-events failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"run events unavailable"}');
+        });
       return;
     }
 
@@ -599,18 +609,16 @@ export function startDashboard(): {
     if (url.pathname === "/telemetry") {
       // Same SPA/API split as /runs: browser navigations (reload, bookmark,
       // deep link) get the app shell; API clients get JSON. And the aggregate
-      // reads durable rows — a bad row or sqlite error must 500 this request,
+      // reads durable rows — a bad row or a store error must 500 this request,
       // never take down the daemon serving the pipeline.
       if (wantsHtml && serveIndex(res)) return;
-      try {
-        const body = JSON.stringify(getTelemetry());
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(body);
-      } catch (error) {
-        console.error(`[dashboard] telemetry failed: ${error instanceof Error ? error.message : error}`);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end('{"error":"telemetry unavailable"}');
-      }
+      void getTelemetry()
+        .then((t) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(t)); })
+        .catch((error: unknown) => {
+          console.error(`[dashboard] telemetry failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"telemetry unavailable"}');
+        });
       return;
     }
 
@@ -619,15 +627,13 @@ export function startDashboard(): {
       // /catalog page get the app shell; fetch() clients get the JSON payload.
       // A read error must 500 this request, never crash the pipeline daemon.
       if (wantsHtml && serveIndex(res)) return;
-      try {
-        const body = JSON.stringify(readCatalog());
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(body);
-      } catch (error) {
-        console.error(`[dashboard] catalog failed: ${error instanceof Error ? error.message : error}`);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end('{"error":"catalog unavailable"}');
-      }
+      void readCatalog()
+        .then((payload) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(payload)); })
+        .catch((error: unknown) => {
+          console.error(`[dashboard] catalog failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"catalog unavailable"}');
+        });
       return;
     }
 
@@ -640,18 +646,20 @@ export function startDashboard(): {
       // this request, never crash the pipeline daemon; a missing table is an
       // empty list, not an error.
       if (wantsHtml && serveIndex(res)) return;
-      try {
-        const body = JSON.stringify({ lessons: listLessons()
-          .filter((l) => !l.archived)                                   // archive actually hides (F1)
-          .map((l) => ({ id: l.id, repo: l.repo, stage: l.stage, lesson: l.lesson,
-            createdAt: l.createdAt, sourceIssue: l.issueKey || null, sourceUrl: null })) }); // UI shape (F2)
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(body);
-      } catch (error) {
-        console.error(`[dashboard] lessons failed: ${error instanceof Error ? error.message : error}`);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end('{"error":"lessons unavailable"}');
-      }
+      void listLessons()
+        .then((rows) => {
+          const body = JSON.stringify({ lessons: rows
+            .filter((l) => !l.archived)                                   // archive actually hides (F1)
+            .map((l) => ({ id: l.id, repo: l.repo, stage: l.stage, lesson: l.lesson,
+              createdAt: l.createdAt, sourceIssue: l.issueKey || null, sourceUrl: null })) }); // UI shape (F2)
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(body);
+        })
+        .catch((error: unknown) => {
+          console.error(`[dashboard] lessons failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"lessons unavailable"}');
+        });
       return;
     }
 
@@ -662,15 +670,13 @@ export function startDashboard(): {
       // stored strings were redacted at write time (approvals.ts); `count`
       // backs the nav badge. A read error must 500 this request only.
       if (wantsHtml && serveIndex(res)) return;
-      try {
-        const body = JSON.stringify(approvalsView());
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(body);
-      } catch (error) {
-        console.error(`[dashboard] approvals failed: ${error instanceof Error ? error.message : error}`);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end('{"error":"approvals unavailable"}');
-      }
+      void approvalsView()
+        .then((view) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(view)); })
+        .catch((error: unknown) => {
+          console.error(`[dashboard] approvals failed: ${error instanceof Error ? error.message : error}`);
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"approvals unavailable"}');
+        });
       return;
     }
 
@@ -723,8 +729,11 @@ export function startDashboard(): {
   });
 
   return {
-    close(): Promise<void> {
+    async close(): Promise<void> {
       unsubscribe();
+      // Write-behind queue: drain before tearing the server down so a shutdown
+      // never strands events that were emitted but not yet inserted.
+      await flushEvents().catch(() => { /* best-effort */ });
       for (const client of clients) {
         clearInterval(client.heartbeat);
         client.res.end();
