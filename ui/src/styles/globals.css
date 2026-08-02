@@ -119,3 +119,22 @@ body {
   letter-spacing: 0.08em;
   color: var(--color-fg-faint);
 }
+
+/* ------------------------------------------------ mobile (FAC-64) */
+
+/* iOS Safari auto-zooms any focused input whose font-size < 16px, which
+   wrecks the layout mid-interaction. On coarse-pointer screens, floor form
+   text at 16px; desktop keeps the dense mono sizing. */
+@media (pointer: coarse) {
+  textarea,
+  input,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+/* Momentum scrolling for the containers that scroll horizontally on phones
+   (board lanes, tables, DAG). */
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
+}

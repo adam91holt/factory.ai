@@ -1,4 +1,4 @@
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Menu } from "lucide-react";
 import { useFactory } from "../../lib/store";
 import { relTime } from "../../lib/format";
 import { useNow } from "../../lib/useNow";
@@ -8,12 +8,20 @@ import { ConnectionDot } from "./ConnectionDot";
 
 const MODE_LABEL = { watch: "WATCH", once: "ONCE", dry: "DRY RUN" } as const;
 
-export function Topbar() {
+export function Topbar({ onMenu }: { onMenu?: () => void } = {}) {
   const daemon = useFactory((s) => s.mission.daemon);
   const now = useNow(5000);
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-4 border-b border-line bg-bg1 px-4">
+    <header className="flex h-12 shrink-0 items-center gap-3 border-b border-line bg-bg1 px-3 md:gap-4 md:px-4">
+      <button
+        type="button"
+        aria-label="Open menu"
+        onClick={onMenu}
+        className="-ml-1 flex size-11 items-center justify-center rounded-lg text-fg-dim transition-colors duration-100 hover:bg-bg2 hover:text-fg md:hidden"
+      >
+        <Menu className="size-5" strokeWidth={1.75} />
+      </button>
       {daemon ? (
         <Badge variant={daemon.mode === "dry" ? "codex" : "live"} className="tracking-[0.06em]">
           {MODE_LABEL[daemon.mode]}
@@ -26,7 +34,9 @@ export function Topbar() {
       )}
 
       {daemon && (
-        <div className="flex items-center gap-4 font-mono text-[11px] text-fg-faint">
+        // Dense operator stats are desktop-only; on a phone the badges +
+        // connection dot carry the state and the numbers live one tap away.
+        <div className="hidden items-center gap-4 font-mono text-[11px] text-fg-faint lg:flex">
           <span>
             teams <span className="text-fg-dim">{daemon.teamKeys.join(",")}</span>
           </span>

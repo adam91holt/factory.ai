@@ -103,7 +103,7 @@ function ApproveButton({
   if (disabledReason !== null) {
     return (
       <span
-        className="flex h-7 cursor-not-allowed items-center gap-1.5 rounded-md border border-line px-2.5 font-mono text-[10.5px] text-fg-faint"
+        className="flex h-11 cursor-not-allowed items-center gap-1.5 rounded-md border border-line px-3 font-mono text-[11px] text-fg-faint md:h-7 md:px-2.5 md:text-[10.5px]"
         title={disabledReason}
       >
         <Check className="size-3" strokeWidth={1.75} />
@@ -121,7 +121,7 @@ function ApproveButton({
         onApprove();
       }}
       className={cn(
-        "flex h-7 items-center gap-1.5 rounded-md border px-2.5 font-mono text-[10.5px]",
+        "flex h-11 items-center gap-1.5 rounded-md border px-3 font-mono text-[11px] md:h-7 md:px-2.5 md:text-[10.5px]",
         "transition-[color,background-color,border-color,transform] duration-100 active:scale-95",
         armed
           ? "border-ok/60 bg-ok/15 text-ok hover:bg-ok/25"
@@ -155,7 +155,7 @@ function PushbackForm({
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="flex h-7 items-center gap-1.5 rounded-md border border-line px-2.5 font-mono text-[10.5px] text-fg-dim transition-colors duration-100 hover:border-line2 hover:bg-bg2 hover:text-fg"
+        className="flex h-11 items-center gap-1.5 rounded-md border border-line px-3 font-mono text-[11px] text-fg-dim transition-colors duration-100 hover:border-line2 hover:bg-bg2 hover:text-fg md:h-7 md:px-2.5 md:text-[10.5px]"
         title="send it back to the factory with feedback — a fixer round picks it up"
       >
         <CornerUpLeft className="size-3" strokeWidth={1.75} />
@@ -179,7 +179,7 @@ function PushbackForm({
           disabled={pending || feedback.trim() === ""}
           onClick={() => onPushback(feedback.trim())}
           className={cn(
-            "flex h-7 items-center gap-1.5 rounded-md border border-human/40 bg-human/10 px-2.5 font-mono text-[10.5px] text-human",
+            "flex h-11 items-center gap-1.5 rounded-md border border-human/40 bg-human/10 px-3 font-mono text-[11px] text-human md:h-7 md:px-2.5 md:text-[10.5px]",
             "transition-colors duration-100 hover:bg-human/20",
             (pending || feedback.trim() === "") && "cursor-not-allowed opacity-50",
           )}

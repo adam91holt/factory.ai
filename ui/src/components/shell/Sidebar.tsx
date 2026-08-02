@@ -21,7 +21,7 @@ const NAV = [
   { to: "/lessons", label: "Lessons", icon: GraduationCap },
 ] as const;
 
-export function Sidebar() {
+export function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
   const activeRuns = useFactory((s) =>
     Object.values(s.mission.runs)
       .filter((r) => r.status === "active")
@@ -67,7 +67,8 @@ export function Sidebar() {
             key={to}
             to={to}
             activeOptions={{ exact: to === "/" }}
-            className="flex h-8 items-center gap-2.5 rounded-lg px-2.5 text-[12.5px] font-medium text-fg-dim transition-colors duration-100 hover:bg-bg2 hover:text-fg [&.active]:bg-bg2 [&.active]:text-fg [&.active]:shadow-[inset_2px_0_0_0] [&.active]:shadow-live"
+            onClick={onNavigate}
+            className="flex h-11 items-center gap-2.5 rounded-lg px-2.5 text-[13px] font-medium text-fg-dim transition-colors duration-100 hover:bg-bg2 hover:text-fg md:h-8 md:text-[12.5px] [&.active]:bg-bg2 [&.active]:text-fg [&.active]:shadow-[inset_2px_0_0_0] [&.active]:shadow-live"
           >
             <Icon className="size-3.5 text-fg-faint" strokeWidth={1.75} />
             {label}
@@ -102,7 +103,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      <div className="border-t border-line px-4 py-3">
+      <div className="border-t border-line px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         <div className="section-label">Session spend</div>
         <div className="mt-0.5 font-mono text-sm text-fg">{usd(sessionCost)}</div>
       </div>
