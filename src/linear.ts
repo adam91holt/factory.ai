@@ -867,6 +867,23 @@ export function filterOrphanedIssues(issues: Issue[], excludeIdentifiers: Readon
   return issues.filter((issue) => !excludeIdentifiers.has(issue.identifier));
 }
 
+/** Fresh-read guard for a mutation that, unlike claim(), does not itself
+ * claim the issue first (index.ts's pre-claim `pr-merged` gate, FAC-75
+ * review round 1, high): confirms the issue is STILL in the state the
+ * tick's queue fetch assumed it was in — unstarted, no EXECUTING_LABEL —
+ * immediately before resolveStale mutates it. The `issue` object a gate
+ * decision is based on can be seconds stale by the time a network-bound gh
+ * probe resolves; without this re-read, a human who manually started (or
+ * otherwise moved) the ticket in that window would have the intervention
+ * silently overwritten by a decision made against stale data. Same check
+ * claim() makes before its first mutation (line ~848); split out because
+ * this caller never claims — there is no workspace/PR run to roll back, it
+ * only needs the guard. */
+export async function stillUnclaimed(issue: Issue): Promise<boolean> {
+  const fresh = await getIssue(issue.id);
+  return fresh.stateType === "unstarted" && !fresh.labels.includes(EXECUTING_LABEL);
+}
+
 /** Startup recovery (and the runtime orphan sweep, index.ts): a fresh daemon
  * owns no in-flight work, and the single-instance lease guarantees no live
  * sibling holds a claim — so any Executing-labeled issue that is NOT one of

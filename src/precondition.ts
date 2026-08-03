@@ -296,7 +296,19 @@ export async function checkFreshness(
   issueKey: string, description: string, ctx: PreconditionContext, probes: PreconditionProbes = defaultProbes,
 ): Promise<{ action: FreshnessAction; reason: string }> {
   const implicit = parsePrecondition(`undelivered factory/${issueKey.toLowerCase()}`)!;
-  const all = [implicit, ...parsePreconditions(description)];
+  // `pr-merged` is EXCLUDED here on purpose (repair, FAC-75 review round 1): the
+  // header EXCEPTION says this kind never routes through decideFreshness's
+  // proceed/cancel/park space, because its "park" would turn a plain "not yet"
+  // (PR still OPEN, or a transient gh UNKNOWN between the pre-claim gate and
+  // this check) into a human-blocking state — exactly the fail-safe direction
+  // Outcome #2 forbids. The pre-claim gate (decidePendingMerge/checkPendingMerge,
+  // index.ts) is the ONLY place `pr-merged` can hold/cancel; once a ticket has
+  // passed it, MERGED is a terminal PR state (a PR cannot un-merge back to
+  // CLOSED), so there is no legitimate post-claim cancellation left to detect —
+  // dropping it here costs nothing and removes the unreachable-in-theory,
+  // reachable-in-practice park path a gh hiccup could trigger.
+  const authored = parsePreconditions(description).filter((p) => p.kind !== "pr-merged");
+  const all = [implicit, ...authored];
   const evaluated = all.map((p) => ({ p, ...evaluateOne(p, ctx, probes) }));
   return decideFreshness(evaluated);
 }
@@ -353,6 +365,56 @@ export async function checkPendingMerge(
   return decidePendingMerge(evaluated);
 }
 
+/** Minimal shape the scheduling wiring (index.ts) needs from a queue issue —
+ * kept narrow so this stays testable with plain fixture objects, no linear.ts
+ * Issue import here. */
+export interface MergeGateIssue { identifier: string; description: string; }
+
+/** Result of applying the pre-claim `pr-merged` gate to a batch of candidates.
+ *  `schedulable` is EVERY candidate minus the cancelled ones — including held
+ *  ones — so DAG derivation and the file mutex (dag.ts, index.ts) still see a
+ *  held ticket's `touches`/position and order/serialize real siblings around
+ *  it correctly; the caller is responsible for excluding `heldIds` from the
+ *  final CLAIM batch (after selectRunnable), not from scheduling itself.
+ *  Repair (FAC-75 review round 1, high #1 dag.ts/index.ts): dropping a held
+ *  candidate out of the schedulable set entirely — the pre-repair behavior —
+ *  made it invisible to deriveImplicitDeps, so a later sibling with
+ *  overlapping `touches` could jump ahead of it with no ordering edge. */
+export interface MergeGatePartition<T extends MergeGateIssue> {
+  schedulable: T[];
+  heldIds: Set<string>;
+  cancelled: Array<{ issue: T; reason: string }>;
+}
+
+/** Apply the `pr-merged` pre-claim gate to a batch of already-eligible,
+ * NOT-in-flight candidates (the caller MUST exclude in-flight issues before
+ * calling this — an issue whose run is currently executing must never be
+ * re-probed or resolved here; see index.ts's FAC-75 repair note). Extracted
+ * from index.ts's tick() so the scheduling wiring itself — not just the pure
+ * decidePendingMerge combinator — is unit-testable without mocking Linear/gh
+ * (repair, FAC-75 review round 1, medium #3: the pre-repair gate loop had
+ * zero coverage at this level, which is exactly where the in-flight defect
+ * lived). Pure given injected `probes`; async because checkPendingMerge is. */
+export async function applyMergeGate<T extends MergeGateIssue>(
+  issues: T[],
+  repoOf: (issue: T) => string,
+  probes: PreconditionProbes = defaultProbes,
+): Promise<MergeGatePartition<T>> {
+  const schedulable: T[] = [];
+  const heldIds = new Set<string>();
+  const cancelled: Array<{ issue: T; reason: string }> = [];
+  for (const issue of issues) {
+    const gate = await checkPendingMerge(issue.description, { repo: repoOf(issue) }, probes).catch((error) => ({
+      action: "hold" as const,
+      reason: `pr-merged gate check errored — holding (fail-safe): ${error instanceof Error ? error.message : error}`,
+    }));
+    if (gate.action === "cancel") { cancelled.push({ issue, reason: gate.reason }); continue; }
+    schedulable.push(issue);
+    if (gate.action === "hold") heldIds.add(issue.identifier);
+  }
+  return { schedulable, heldIds, cancelled };
+}
+
 /** Lift model-authored preconditions (a "## Precondition" section, or inline
  * "Precondition:" lines the steward wrote in prose) into validated DSL strings,
  * dropping any that don't parse — the same trust boundary plan.ts uses stamping
@@ -375,9 +437,26 @@ export function liftPreconditions(followupBody: string): string[] {
       if (body) candidates.push(body);
     }
   }
+  // A model echoing this module's own vocabulary docs (agents/steward.md
+  // wraps every DSL example in a code span, e.g. `pr-merged acme/w#6`) is a
+  // very plausible steward output shape. Left unstripped, the leading/
+  // trailing backtick makes the KIND token unrecognizable ("`pr-merged" is
+  // not a known kind), so parsePrecondition silently drops the WHOLE line —
+  // for a self-cancel kind that's a minor missed DoS-immunity (module header),
+  // but for `pr-merged` it defeats the very gate this ticket adds: the
+  // follow-up is stamped with NO precondition at all and proceeds immediately,
+  // recreating the FAC-74 race (repair, FAC-75 review round 1, high). Strip
+  // ONE matched pair of surrounding backticks (a single code span around the
+  // whole line) before parsing; anything else malformed still drops, same as
+  // before.
+  const stripCodeSpan = (s: string): string => {
+    const m = s.match(/^`([^`]+)`$/);
+    return m ? m[1]!.trim() : s;
+  };
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const c of candidates) {
+  for (const raw of candidates) {
+    const c = stripCodeSpan(raw);
     const p = parsePrecondition(c);
     if (!p) continue;
     const dsl = serialize(p);
