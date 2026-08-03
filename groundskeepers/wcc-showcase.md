@@ -1,6 +1,6 @@
 ---
 name: wcc-showcase
-enabled: true
+enabled: false
 schedule: "*/15 * * * *"
 team: FAC
 repos: [adam91holt/wcc-emergency-gis-showcase]
