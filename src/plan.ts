@@ -64,8 +64,17 @@ export function readChildren(dir: string): ChildSpec[] {
     // ## Depends-on: any digit runs are ordinals (tolerant of "01, 02", bullets,
     // spaces). ## Touches: comma/newline/bullet-separated globs.
     const dependsOn = (extractSection(description, "Depends-on").match(/\d+/g) ?? []).map(Number);
-    const touches = extractSection(description, "Touches")
+    const declaredTouches = extractSection(description, "Touches")
       .split(/[\n,]/).map((s) => s.replace(/^[-*]\s*/, "").replace(/^`|`$/g, "").trim()).filter((s) => s.length > 0);
+    // SERIALISE ON GLUE (2026-08-03): augment the declared touches with a bare
+    // token for every well-known glue file this child references — declared or
+    // merely mentioned in its body. Because the token is the shared basename,
+    // any two children that touch the same glue file now have overlapping
+    // `touches`, so deriveImplicitDeps chains a depends_on edge and the file-
+    // mutex blocks parallel runs. This is the anti-collision fix for the WCC
+    // conflict cascade: children editing index.html/main.ts/style.css build and
+    // merge SERIALLY on fresh main instead of racing to a merge conflict.
+    const touches = [...new Set([...declaredTouches, ...glueTokensFor({ description, touches: declaredTouches })])];
     return { title, description, ordinal, dependsOn, touches };
   }).filter((c) => c.title.length > 0 && c.description.length > 50);
   if (children.length < 2 || children.length > 6) throw new Error(`decomposer produced ${children.length} valid child files (expected 2-6)`);
@@ -90,14 +99,33 @@ export function readChildren(dir: string): ChildSpec[] {
 // the collision. Matched by basename (not full path) since repos name these
 // differently — the goal is visibility, not precision.
 const KNOWN_GLUE_BASENAMES = [
-  "index.css", "app.css", "global.css", "globals.css", "styles.css",
+  // HTML/entry + main module + top-level stylesheet — the files EVERY UI
+  // feature edits (added 2026-08-03: the WCC conflict cascade was on exactly
+  // these three, and NONE were on the list, so it went undetected).
+  "index.html", "main.ts", "main.tsx", "main.js", "main.jsx", "index.ts", "index.tsx",
+  "style.css", "styles.css", "main.css",
+  "index.css", "app.css", "global.css", "globals.css",
   "package.json", "package-lock.json", "bun.lock", "bun.lockb", "yarn.lock", "pnpm-lock.yaml",
-  "layout.tsx", "layout.jsx", "layout.ts", "_layout.tsx", "root.tsx", "app.tsx",
+  "layout.tsx", "layout.jsx", "layout.ts", "_layout.tsx", "root.tsx", "app.tsx", "app.ts",
   "router.tsx", "router.ts", "routes.tsx", "routes.ts",
 ];
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The glue basenames a child REFERENCES — declared in ## Touches OR mentioned
+ * anywhere in its body. Returned as bare basenames so they serve as normalised
+ * mutex tokens: two children that both reference `main.ts` share the token
+ * `main.ts` regardless of the path each declared (or that neither declared it),
+ * so deriveImplicitDeps + the file-mutex serialise them. This is what turns the
+ * old ADVISORY glue detection into an actual anti-collision guarantee. */
+export function glueTokensFor(child: { description: string; touches: string[] }): string[] {
+  const declared = child.touches.map((t) => (t.split("/").pop() ?? "").toLowerCase());
+  const hay = `${child.description}\n${child.touches.join("\n")}`;
+  return KNOWN_GLUE_BASENAMES.filter(
+    (g) => declared.includes(g) || new RegExp(`\\b${escapeRegExp(g)}\\b`, "i").test(hay),
+  );
 }
 
 /** Advisory static check (Gap 9): for each child, scan its FULL description
@@ -289,11 +317,15 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);
 
     const children = readChildren(join(scratch, "children"));
-    // Gap 9 (advisory only — never blocks planning): log a visible warning for
-    // any child that mentions a well-known shared/glue file in its body without
-    // declaring it in ## Touches, so an undeclared-collision risk is caught
-    // before the DAG runs siblings in parallel.
-    for (const w of findUndeclaredGlueTouches(children)) console.warn(`[${issue.identifier}] ${w}`);
+    // Gap 9 → now ENFORCED: readChildren augments each child's `touches` with a
+    // token for every glue file it references (declared OR merely mentioned), so
+    // deriveImplicitDeps + the file-mutex serialise any two children that share
+    // a glue file — they build and merge one-at-a-time on fresh main instead of
+    // racing to a merge conflict. Log the applied serialisation for visibility.
+    for (const c of children) {
+      const glue = glueTokensFor(c);
+      if (glue.length > 0) console.log(`[${issue.identifier}] child ${c.ordinal} ("${c.title}") serialised on shared glue: ${glue.join(", ")}`);
+    }
     if (config.dryRun) {
       console.log(`[${issue.identifier}] dry-run: would create ${children.length} children: ${children.map((c) => c.title).join(" | ")}`);
       finish("planned", `dry-run: planned ${children.length} children`);

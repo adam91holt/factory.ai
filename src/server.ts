@@ -969,11 +969,21 @@ export async function startDashboard(): Promise<{
   });
 
   server.on("error", (error) => {
+    const code = (error as NodeJS.ErrnoException).code;
     console.error(`[dashboard] server error: ${error instanceof Error ? error.message : error}`);
-    // In --server-only the dashboard IS the process — a failed bind (e.g.
-    // EADDRINUSE) must exit non-zero instead of idling on a dead listener.
-    // In daemon modes the pipeline keeps running without the dashboard.
-    if (config.serverOnly) process.exit(1);
+    // EADDRINUSE on the configured dashboard port almost always means ANOTHER
+    // factory instance already holds it — the port is a single-instance signal,
+    // a second independent guard beyond the .factory.pid lease. A daemon that
+    // loses the bind must NOT keep running a silent, headless SECOND pipeline
+    // (live-found 2026-08-03: lease was bypassed, lost-the-port daemons piled up
+    // and double-claimed tickets). So EADDRINUSE is fatal in EVERY mode. Other
+    // errors stay fatal only in --server-only, where the dashboard IS the
+    // process; in daemon mode a non-bind dashboard error leaves the pipeline
+    // running headless (the old behavior, deliberately preserved).
+    if (code === "EADDRINUSE" || config.serverOnly) {
+      console.error(`[dashboard] port ${port} unavailable (${code ?? "error"}) — exiting so a second pipeline cannot run against a bound port`);
+      process.exit(1);
+    }
   });
   server.listen(port, "127.0.0.1", () => {
     console.log(`[dashboard] mission control on http://127.0.0.1:${port}`);

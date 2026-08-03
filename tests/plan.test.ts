@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readChildren, createChildren, findUndeclaredGlueTouches, type ChildSpec } from "../src/plan.ts";
+import { readChildren, createChildren, findUndeclaredGlueTouches, glueTokensFor, type ChildSpec } from "../src/plan.ts";
+import { deriveImplicitDeps } from "../src/dag.ts";
 import { config } from "../src/config.ts";
 
 // A model in the configured roster (parseFactoryMeta drops unlisted models — a
@@ -76,6 +77,53 @@ describe("readChildren — DAG validation (fail-closed → epic parks)", () => {
     writeChild("01-a.md", `# A\n${FILLER}\n\n## Depends-on\n02`);
     writeChild("02-b.md", `# B\n${FILLER}\n\n## Depends-on\n01`);
     expect(() => readChildren(dir)).toThrow();
+  });
+});
+
+// The WCC conflict cascade (2026-08-03): 6 children all edited
+// index.html/main.ts/style.css but declared only their feature files, so the
+// DAG ran them in parallel and they collided at merge. glueTokensFor +
+// readChildren augmentation serialise glue-sharing children by construction.
+describe("glue serialisation — the anti-collision fix", () => {
+  test("glueTokensFor picks up the glue files the WCC conflict was on (declared OR mentioned)", () => {
+    const tokens = glueTokensFor({
+      description: "Wire the map into main.ts and add styles to style.css; edits index.html for the mount.",
+      touches: ["src/map.ts"],
+    });
+    expect(tokens).toContain("main.ts");
+    expect(tokens).toContain("style.css");
+    expect(tokens).toContain("index.html");
+    expect(tokens).not.toContain("router.ts"); // unmentioned glue is not added
+  });
+
+  test("readChildren augments touches with referenced glue, so two glue-sharing siblings OVERLAP", () => {
+    writeChild("01-map.md", `# Map\n${FILLER}\n\nWire it into src/main.ts and src/style.css.\n\n## Touches\nsrc/map.ts`);
+    writeChild("02-detail.md", `# Detail\n${FILLER}\n\nMount from src/main.ts; add src/style.css rules.\n\n## Touches\nsrc/detail.ts`);
+    const children = readChildren(dir);
+    const map = children.find((c) => c.ordinal === 1)!;
+    const detail = children.find((c) => c.ordinal === 2)!;
+    // each keeps its own feature file AND gains the shared glue tokens
+    expect(map.touches).toContain("src/map.ts");
+    expect(map.touches).toEqual(expect.arrayContaining(["main.ts", "style.css"]));
+    expect(detail.touches).toEqual(expect.arrayContaining(["main.ts", "style.css"]));
+  });
+
+  test("integration: glue-sharing siblings get a derived depends_on edge (serialised, not parallel)", () => {
+    writeChild("01-map.md", `# Map\n${FILLER}\n\nEdits src/main.ts.\n\n## Touches\nsrc/map.ts`);
+    writeChild("02-detail.md", `# Detail\n${FILLER}\n\nAlso edits src/main.ts.\n\n## Touches\nsrc/detail.ts`);
+    const children = readChildren(dir);
+    const schedulable = children.map((c) => ({ identifier: `FAC-${c.ordinal}`, dependsOn: c.dependsOn.map((d) => `FAC-${d}`), touches: c.touches }));
+    const { added } = deriveImplicitDeps(schedulable);
+    // FAC-2 now waits for FAC-1 because they share the main.ts token
+    expect(added.some((a) => a.identifier === "FAC-2" && a.dependsOn === "FAC-1")).toBe(true);
+  });
+
+  test("non-glue-sharing siblings still run in parallel (no over-serialisation)", () => {
+    writeChild("01-a.md", `# A\n${FILLER}\n\n## Touches\nsrc/a/**`);
+    writeChild("02-b.md", `# B\n${FILLER}\n\n## Touches\nsrc/b/**`);
+    const children = readChildren(dir);
+    const schedulable = children.map((c) => ({ identifier: `FAC-${c.ordinal}`, dependsOn: [] as string[], touches: c.touches }));
+    expect(deriveImplicitDeps(schedulable).added).toHaveLength(0);
   });
 });
 

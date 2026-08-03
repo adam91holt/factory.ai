@@ -441,13 +441,23 @@ export async function groundskeeperTick(): Promise<void> {
 async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   const issueKey = `GK-${card.name}`;
 
-  // (a) Weekly budget envelope — this card's own run_stage_finished spend, AND
-  // a pessimistic runs × perRun bound: aborted/crashed stages record costUsd 0
-  // despite real API spend, so recorded dollars alone would under-count.
+  // (a) Weekly budget envelope. RECORDED spend is the truth once stages are
+  // recording cost normally; the pessimistic runs × perRun estimate exists only
+  // to catch the UNDER-count case where aborted/crashed stages record costUsd 0
+  // despite real API spend. The old code applied the pessimistic bound
+  // UNCONDITIONALLY, so a card with cheap generator runs (or a burst of $0
+  // failed runs) slept far below its real budget — live-found 2026-08-03: the
+  // wcc-showcase card slept at $11.73 recorded because 8 runs × $5 hit a $40
+  // cap. Fix: once recorded spend exceeds one run's estimate (proof the stages
+  // ARE recording cost), trust `spent`; only fall back to the pessimistic floor
+  // when recorded spend is ~nil across the window (the crashed-at-$0 scenario
+  // the floor was built for).
   const spent = await stageSpendForIssueSince(issueKey, Date.now() - WEEK_MS);
   const runCount = await stageRunCountForIssueSince(issueKey, Date.now() - WEEK_MS);
-  if (spent >= card.budget.weekly || runCount * card.budget.perRun >= card.budget.weekly) {
-    console.log(`[gk:${card.name}] weekly budget exhausted ($${spent.toFixed(2)} recorded, ${runCount} run(s) × $${card.budget.perRun} of $${card.budget.weekly}) — sleeping`);
+  const recordedLooksReal = spent > card.budget.perRun;
+  const effectiveSpend = recordedLooksReal ? spent : Math.max(spent, runCount * card.budget.perRun);
+  if (effectiveSpend >= card.budget.weekly) {
+    console.log(`[gk:${card.name}] weekly budget exhausted (effective $${effectiveSpend.toFixed(2)} = ${recordedLooksReal ? `recorded $${spent.toFixed(2)}` : `max(recorded $${spent.toFixed(2)}, ${runCount} run(s) × $${card.budget.perRun})`} of $${card.budget.weekly}) — sleeping`);
     return false;
   }
 
