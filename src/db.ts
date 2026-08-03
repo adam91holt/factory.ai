@@ -2190,6 +2190,27 @@ export async function activeMergePolicyForRepo(repo: string): Promise<"auto" | "
   }
 }
 
+/** The active human-approved `mergeGuarded` override for `repo` (via its owning
+ *  active project) — the per-project switch that lets an operator-granted
+ *  auto-merge also cover guarded-path touches (.github/CLAUDE.md/agents/
+ *  existing-test edits). Absence / closed store / malformed value all degrade
+ *  to FALSE, the fail-safe direction: a missed read can only ever WITHHOLD the
+ *  bypass, never grant it. loop.ts additionally requires merge:auto to be in
+ *  force before this matters, and it never applies to the self-repo. */
+export async function activeGuardedOverrideForRepo(repo: string): Promise<boolean> {
+  if (!store) return false;
+  try {
+    const rows = await store.query<{ value: string }>(
+      "SELECT pol.value FROM project_policy pol JOIN projects p ON p.id = pol.project_id JOIN project_repos pr ON pr.project_id = p.id WHERE pr.repo = $1 AND p.status = 'active' AND pol.key = 'mergeGuarded' AND pol.state = 'active' LIMIT 1",
+      [repo]);
+    if (!rows[0]) return false;
+    try { return JSON.parse(rows[0].value) === true; } catch { return false; }
+  } catch (error) {
+    console.error(`[db] activeGuardedOverrideForRepo(${repo}) failed — treating as no override: ${error instanceof Error ? error.message : error}`);
+    return false;
+  }
+}
+
 /** Attempts the activate step makes when it keeps losing the one-active-row
  *  index to a concurrent approver. IN-CODE CONSTANT, not an env knob
  *  (CLAUDE.md) — same shape as MAX_APPROVAL_INSERT_ATTEMPTS. */

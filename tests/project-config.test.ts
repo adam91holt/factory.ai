@@ -384,7 +384,7 @@ describe("groundskeeper third gate (AND-ed, never a bypass)", () => {
 
 describe("policy value validation (pure)", () => {
   test("unknown keys are refused — the authority set is an in-code constant", () => {
-    expect(AUTHORITY_KEYS).toEqual(["repos", "deploy", "smoke", "deployEnabled", "merge"]);
+    expect(AUTHORITY_KEYS).toEqual(["repos", "deploy", "smoke", "deployEnabled", "merge", "mergeGuarded"]);
     expect(validatePolicyValue("budget", 1_000_000).ok).toBe(false);
     expect(validatePolicyValue("", "x").ok).toBe(false);
   });

@@ -74,26 +74,33 @@ export function buildMergeEvidence(x: {
  * `minStrength` (default "strong") is the evidence floor: the AUTO_MERGE_ALL
  * override passes "real" so repos without an e2e gate can still merge on green
  * unit tests — every OTHER safety condition below is non-negotiable either way. */
-export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskMaxDiff: number; minStrength?: "real" | "strong" }): MergeDecision {
+export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskMaxDiff: number; minStrength?: "real" | "strong"; allowGuarded?: boolean }): MergeDecision {
   const minStrength = opts.minStrength ?? "strong";
   const strengthOk = ev.strength === "strong" || (minStrength === "real" && ev.strength === "real");
+  // allowGuarded (operator override — AUTO_MERGE_ALL or a per-project
+  // mergeGuarded grant) lets guarded-path touches auto-merge. It relaxes ONLY
+  // the guarded-path classification; every other block below (needs-human
+  // folds, security, browser, green, strength) is untouched. The caller only
+  // ever sets it alongside an explicit auto grant on a non-self repo.
+  const guardedBlocks = ev.guarded && !opts.allowGuarded;
   const reasons: string[] = [];
   if (!ev.green) reasons.push("gates not green");
   if (!strengthOk) reasons.push(`gate strength ${ev.strength} (need ${minStrength})`);
-  if (ev.guarded) reasons.push("guarded paths touched");
+  if (guardedBlocks) reasons.push("guarded paths touched");
+  else if (ev.guarded) reasons.push("guarded paths touched — auto-merged under operator override");
   if (ev.needsHuman) reasons.push("needs human (taste/tester/test-deletion)");
   if (ev.security === "fail") reasons.push("security review failed");
   if (ev.browser === "fail") reasons.push("browser evidence failed");
   if (ev.browser === "missing") reasons.push("required browser evidence missing");
 
-  const wouldMerge = ev.green && !ev.guarded && !ev.needsHuman && strengthOk
+  const wouldMerge = ev.green && !guardedBlocks && !ev.needsHuman && strengthOk
     && ev.security !== "fail" && ev.browser !== "fail" && ev.browser !== "missing";
 
   let act = false;
   if (wouldMerge) {
     if (tier === "auto") act = true;
     else if (tier === "auto-low-risk") {
-      act = ev.diffLines <= opts.lowRiskMaxDiff && !ev.guarded;
+      act = ev.diffLines <= opts.lowRiskMaxDiff && !guardedBlocks;
       if (!act) reasons.push(`diff ${ev.diffLines} lines > low-risk cap ${opts.lowRiskMaxDiff}`);
     } else {
       // shadow | human: compute-only — record the would-merge, never act.

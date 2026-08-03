@@ -78,9 +78,41 @@ describe("decideMerge — minStrength 'real' floor (the AUTO_MERGE_ALL leg)", ()
     expect(decideMerge(AUTO, { ...clean, browser: "fail" }, RELAXED).act).toBe(false);
     expect(decideMerge(AUTO, { ...clean, browser: "missing" }, RELAXED).act).toBe(false);
   });
+
   test("shadow tier with the relaxed floor still only RECORDS (tier gating unchanged)", () => {
     const d = decideMerge("shadow", clean, RELAXED);
     expect(d.wouldMerge).toBe(true);
     expect(d.act).toBe(false);
+  });
+});
+
+describe("decideMerge — allowGuarded operator override (guarded-path bypass)", () => {
+  const AUTO = "auto" as const;
+  const OPTS = { lowRiskMaxDiff: 40 };
+  const clean: MergeEvidence = { green: true, strength: "strong", guarded: false, needsHuman: false, security: "pass", browser: "not-required", diffLines: 10 };
+
+  test("guarded paths block by default (no override)", () => {
+    expect(decideMerge(AUTO, { ...clean, guarded: true }, OPTS).act).toBe(false);
+  });
+
+  test("allowGuarded lets a guarded-but-otherwise-clean diff merge", () => {
+    const d = decideMerge(AUTO, { ...clean, guarded: true }, { ...OPTS, allowGuarded: true });
+    expect(d.act).toBe(true);
+    expect(d.reasons.some((r) => /operator override/.test(r))).toBe(true);
+  });
+
+  test("allowGuarded relaxes ONLY guarded — every other block still holds", () => {
+    const g = { ...clean, guarded: true };
+    const O = { ...OPTS, allowGuarded: true };
+    expect(decideMerge(AUTO, { ...g, green: false }, O).act).toBe(false);
+    expect(decideMerge(AUTO, { ...g, needsHuman: true }, O).act).toBe(false);   // taste/tester/test-deletion still stops
+    expect(decideMerge(AUTO, { ...g, security: "fail" }, O).act).toBe(false);
+    expect(decideMerge(AUTO, { ...g, browser: "fail" }, O).act).toBe(false);
+    expect(decideMerge(AUTO, { ...g, strength: "weak" }, O).act).toBe(false);
+  });
+
+  test("allowGuarded also frees the auto-low-risk guarded clamp (within the diff cap)", () => {
+    const d = decideMerge("auto-low-risk", { ...clean, guarded: true, diffLines: 10 }, { ...OPTS, allowGuarded: true });
+    expect(d.act).toBe(true);
   });
 });

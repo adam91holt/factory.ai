@@ -3,7 +3,7 @@ import {
   openTestDatabase, closeTestDatabase,
   ensureProjectRow, replaceProjectRepos, getProjectRowByName, listProjectRepos,
   projectOwningRepo, updateProjectDescriptive,
-  insertPendingPolicy, approveProjectPolicy, activeMergePolicyForRepo,
+  insertPendingPolicy, approveProjectPolicy, activeMergePolicyForRepo, activeGuardedOverrideForRepo,
 } from "../src/db.ts";
 import { createProject } from "../src/project-config.ts";
 
@@ -80,6 +80,37 @@ describe("activeMergePolicyForRepo (the per-project auto-merge grant)", () => {
   test("closed store → null (fail-safe: less authority, never more)", async () => {
     await closeTestDatabase();
     expect(await activeMergePolicyForRepo("adam91holt/eval-orbital-01")).toBeNull();
+    await openTestDatabase();
+  });
+});
+
+describe("activeGuardedOverrideForRepo (the per-project guarded-path bypass)", () => {
+  test("no policy → false (fail-safe: the bypass is withheld by default)", async () => {
+    const id = await ensureProjectRow("gis", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/wcc-gis"], "test");
+    expect(await activeGuardedOverrideForRepo("adam91holt/wcc-gis")).toBe(false);
+  });
+
+  test("an approved mergeGuarded=true policy resolves true for the project's repos", async () => {
+    const id = await ensureProjectRow("gis", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/wcc-gis"], "test");
+    const pid = await insertPendingPolicy(id!, "mergeGuarded", JSON.stringify(true), "test");
+    await approveProjectPolicy(pid!, "test");
+    expect(await activeGuardedOverrideForRepo("adam91holt/wcc-gis")).toBe(true);
+    expect(await activeGuardedOverrideForRepo("acme/other")).toBe(false); // scoped
+  });
+
+  test("mergeGuarded=false resolves false (an explicit off)", async () => {
+    const id = await ensureProjectRow("gis", "FAC", "test");
+    await replaceProjectRepos(id!, ["adam91holt/wcc-gis"], "test");
+    const pid = await insertPendingPolicy(id!, "mergeGuarded", JSON.stringify(false), "test");
+    await approveProjectPolicy(pid!, "test");
+    expect(await activeGuardedOverrideForRepo("adam91holt/wcc-gis")).toBe(false);
+  });
+
+  test("closed store → false (never grants the bypass on a read failure)", async () => {
+    await closeTestDatabase();
+    expect(await activeGuardedOverrideForRepo("adam91holt/wcc-gis")).toBe(false);
     await openTestDatabase();
   });
 });

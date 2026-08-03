@@ -44,7 +44,7 @@ const SYNC_ACTOR = "card-sync";
 
 /** The authority keys — IN-CODE constant (CLAUDE.md: caps and authority
  *  boundaries are never env knobs). Everything else is descriptive. */
-export const AUTHORITY_KEYS = ["repos", "deploy", "smoke", "deployEnabled", "merge"] as const;
+export const AUTHORITY_KEYS = ["repos", "deploy", "smoke", "deployEnabled", "merge", "mergeGuarded"] as const;
 export type AuthorityKey = (typeof AUTHORITY_KEYS)[number];
 
 const EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -93,6 +93,13 @@ export function validatePolicyValue(key: string, value: unknown): { ok: true; va
       return { ok: true, value };
     case "merge":
       if (value !== "review" && value !== "shadow" && value !== "auto") return { ok: false, error: "merge must be one of review | shadow | auto" };
+      return { ok: true, value };
+    case "mergeGuarded":
+      // The guarded-path auto-merge override. Fail closed: ONLY a bare boolean,
+      // same discipline as deployEnabled. Effective only WITH merge:auto and
+      // only for non-self repos (loop.ts); never bypasses the needs-human folds
+      // (taste/tester/test-deletion/ratchet) or security/browser fails.
+      if (value !== true && value !== false) return { ok: false, error: "mergeGuarded must be a bare boolean" };
       return { ok: true, value };
     default:
       return { ok: false, error: `unknown authority key ${JSON.stringify(String(key).slice(0, 40))} (allowed: ${AUTHORITY_KEYS.join(", ")})` };
