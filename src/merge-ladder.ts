@@ -110,6 +110,22 @@ export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskM
   return { wouldMerge, act, tier, reasons };
 }
 
+/** May a project's explicit auto-grant BYPASS the human-review-by-design file
+ * guards (guarded paths + test deletion), letting the factory change any files
+ * and still auto-merge? PURE — the caller resolves the four inputs. The grant
+ * itself is the STRONGER one (AUTO_MERGE_ALL, or per-project merge:auto AND an
+ * approved mergeGuarded policy — merge:auto alone is not enough). Two HARD
+ * carve-outs the bypass can NEVER cross, mirroring effectiveMergeTier's own
+ * backstops: the self-repo (factory.ai must never self-modify its guards
+ * unattended) and a ticket that explicitly withheld (merge:review/shadow). An
+ * uncomputable diff (DIFF_FAILED) is handled separately by the caller — never
+ * bypassed. Quality gates are NOT this function's business; it only governs the
+ * "human by design" file guards. */
+export function guardBypassAllowed(opts: { autoMergeAll: boolean; policyMergeAuto: boolean; guardedOverride: boolean; humanReview: boolean; selfRepo: boolean }): boolean {
+  const grant = opts.autoMergeAll || (opts.policyMergeAuto && opts.guardedOverride);
+  return grant && !opts.humanReview && !opts.selfRepo;
+}
+
 /** Should an epic child that declares `depends_on` be DEFERRED from auto-merge
  * (handed to the steward for ordered merge) rather than merged now? By default
  * YES — the steward owns epic merge ordering (Gap-1). But an EXPLICIT operator

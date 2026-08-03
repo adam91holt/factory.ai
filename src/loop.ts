@@ -13,7 +13,7 @@ import { checkFreshness } from "./precondition.ts";
 import { activeAgentRegisterSnapshot, activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback, activeMergePolicyForRepo, activeGuardedOverrideForRepo } from "./db.ts";
 import { MATERIALIZED_SKILLS_SUBDIR, buildDelegateRoster, buildRegisterIndex, delegableSpecialists, indexBlockForStage, materializeSkills, refreshMaterializedSkills } from "./discovery.ts";
 import { fileApproval, shouldFileApproval } from "./approvals.ts";
-import { decideMerge, effectiveMergeTier, buildMergeEvidence, deferMergeForDeps, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
+import { decideMerge, effectiveMergeTier, buildMergeEvidence, deferMergeForDeps, guardBypassAllowed, isSelfRepo, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
 import { selectSkills, buildSkillBlock, type SkillSelection, type StagePin } from "./skills.ts";
 import { GATE_OUTPUT_SCHEMA, resolveGateOutput, renderFindings, type GateOutput, type GateVerdict } from "./gate.ts";
@@ -1129,9 +1129,34 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       await postStageComment(issue, security, gateStageText(securityGate, security));
     }
 
-    // ---- deliver (guarded paths / test deletion stop auto-advance — C17)
+    // The guarded-path / test-deletion HUMAN-REVIEW-BY-DESIGN bypass. An operator
+    // who put a project into FULL auto (AUTO_MERGE_ALL, or per-project merge:auto
+    // + mergeGuarded) has explicitly said "change any files and merge" — so on
+    // that project the factory may touch CI, CLAUDE.md, .github, tests, etc. and
+    // still auto-merge, instead of every such change forcing a human (the top
+    // waste cluster in the telemetry: guarded-path needs-human). HARD exceptions
+    // that the bypass NEVER covers: the self-repo (factory.ai is always human —
+    // it can't be allowed to self-modify its own guards unattended), a ticket
+    // that explicitly withheld (merge:review / merge:shadow), and an UNCOMPUTABLE
+    // diff (DIFF_FAILED below — we never merge blind). Quality gates (red tests,
+    // security/taste FAIL, test-count ratchet) are untouched — this only relaxes
+    // the "human by design" file guards, never a real failure.
+    const metaMerge = parseFactoryMeta(issue.description).merge;
+    const humanReview = metaMerge === "review" || metaMerge === "shadow";
+    const policyMerge = await activeMergePolicyForRepo(repo);
+    const guardBypass = guardBypassAllowed({
+      autoMergeAll: config.autoMergeAll,
+      policyMergeAuto: policyMerge === "auto",
+      guardedOverride: policyMerge === "auto" ? await activeGuardedOverrideForRepo(repo) : false,
+      humanReview,
+      selfRepo: isSelfRepo(repo),
+    });
+
+    // ---- deliver (guarded paths / test deletion stop auto-advance — C17,
+    // unless the project's explicit auto-grant bypasses the human-by-design guards)
     const removedTests = testFilesRemoved(ws);
-    if (removedTests.length > 0) { await park(issue, repo, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`, ws); return; }
+    if (removedTests.length > 0 && !guardBypass) { await park(issue, repo, stages, `change DELETES test files (${removedTests.join(", ")}) — categorical human review`, ws); return; }
+    if (removedTests.length > 0) console.log(`[${issue.identifier}] deletes test files (${removedTests.join(", ")}) — auto-merged under explicit project auto-grant (guard bypass)`);
     const guarded = guardedPathsTouched(ws);
     if (!config.dryRun && !(await stillOurs(issue))) { await abortExternal(issue, stages, "delivery"); return; }
 
@@ -1173,7 +1198,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // fail-closed for the merge action: without them, a null verdict slips past
     // decideMerge (which blocks only on "fail"), letting an earned auto tier
     // merge a large diff with the gate silently skipped.
-    const guardedStop = guarded.length > 0 || guarded.includes(DIFF_FAILED);
+    // An UNCOMPUTABLE diff (DIFF_FAILED) ALWAYS stops — never merge blind, even
+    // under a guard bypass. Real guarded-path FILE touches stop unless the
+    // project's explicit auto-grant bypasses the human-by-design guards.
+    const diffFailed = guarded.includes(DIFF_FAILED);
+    const guardedStop = diffFailed || (guarded.length > 0 && !guardBypass);
+    if (guarded.length > 0 && guardBypass && !diffFailed) console.log(`[${issue.identifier}] touched guarded paths (${guarded.join(", ")}) — auto-merged under explicit project auto-grant (guard bypass)`);
     const securityWarrantedButAbsent = securityReviewOutstanding(diffLines, securityVerdict);
     // NOTE: these phrasings (and park()'s reasons) are classification markers
     // for the dashboard's routed-vs-escalated ledger (ui/src/lib/history.ts
@@ -1216,9 +1246,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // (all SAFETY conditions) holds. A ticket/epic may WITHHOLD via merge:review or
     // merge:shadow (force human) — but merge:"auto" from the untrusted description is
     // IGNORED here (only the operator flag can grant; withhold-only invariant).
-    const metaMerge = parseFactoryMeta(issue.description).merge;
-    const humanReview = metaMerge === "review" || metaMerge === "shadow";
-    const policyMerge = await activeMergePolicyForRepo(repo);
+    // (metaMerge / humanReview / policyMerge / explicitAutoGrant / guardBypass
+    // were computed above the delivery guards — reused here for the tier + floor.)
     const tier = effectiveMergeTier(repo, await getLadderState(repo), { autoDefault: config.autoMergeDefault, humanReview, overrideAll: config.autoMergeAll, policyMerge });
     const ev = buildMergeEvidence({ summary, guarded, needsHuman, security: securityVerdict, browser, diffLines });
     // An explicit auto grant — blanket AUTO_MERGE_ALL or the repo's approved
@@ -1226,13 +1255,12 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // (unit tests, no e2e requirement), else a repo without an e2e gate could
     // never act on the grant. Every other decideMerge condition holds.
     const relaxedFloor = config.autoMergeAll || policyMerge === "auto";
-    // Guarded-path auto-merge override: the blanket AUTO_MERGE_ALL, OR a
-    // per-project mergeGuarded grant that is only honoured WHILE merge:auto is
-    // in force (an explicit auto grant). Never for the self-repo — effectiveMergeTier
-    // pins it to "human", so tier !== auto and act stays false regardless. Only
-    // relaxes guarded paths; needs-human/security/browser blocks are untouched.
-    const allowGuarded = config.autoMergeAll || (policyMerge === "auto" && await activeGuardedOverrideForRepo(repo));
-    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(relaxedFloor ? { minStrength: "real" as const } : {}), ...(allowGuarded ? { allowGuarded: true } : {}) });
+    // decideMerge's guarded relaxation uses the SAME guardBypass computed above
+    // (already excludes self-repo and merge:review withholds), so the merge
+    // decision and the delivery-guard folds can never disagree about whether a
+    // guarded touch is allowed. Only relaxes guarded paths; needs-human/security/
+    // browser blocks are untouched.
+    const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(relaxedFloor ? { minStrength: "real" as const } : {}), ...(guardBypass ? { allowGuarded: true } : {}) });
     // Gap-1 interaction: a child that declares dependencies must NOT auto-merge
     // out of order — the steward owns epic merge ordering. EXCEPT under an
     // explicit operator "merge everything green" grant (AUTO_MERGE_ALL or

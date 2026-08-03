@@ -7,7 +7,7 @@ import { ensureWorkspace, resetWorkspaceToBase, repoFromTicket } from "./repos.t
 import { isEligible } from "./loop.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
-import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, getTelemetry, projectGroundskeeperRowsForCard } from "./db.ts";
+import { eventStoreOpen, stageSpendForIssueSince, stageRunCountForIssueSince, parkedRunsSince, pipelineRunsSince, getTelemetry, projectGroundskeeperRowsForCard } from "./db.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 import type { StagePin } from "./skills.ts";
 
@@ -45,6 +45,7 @@ export interface GroundskeeperCard {
   tools: string[];           // ∩ READONLY_TOOLS at run time
   budget: { perRun: number; weekly: number };  // USD-notional
   maxTicketsPerRun: number;
+  requiresActivity: boolean; // only run when the factory has run NEW pipeline work since this card's last run (for telemetry-mining cards like the factory groundskeeper — nothing new to analyse ⇒ sleep)
   charter: string;           // frontmatter body: goals, taste bar, anti-goals
 }
 
@@ -107,6 +108,7 @@ function parseCard(raw: string, fallbackName: string): GroundskeeperCard | null 
     tools: parseList(fields.tools ?? "[]"),
     budget: { perRun, weekly },
     maxTicketsPerRun: Number.isInteger(maxTickets) && maxTickets > 0 ? maxTickets : 1,
+    requiresActivity: (fields.requiresActivity ?? "").trim().toLowerCase() === "true",
     charter: (fm[2] ?? "").trim(),
   };
 }
@@ -420,6 +422,18 @@ export async function groundskeeperTick(): Promise<void> {
       if (gateRows !== null) console.log(`[gk:${card.name}] blocked by a project_groundskeepers row (third gate)`);
       continue;
     }
+    // Activity gate (requiresActivity cards, e.g. the factory groundskeeper that
+    // MINES telemetry): if the factory has run no NEW pipeline work since this
+    // card's last actual run, there is nothing new to analyse — sleep rather
+    // than re-file the same repair tickets. Checked BEFORE the state mark (like
+    // the veto gate) so the window isn't consumed; it fires the moment real work
+    // lands. First-ever run (no prior lastRunAt) is allowed, to establish a
+    // baseline. A store-read failure is non-fatal: fall through and run.
+    const prevLastRunAt = state.cards[card.name]?.lastRunAt;
+    if (card.requiresActivity && prevLastRunAt !== undefined) {
+      const newRuns = await pipelineRunsSince(prevLastRunAt).catch(() => -1);
+      if (newRuns === 0) { console.log(`[gk:${card.name}] no new pipeline runs since last run — requiresActivity, sleeping`); continue; }
+    }
     // Mark BEFORE running so a crash mid-run cannot re-fire this window; if the
     // mark cannot be persisted, do NOT run — an unrecorded run can double-fire.
     state.cards[card.name] = { lastRunMinute: bucket, lastRunAt: nowMs };
@@ -569,6 +583,8 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     `Spend to date: $${tel.totals.costUsd.toFixed(2)} over ${tel.totals.runs} runs (${tel.totals.degradedRuns} degraded).`,
     `Outcomes: pr_open ${tel.outcomes.pr_open}, planned ${tel.outcomes.planned}, parked ${tel.outcomes.parked}, needs_human ${tel.outcomes.needs_human}, aborted ${tel.outcomes.aborted}.`,
     tel.parkReasons.length ? `Top park reasons: ${tel.parkReasons.map((p) => `"${p.reason}" (${p.count})`).join("; ")}.` : "No park reasons recorded.",
+    tel.needsHumanReasons.length ? `Top NEEDS-HUMAN reasons (where autonomy leaks): ${tel.needsHumanReasons.map((p) => `"${p.reason}" (${p.count})`).join("; ")}.` : "No needs-human reasons recorded.",
+    `Cost by issue (top spenders): ${tel.costPerIssue.slice(0, 6).map((c) => `${c.issueKey} $${c.costUsd.toFixed(2)}`).join(", ")}.`,
     `Last 7 days spend: ${tel.daily.map((d) => `${d.date} $${d.costUsd.toFixed(2)}`).join(", ")}.`,
     `Parks in last 24h: ${parksLast24h}. This card's 7-day spend: $${spent.toFixed(2)} of $${card.budget.weekly}.`,
   ].join("\n");

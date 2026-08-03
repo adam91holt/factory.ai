@@ -70,8 +70,15 @@ data feeds the loops above — don't break its shape casually.
   specialist chosen on REPO FACTS ONLY (`verify.ts repoFacts`) — never on
   ticket text, which has no routing key at all. Unknown selector, unknown
   match term, unknown role → fail closed (grant nothing / keep the default).
-- **Guarded paths** (tests, CI, `CLAUDE.md`, `.claude/`, skills) force human
-  review by design — this file is one of them.
+- **Guarded paths** (tests, CI, `CLAUDE.md`, `.claude/`, skills, groundskeepers,
+  projects) force human review by design — this file is one of them — EXCEPT on
+  a project the operator has put into full auto (`AUTO_MERGE_ALL`, or per-project
+  `merge:auto` **and** an approved `mergeGuarded` policy): there the factory may
+  change any files and still auto-merge (`guardBypassAllowed`, loop.ts). The
+  self-repo is NEVER bypassed (it can't self-modify its own guards unattended),
+  a `merge:review`/`merge:shadow` ticket still withholds, and an uncomputable
+  diff (`DIFF_FAILED`) never merges. Quality gates (red tests, security/taste
+  fail, the test-count ratchet) are untouched by the bypass.
 - The factory never merges by default (ADR-0001); autonomy comes only through
   the merge ladder. Decision logic stays pure and I/O-free so the loop and
   steward can't disagree.

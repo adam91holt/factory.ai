@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveMergeTier, decideMerge, deferMergeForDeps, type MergeEvidence } from "../src/merge-ladder.ts";
+import { effectiveMergeTier, decideMerge, deferMergeForDeps, guardBypassAllowed, type MergeEvidence } from "../src/merge-ladder.ts";
 
 // AUTO_MERGE_ALL — the operator's blanket override. Two effects, both pinned
 // here: (1) tier resolves to "auto" for every non-self repo, INCLUDING
@@ -83,6 +83,29 @@ describe("decideMerge — minStrength 'real' floor (the AUTO_MERGE_ALL leg)", ()
     const d = decideMerge("shadow", clean, RELAXED);
     expect(d.wouldMerge).toBe(true);
     expect(d.act).toBe(false);
+  });
+});
+
+describe("guardBypassAllowed — auto projects may change any files (with hard carve-outs)", () => {
+  const base = { autoMergeAll: false, policyMergeAuto: false, guardedOverride: false, humanReview: false, selfRepo: false };
+  test("AUTO_MERGE_ALL grants the bypass", () => {
+    expect(guardBypassAllowed({ ...base, autoMergeAll: true })).toBe(true);
+  });
+  test("per-project merge:auto + mergeGuarded grants the bypass", () => {
+    expect(guardBypassAllowed({ ...base, policyMergeAuto: true, guardedOverride: true })).toBe(true);
+  });
+  test("merge:auto ALONE (no mergeGuarded) does NOT grant the bypass", () => {
+    expect(guardBypassAllowed({ ...base, policyMergeAuto: true, guardedOverride: false })).toBe(false);
+  });
+  test("self-repo NEVER bypasses, even with AUTO_MERGE_ALL", () => {
+    expect(guardBypassAllowed({ ...base, autoMergeAll: true, selfRepo: true })).toBe(false);
+    expect(guardBypassAllowed({ ...base, policyMergeAuto: true, guardedOverride: true, selfRepo: true })).toBe(false);
+  });
+  test("a merge:review/shadow withhold NEVER bypasses, even with the grant", () => {
+    expect(guardBypassAllowed({ ...base, autoMergeAll: true, humanReview: true })).toBe(false);
+  });
+  test("no grant → no bypass", () => {
+    expect(guardBypassAllowed(base)).toBe(false);
   });
 });
 

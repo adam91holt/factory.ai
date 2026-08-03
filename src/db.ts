@@ -1043,6 +1043,25 @@ export async function stageRunCountForIssueSince(issueKey: string, sinceMs: numb
   return num(rows[0]?.n);
 }
 
+/** Count of real (non-dry) PIPELINE run_finished events since `sinceMs` —
+ *  excludes the groundskeeper's own GK-* runs. The "new task activity" signal a
+ *  card can gate on (requiresActivity): a factory groundskeeper that only mines
+ *  telemetry has nothing new to say until the factory has actually run work, so
+ *  it should sleep rather than re-file the same analysis. */
+export async function pipelineRunsSince(sinceMs: number): Promise<number> {
+  await flushEvents();
+  if (!store) return 0;
+  const rows = await store.query<{ issue_key: string | null; json: unknown }>(
+    "SELECT issue_key, json::text AS json FROM events WHERE type = 'run_finished' AND at >= $1", [sinceMs]);
+  let n = 0;
+  for (const r of rows) {
+    if ((r.issue_key ?? "").startsWith("GK-")) continue;
+    const e = jsonbObject(r.json) as { dryRun?: boolean };
+    if (!e.dryRun) n += 1;
+  }
+  return n;
+}
+
 /** Count of real (non-dry) run_finished parked outcomes since `sinceMs` — the
  *  parks-spike signal that flips a groundskeeper into repair-only mode. */
 export async function parkedRunsSince(sinceMs: number): Promise<number> {
@@ -1153,6 +1172,10 @@ export interface Telemetry {
   outcomes: { pr_open: number; merged: number; planned: number; parked: number; needs_human: number; aborted: number };
   /** top-5 park reasons by frequency. */
   parkReasons: Array<{ reason: string; count: number }>;
+  /** top-5 NEEDS-HUMAN reasons by frequency — the human-intervention clusters
+   *  (guarded-path touches, taste fails, merge conflicts) a mining groundskeeper
+   *  targets. Distinct from parks (retryable) — these are where autonomy leaks. */
+  needsHumanReasons: Array<{ reason: string; count: number }>;
   /** top-10 issues by total spend (stage-row spend; runs = non-dry deliveries). */
   costPerIssue: Array<{ issueKey: string; costUsd: number; runs: number }>;
 }
@@ -1199,7 +1222,7 @@ function emptyTelemetry(): Telemetry {
       cacheRead: 0, cacheWrite: 0, prOpen: 0, merged: 0, parked: 0, needsHuman: 0, aborted: 0, planned: 0, degradedRuns: 0 },
     perModel: [], perStage: [], daily,
     outcomes: { pr_open: 0, merged: 0, planned: 0, parked: 0, needs_human: 0, aborted: 0 },
-    parkReasons: [], costPerIssue: [],
+    parkReasons: [], needsHumanReasons: [], costPerIssue: [],
   };
 }
 
@@ -1307,6 +1330,7 @@ async function computeTelemetry(): Promise<Telemetry> {
   const runRows = await s.query<{ at: unknown; json: unknown }>(
     "SELECT at::float8 AS at, json::text AS json FROM events WHERE type = 'run_finished' ORDER BY id ASC");
   const parkReasons = new Map<string, number>();
+  const needsHumanReasons = new Map<string, number>();
 
   for (const row of runRows) {
     const body = jsonbObject(row.json);
@@ -1326,6 +1350,10 @@ async function computeTelemetry(): Promise<Telemetry> {
       const key = e.reason.trim().slice(0, 120);
       parkReasons.set(key, (parkReasons.get(key) ?? 0) + 1);
     }
+    if (outcome === "needs_human" && typeof e.reason === "string" && e.reason.trim()) {
+      const key = e.reason.trim().slice(0, 120);
+      needsHumanReasons.set(key, (needsHumanReasons.get(key) ?? 0) + 1);
+    }
     if (Array.isArray(e.stages) && e.stages.some((s2) => s2?.degraded === true)) t.totals.degradedRuns += 1;
 
     // Spend comes from stage rows above; run_finished only contributes the
@@ -1343,6 +1371,10 @@ async function computeTelemetry(): Promise<Telemetry> {
   t.perModel = [...perModel.values()].sort((a, b) => b.costUsd - a.costUsd);
   t.perStage = [...perStage.values()].sort((a, b) => b.costUsd - a.costUsd);
   t.parkReasons = [...parkReasons.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  t.needsHumanReasons = [...needsHumanReasons.entries()]
     .map(([reason, count]) => ({ reason, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 5);
