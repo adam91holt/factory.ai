@@ -15,6 +15,7 @@ import { CatalogPage } from "./pages/CatalogPage";
 import { LessonsPage } from "./pages/LessonsPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { ProjectDetailPage } from "./pages/ProjectDetailPage";
+import { ModelsPage } from "./pages/ModelsPage";
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -77,6 +78,12 @@ const lessonsRoute = createRoute({
   component: LessonsPage,
 });
 
+const modelsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/models",
+  component: ModelsPage,
+});
+
 const projectsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/projects",
@@ -104,6 +111,7 @@ const routeTree = rootRoute.addChildren([
   telemetryRoute,
   catalogRoute,
   lessonsRoute,
+  modelsRoute,
   projectsRoute,
   projectDetailRoute,
 ]);

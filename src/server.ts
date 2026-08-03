@@ -4,7 +4,7 @@ import { readCatalog, saveCatalogEntry } from "./catalog-manager.ts";
 import { listLessons, archiveLesson } from "./lessons.ts";
 import { approvalsView, approveItem, pushbackItem } from "./approvals.ts";
 import {
-  projectsView, createProject, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
+  projectsView, modelsView, createProject, saveProjectDescriptive, setProjectModel, setProjectGroundskeeper,
   proposeProjectPolicy, approvePolicyItem, rejectPolicyItem,
 } from "./project-config.ts";
 import {
@@ -413,6 +413,17 @@ export function handleProjectRoutes(url: URL, req: IncomingMessage, res: ServerR
     // get the app shell, fetch() clients get JSON.
     if ((req.headers.accept ?? "").includes("text/html") && serveIndex(res)) return true;
     respond(projectsView().then((view) => ({ status: 200, json: view })), "projects view");
+    return true;
+  }
+
+  if (url.pathname === "/models") {
+    if (req.method !== "GET") {
+      res.writeHead(405, { "content-type": "application/json" });
+      res.end('{"error":"method not allowed"}');
+      return true;
+    }
+    if ((req.headers.accept ?? "").includes("text/html") && serveIndex(res)) return true;
+    respond(modelsView().then((view) => ({ status: 200, json: view })), "models view");
     return true;
   }
 

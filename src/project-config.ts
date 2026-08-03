@@ -8,7 +8,7 @@ import {
   upsertProjectModel, deleteProjectModel, listProjectModels,
   upsertProjectGroundskeeper, listProjectGroundskeepers,
   insertPendingPolicy, getProjectPolicy, listProjectPolicies,
-  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo, listCatalogModels,
+  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo, listCatalogModels, listModelCatalogRows,
   type ProjectModelRow, type ProjectRow,
 } from "./db.ts";
 
@@ -270,6 +270,31 @@ async function resolveProject(nameRaw: unknown): Promise<{ row: ProjectRow } | {
     row = await getProjectRowByName(name);
   }
   return row ? { row } : { error: bad(503, "project store unavailable") };
+}
+
+/** GET /models — the Models area's payload: the PG model catalog (proxy-served
+ *  ids, availability history), the env roster in force per role, per-project
+ *  overrides, and whether stages route via the proxy. Read-only; configuration
+ *  happens through the existing audited write paths (POST /projects/model). */
+export async function modelsView(): Promise<{
+  catalog: Awaited<ReturnType<typeof listModelCatalogRows>>;
+  roster: Array<{ role: string; model: string }>;
+  proxyAll: boolean;
+  projects: Array<{ name: string; models: ProjectModelRow[] }>;
+}> {
+  const [catalog, catalogIds, rows] = await Promise.all([listModelCatalogRows(), listCatalogModels(), listProjectRows()]);
+  // Every project appears (an empty models array just means "no overrides") so
+  // the Models page can offer the override editor for all of them.
+  const projects: Array<{ name: string; models: ProjectModelRow[] }> = [];
+  for (const row of rows) {
+    projects.push({ name: row.name, models: validateProjectModels(await listProjectModels(row.id), config.models, catalogIds) });
+  }
+  return {
+    catalog,
+    roster: Object.entries(config.models).map(([role, model]) => ({ role, model })),
+    proxyAll: config.proxyAll,
+    projects,
+  };
 }
 
 /** POST /projects/create — register a NEW project (name, team, repos) in

@@ -2156,6 +2156,18 @@ export async function listCatalogModels(): Promise<string[]> {
   return rows.map((r) => r.model);
 }
 
+export interface ModelCatalogRow {
+  model: string; source: string; available: boolean; firstSeen: number; lastSeen: number;
+}
+
+/** Full catalog rows (including unavailable history) for the /models view. */
+export async function listModelCatalogRows(): Promise<ModelCatalogRow[]> {
+  if (!store) return [];
+  const rows = await store.query<{ model: string; source: string; available: boolean; first_seen: unknown; last_seen: unknown }>(
+    "SELECT model, source, available, first_seen, last_seen FROM model_catalog ORDER BY available DESC, model");
+  return rows.map((r) => ({ model: r.model, source: r.source, available: r.available === true, firstSeen: num(r.first_seen), lastSeen: num(r.last_seen) }));
+}
+
 /** The ACTIVE human-approved merge policy governing `repo` (via its owning
  *  active project), for effectiveMergeTier's policyMerge leg. Absence, a closed
  *  store, a malformed value, or a query failure all degrade to null — which the

@@ -390,9 +390,31 @@ async function main(): Promise<void> {
     // Lease already released above, so the child acquires it cleanly. stdio
     // inherit keeps the operator's existing log redirection; detached+unref
     // lets THIS process exit without reaping the child.
+    //
+    // env OVERLAY (live-found 2026-08-03): a bare spawn inherits THIS process's
+    // env, and Bun gives real env vars precedence over .env-file values — so an
+    // operator's .env edit was silently ignored for any var that already
+    // existed at the parent's boot (the whole point of SIGHUP). Re-parse .env
+    // here and overlay it, so the child boots on the file as written. Parsing
+    // is deliberately minimal (KEY=VALUE lines, # comments, optional matching
+    // quotes) — .env is operator-authored, not hostile input.
+    const childEnv: Record<string, string | undefined> = { ...process.env };
+    try {
+      const dotenv = readFileSync(join(process.cwd(), ".env"), "utf8");
+      for (const line of dotenv.split("\n")) {
+        const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+        if (!m?.[1] || m[1].startsWith("#")) continue;
+        let v = m[2] ?? "";
+        if (v.startsWith("#")) v = ""; // "KEY= # comment" → empty
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        childEnv[m[1]] = v;
+      }
+    } catch {
+      // no .env (pure-env deployment) — inherited env is already correct
+    }
     const { spawn } = await import("node:child_process");
     const child = spawn(process.execPath, [fileURLToPath(new URL("index.ts", import.meta.url)), ...process.argv.slice(2)],
-      { detached: true, stdio: "inherit" });
+      { detached: true, stdio: "inherit", env: childEnv });
     child.unref();
     console.log(`[restart] fresh daemon spawned (pid ${child.pid}) — this process exits now`);
   }
