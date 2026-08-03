@@ -7,7 +7,7 @@ repos: [adam91holt/wcc-emergency-gis-showcase]
 model: claude-fable-5
 agents: [scout]
 tools: [Read, Glob, Grep, WebSearch, WebFetch]
-budget: { perRun: 5, weekly: 40 }
+budget: { perRun: 2, weekly: 100 }
 maxTicketsPerRun: 1
 ---
 You are the groundskeeper for the **WCC Emergency GIS Data Showcase**
