@@ -229,6 +229,13 @@ async function tick(): Promise<boolean> {
     });
     if (!safe) { console.log(`[dag] ${issue.identifier} pr-merged gate: skipping cancel — issue state changed since fetch, leaving for next tick`); continue; }
     console.log(`[dag] ${issue.identifier} pr-merged gate cancelling: ${reason}`);
+    // Repair (FAC-75 review round 2, medium — Review 1): resolveStale emits
+    // run_finished; without a paired run_started, an event consumer that
+    // tracks a per-issueKey run lifecycle (db.ts's "newest event that carries
+    // one" pairing, server.ts's dashboard) would see a finish with no start
+    // for this pre-claim cancellation. Emit the pair here, exactly as every
+    // post-claim path already does before its own resolveStale/park call.
+    bus.emit({ type: "run_started", issueKey: issue.identifier, title: issue.title, repo, dryRun: config.dryRun });
     await resolveStale(issue, repo, [], reason).catch((error) => console.error(`[${issue.identifier}] pr-merged cancel failed: ${error instanceof Error ? error.message : error}`));
   }
   for (const id of gateResult.heldIds) console.log(`[dag] ${id} pr-merged gate holding — not yet claimable`);
@@ -251,7 +258,10 @@ async function tick(): Promise<boolean> {
   // schedulableIssues already excludes in-flight (gateable, above) and
   // cancelled (gateResult.cancelled) issues; a held one (heldIds) is DELIBERATELY
   // still included here — see the gate comment above — so it keeps its place
-  // in deriveImplicitDeps/selectRunnable and is only dropped from `batch` below.
+  // in deriveImplicitDeps (a later overlapping sibling still gets the implicit
+  // depends_on edge). It is EXCLUDED further down, before selectRunnable, so
+  // it never consumes a WIP slot — see that comment for why (repair, FAC-75
+  // review round 2, high).
   const candidates = schedulableIssues.map((issue) => {
     const meta = parseFactoryMeta(issue.description);
     const schedulable: Schedulable = { identifier: issue.identifier, dependsOn: meta.depends_on ?? [], touches: meta.touches ?? [] };
@@ -278,12 +288,35 @@ async function tick(): Promise<boolean> {
   const depIds = [...new Set(augmented.flatMap((c) => c.dependsOn))];
   const depTypes = depIds.length > 0 ? await fetchStatesByIdentifiers(depIds) : new Map<string, string>();
   const busyTouches = [...inFlight.values()];
-  const { run } = selectRunnable(augmented, (id) => depTypes.get(id), busyTouches, capacity);
+  // Repair (FAC-75 review round 2, high — both reviewers, independently):
+  // held ids MUST be excluded from what selectRunnable is asked to admit, not
+  // just from `batch` afterward. selectRunnable is capacity-bounded (see the
+  // draining comment above) and admits candidates FIFO into `run` up to
+  // `capacity` — a held candidate left in that list gets admitted first
+  // (occupying a slot that is then thrown away when `batch` drops it below),
+  // so with wipLimit=1 a single held ticket — or wipLimit=4 with four held
+  // FIFO-head tickets, the default — silently stalls EVERY unrelated
+  // candidate for the entire hold window (hours for an open PR; forever for
+  // an unresolvable ref). This is the exact bug the prior round's own
+  // "holding costs nothing" comment asserted did NOT exist.
+  //
+  // The held ticket's dependsOn EDGE (derived above, into `augmented`, from
+  // the FULL schedulableIssues set including held ones) must still exist so a
+  // later overlapping sibling waits on it — but the held ticket itself does
+  // not need a `run` slot to make that edge work: depTypes is a LIVE Linear
+  // state lookup keyed by identifier (fetchStatesByIdentifiers, above), not a
+  // lookup into `augmented`/`run` — a held ticket's real Linear state is
+  // still "unstarted" (never claimed), so selectRunnable correctly reports
+  // any dependent as `blocked` (not "completed"/"canceled") regardless of
+  // whether the held ticket itself is in the list passed to it.
+  const runnable = augmented.filter((c) => !gateResult.heldIds.has(c.identifier));
+  const { run } = selectRunnable(runnable, (id) => depTypes.get(id), busyTouches, capacity);
   const runSet = new Set(run);
-  // A held candidate can land in `run` (selectRunnable has no notion of the
-  // pr-merged gate — it only sees dependsOn/touches) — exclude it from the
-  // actual claim batch here, after it has already done its job of reserving
-  // the mutex/ordering for real siblings this tick.
+  // Held ids can no longer appear in `run` at all (they were excluded from
+  // `runnable` above, before selectRunnable ever saw them) — the extra
+  // `!gateResult.heldIds.has(...)` here is now belt-and-braces, not the
+  // primary defense: even if a future edit fed the wrong list into
+  // selectRunnable, a held ticket still could not slip into the claim batch.
   const batch = candidates.filter((c) => runSet.has(c.schedulable.identifier) && !gateResult.heldIds.has(c.schedulable.identifier));
   if (batch.length > 0) console.log(`[tick] claiming ${batch.length} (in-flight ${inFlight.size}/${config.caps.wipLimit})`);
   for (const { issue, schedulable } of batch) {
