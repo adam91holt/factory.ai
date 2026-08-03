@@ -1,5 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { stageBudgetUsd, stageCostCapUsd } from "../src/agents.ts";
+import { stageBudgetUsd, stageCostCapUsd, stageMayResume } from "../src/agents.ts";
+
+// ADVERSARIAL INDEPENDENCE (SDK-leverage item 5). The writer family shares a
+// warm session lineage (fixer resumes the implementer so it doesn't re-read the
+// files it is fixing). The JUDGES must never inherit the author's conversation —
+// a reviewer that shares the author's context inherits the author's
+// rationalisations. This is structural, not a convention.
+describe("stageMayResume — judges can NEVER resume a session", () => {
+  test("every adversarial judge is refused a resume", () => {
+    for (const judge of ["reviewer-claude", "reviewer-repo", "reviewer-spec", "reviewer-fallback", "design-reviewer", "security-reviewer", "tester"]) {
+      expect(stageMayResume(judge)).toBe(false);
+    }
+  });
+  test("round-suffixed judge labels are covered too (design-reviewer-2, -3, …)", () => {
+    expect(stageMayResume("design-reviewer-2")).toBe(false);
+    expect(stageMayResume("design-reviewer-3")).toBe(false);
+  });
+  test("the writer family MAY resume — that is the warm lineage", () => {
+    for (const writer of ["implementer", "fixer", "design-fixer", "design-fixer-2", "verify-repair-1"]) {
+      expect(stageMayResume(writer)).toBe(true);
+    }
+  });
+});
 
 // Per-stage cost ceilings (in-code caps, telemetry-calibrated 2026-08-03: the
 // runaway-implementer tail was 27% of all-time spend because a stage's

@@ -804,7 +804,20 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       console.error(`[${issue.identifier}] resume failed (${implementer.error}); retrying fresh`);
       implementer = await runStage("implementer", implPrompt, implOpts);
     }
-    await clearStageSession(issue.identifier, "implementer"); // stage returned → not cut off
+    // WARM LINEAGE (SDK-leverage item 5). The implementer's session is NOT
+    // discarded here any more: the fixer family (fixer, design-fixer,
+    // verify-repair) works the SAME files in the SAME worktree, and telemetry
+    // showed 64% of all Reads happen AFTER the implementer — 35% of them
+    // byte-identical re-reads of paths the implementer already read. Resuming
+    // its conversation means the fixer already knows the code it is fixing
+    // instead of cold-starting and re-discovering it.
+    //
+    // The row is cleared at issue END (delivery/park) instead, so the
+    // interrupted-run recovery above still works: while an issue is in flight a
+    // lingering row means "cut off mid-build", and warmLineage below is the
+    // in-memory handle for this run. Reviewers are structurally excluded — see
+    // WARM_LINEAGE_STAGES.
+    const warmLineage: { sessionId: string | null } = { sessionId: await getStageSession(issue.identifier, "implementer") };
     stages.push(pinned(implementer));
     await postStageComment(issue, implementer);
     if (implementer.error) { await park(issue, repo, stages, `implementer: ${implementer.error}`, ws); return; }
@@ -914,13 +927,20 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
       ...(fixDelegates ? { delegates: fixDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
-    const priorFixSession = await getStageSession(issue.identifier, "fixer");
+    // Resume order: this fixer's OWN interrupted session first (recovery), else
+    // the WARM LINEAGE from the implementer (it already knows these files —
+    // SDK-leverage item 5). Either way a resume failure falls back to a cold
+    // start, exactly as the implementer's recovery path does.
+    const priorFixSession = await getStageSession(issue.identifier, "fixer") ?? warmLineage.sessionId;
+    if (priorFixSession) console.log(`[${issue.identifier}] fixer resuming ${priorFixSession === warmLineage.sessionId ? "the implementer's warm session" : "its own interrupted session"}`);
     let fixer = await runStage("fixer", fixPrompt, { ...fixOpts, ...(priorFixSession ? { resume: priorFixSession } : {}) });
     if (priorFixSession && fixer.error) {
       console.error(`[${issue.identifier}] fixer resume failed (${fixer.error}); retrying fresh`);
       fixer = await runStage("fixer", fixPrompt, fixOpts);
     }
-    await clearStageSession(issue.identifier, "fixer");
+    // The fixer is now the newest writer in the lineage — later writer stages
+    // (design-fixer, verify-repair) resume IT rather than the implementer.
+    warmLineage.sessionId = await getStageSession(issue.identifier, "fixer") ?? warmLineage.sessionId;
     stages.push(pinned(fixer));
     await postStageComment(issue, fixer);
     if (fixer.error) { await park(issue, repo, stages, `fixer: ${fixer.error}`, ws); return; }
@@ -979,7 +999,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       for (let round = 1; round < maxTasteRounds && tasteFixRoundWarranted(designGate) && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${gateStageText(designGate, design)}`)}`,
-          { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), ...(warmLineage.sessionId ? { resume: warmLineage.sessionId } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
         commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
@@ -1042,7 +1062,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
-        { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), ...(warmLineage.sessionId ? { resume: warmLineage.sessionId } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
     await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
@@ -1505,6 +1525,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // reached createPr gives the directive back; a delivering run keeps the
     // take permanent. No-op when nothing was consumed (dry-run, early park).
     await pushback.settle(deliveredPr);
+    // Warm-lineage cleanup (SDK-leverage item 5): the writer sessions are kept
+    // ALIVE across stages within a run so the fixer family resumes the
+    // implementer's context instead of cold-starting. They are cleared HERE, at
+    // the single terminal funnel, so a lingering row again means exactly what
+    // the interrupted-run recovery expects: "a prior run was cut off mid-build".
+    await clearStageSession(issue.identifier, "implementer").catch(() => { /* best-effort */ });
+    await clearStageSession(issue.identifier, "fixer").catch(() => { /* best-effort */ });
   }
 }
 

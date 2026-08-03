@@ -150,6 +150,26 @@ const STAGE_COST_CAPS_USD: Readonly<Record<string, number>> = {
 };
 const DEFAULT_STAGE_COST_CAP_USD = 8;
 
+// ADVERSARIAL INDEPENDENCE (SDK-leverage item 5, non-negotiable). The writer
+// stages share a "warm lineage" — the fixer family resumes the implementer's
+// session so it doesn't cold-start and re-read the files it is about to fix.
+// The JUDGES must never be part of that lineage: a reviewer that inherits the
+// author's conversation inherits the author's rationalisations, and the whole
+// point of the adversarial legs is that they see ONLY the ticket and the diff.
+// This set makes that structural rather than a convention a future edit could
+// quietly break — runStage REFUSES a resume on any of these labels.
+const NEVER_RESUME_STAGES: ReadonlySet<string> = new Set([
+  "reviewer-claude", "reviewer-repo", "reviewer-spec", "reviewer-fallback",
+  "design-reviewer", "security-reviewer", "tester",
+]);
+
+/** Is this stage forbidden from resuming ANY prior session (adversarial judge)?
+ *  Round suffixes normalize, so "design-reviewer-2" is covered. Exported so the
+ *  invariant is directly testable. */
+export function stageMayResume(label: string): boolean {
+  return !NEVER_RESUME_STAGES.has(label.replace(/-\d+$/, "")) && !NEVER_RESUME_STAGES.has(label);
+}
+
 /** The cost ceiling for a stage label. Round-suffixed labels normalize to their
  * family ("design-fixer-2" → "design-fixer", "verify-repair-3" → "verify-repair")
  * so every round of a loop shares one family cap per RUN of that stage — the
@@ -760,7 +780,9 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
         settingSources: [], // explicit always; client-repo .claude/ never loads
         includePartialMessages: true, // stream text deltas so tool-less stages (reviewers) show live activity
         persistSession: true, // keep the transcript so an interrupted stage can resume
-        ...(opts.resume ? { resume: opts.resume } : {}),
+        // Adversarial independence enforced HERE, at the single query() seam:
+        // a judge stage can never resume a session even if a caller passes one.
+        ...(opts.resume && stageMayResume(label) ? { resume: opts.resume } : {}),
         env,
         abortController: abort,
       },
