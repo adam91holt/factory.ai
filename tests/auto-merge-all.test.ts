@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveMergeTier, decideMerge, type MergeEvidence } from "../src/merge-ladder.ts";
+import { effectiveMergeTier, decideMerge, deferMergeForDeps, type MergeEvidence } from "../src/merge-ladder.ts";
 
 // AUTO_MERGE_ALL — the operator's blanket override. Two effects, both pinned
 // here: (1) tier resolves to "auto" for every non-self repo, INCLUDING
@@ -83,6 +83,22 @@ describe("decideMerge — minStrength 'real' floor (the AUTO_MERGE_ALL leg)", ()
     const d = decideMerge("shadow", clean, RELAXED);
     expect(d.wouldMerge).toBe(true);
     expect(d.act).toBe(false);
+  });
+});
+
+describe("deferMergeForDeps — explicit auto grant opts out of steward ordering", () => {
+  test("default: a depends_on child that would act is DEFERRED to the steward", () => {
+    expect(deferMergeForDeps(true, true, false)).toBe(true);
+  });
+  test("explicit auto grant: a depends_on child auto-merges (no defer)", () => {
+    expect(deferMergeForDeps(true, true, true)).toBe(false);
+  });
+  test("no deps → never deferred, grant or not", () => {
+    expect(deferMergeForDeps(false, true, false)).toBe(false);
+    expect(deferMergeForDeps(false, true, true)).toBe(false);
+  });
+  test("a decision that would not act is never 'deferred' (nothing to defer)", () => {
+    expect(deferMergeForDeps(true, false, false)).toBe(false);
   });
 });
 

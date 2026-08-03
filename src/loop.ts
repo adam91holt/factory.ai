@@ -13,7 +13,7 @@ import { checkFreshness } from "./precondition.ts";
 import { activeAgentRegisterSnapshot, activeSkillRegisterSnapshot, getStageSession, recordStageSession, clearStageSession, getLadderState, recordShadowDecision, takePushbackFeedback, restorePushbackFeedback, activeMergePolicyForRepo, activeGuardedOverrideForRepo } from "./db.ts";
 import { MATERIALIZED_SKILLS_SUBDIR, buildDelegateRoster, buildRegisterIndex, delegableSpecialists, indexBlockForStage, materializeSkills, refreshMaterializedSkills } from "./discovery.ts";
 import { fileApproval, shouldFileApproval } from "./approvals.ts";
-import { decideMerge, effectiveMergeTier, buildMergeEvidence, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
+import { decideMerge, effectiveMergeTier, buildMergeEvidence, deferMergeForDeps, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
 import { selectSkills, buildSkillBlock, type SkillSelection, type StagePin } from "./skills.ts";
 import { GATE_OUTPUT_SCHEMA, resolveGateOutput, renderFindings, type GateOutput, type GateVerdict } from "./gate.ts";
@@ -1208,13 +1208,24 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const allowGuarded = config.autoMergeAll || (policyMerge === "auto" && await activeGuardedOverrideForRepo(repo));
     const baseDecision = decideMerge(tier, ev, { lowRiskMaxDiff: config.mergeLadder.lowRiskMaxDiff, ...(relaxedFloor ? { minStrength: "real" as const } : {}), ...(allowGuarded ? { allowGuarded: true } : {}) });
     // Gap-1 interaction: a child that declares dependencies must NOT auto-merge
-    // out of order — the steward owns epic merge ordering. Standalone tickets only.
+    // out of order — the steward owns epic merge ordering. EXCEPT under an
+    // explicit operator "merge everything green" grant (AUTO_MERGE_ALL or
+    // per-project merge:auto), which opts out: non-overlapping file areas +
+    // per-branch green CI + the pre-merge integrity re-gate make ordering safe
+    // without the steward, and deferring would only STALL the child (steward
+    // recommends order but never merges). See deferMergeForDeps.
+    const explicitAutoGrant = config.autoMergeAll || policyMerge === "auto";
     const hasDeps = (parseFactoryMeta(issue.description).depends_on ?? []).length > 0;
-    const deferForDeps = hasDeps && baseDecision.act;
+    const deferForDeps = deferMergeForDeps(hasDeps, baseDecision.act, explicitAutoGrant);
+    const mergedUnderGrant = hasDeps && baseDecision.act && explicitAutoGrant;
     const decision: MergeDecision = {
       wouldMerge: baseDecision.wouldMerge, tier: baseDecision.tier,
-      act: baseDecision.act && !hasDeps && prUrl !== null,
-      reasons: deferForDeps ? [...baseDecision.reasons, "deferred: ticket declares depends_on (steward owns epic merge ordering)"] : baseDecision.reasons,
+      act: baseDecision.act && !deferForDeps && prUrl !== null,
+      reasons: deferForDeps
+        ? [...baseDecision.reasons, "deferred: ticket declares depends_on (steward owns epic merge ordering)"]
+        : mergedUnderGrant
+          ? [...baseDecision.reasons, "depends_on present but auto-merged under explicit auto grant (ordering via per-branch CI + pre-merge re-gate)"]
+          : baseDecision.reasons,
     };
 
     // Gap-4: re-validate the premise before recording an earning decision or

@@ -110,6 +110,21 @@ export function decideMerge(tier: MergeTier, ev: MergeEvidence, opts: { lowRiskM
   return { wouldMerge, act, tier, reasons };
 }
 
+/** Should an epic child that declares `depends_on` be DEFERRED from auto-merge
+ * (handed to the steward for ordered merge) rather than merged now? By default
+ * YES — the steward owns epic merge ordering (Gap-1). But an EXPLICIT operator
+ * "merge everything green" grant (AUTO_MERGE_ALL or a per-project merge:auto)
+ * opts out: the decomposer guarantees non-overlapping file areas, every branch
+ * carries its own green CI, and the pre-merge integrity re-gate re-runs the
+ * gates against the combined main before each merge — so ordering is already
+ * safe without the steward, and deferring would instead STALL the child (the
+ * steward recommends order but never merges). Pure; the caller supplies whether
+ * the child has deps, whether the base decision would act, and whether an
+ * explicit auto grant is in force. */
+export function deferMergeForDeps(hasDeps: boolean, baseWouldAct: boolean, explicitAutoGrant: boolean): boolean {
+  return hasDeps && baseWouldAct && !explicitAutoGrant;
+}
+
 /** Pure earning transition — the DB just persists the result. A clean (would-
  * merge) decision extends the streak; any dirty decision resets it to 0. A repo
  * at "shadow" that reaches `promoteAfter` consecutive clean decisions (and whose
