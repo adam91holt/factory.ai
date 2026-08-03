@@ -475,6 +475,17 @@ export function mergePrArgs(repo: string, prUrl: string, matchHeadSha: string): 
   return ["pr", "merge", prUrl, "--repo", repo, "--squash", "--delete-branch", "--match-head-commit", matchHeadSha];
 }
 
+/** Is a failed `gh pr merge` output a TRANSIENT GitHub/network hiccup worth
+ * retrying (vs a real refusal — branch protection, a conflict, a moved head)?
+ * A merge the ladder already DECIDED to make must not be abandoned to pr_open
+ * on a flaky 502 (live-found 2026-08-03: FAC-90 auto-merge decided, then the gh
+ * call hit "502 Bad Gateway" and stranded the ticket). Deliberately narrow —
+ * only the GitHub 5xx / gateway / network shapes, never a 4xx/conflict/protection
+ * message that a retry would just hit again. */
+export function isTransientMergeError(out: string): boolean {
+  return /\b50[234]\b|bad gateway|gateway time-?out|service unavailable|temporarily unavailable|\bECONNRESET\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|connection reset|socket hang up|network (error|timeout)|timed? out/i.test(out);
+}
+
 /** Did the merge fail BECAUSE the PR head no longer matches the pinned SHA?
  * GitHub's refusal reads "Head branch was modified. Review and try the merge
  * again." (gh surfaces it verbatim, sometimes GraphQL-wrapped); the expected-

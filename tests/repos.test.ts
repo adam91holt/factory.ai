@@ -3,7 +3,23 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, classifyStatusPaths, commitsBehindBase, fetchBase, ghRepoCreateArgs, guardedPathsTouched, headSha, isAdditiveTestExtension, mergeBaseIntoBranch, mergePrArgs, mergeRefusedBecauseHeadMoved, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+import { classifyPaths, classifyStatusPaths, commitsBehindBase, fetchBase, ghRepoCreateArgs, guardedPathsTouched, headSha, isAdditiveTestExtension, isTransientMergeError, mergeBaseIntoBranch, mergePrArgs, mergeRefusedBecauseHeadMoved, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+
+describe("isTransientMergeError — retry only flaky GitHub/network merge failures", () => {
+  test("GitHub 5xx / gateway / network shapes are transient", () => {
+    expect(isTransientMergeError('non-200 OK status code: 502 Bad Gateway body: "<html>..."')).toBe(true);
+    expect(isTransientMergeError("503 Service Unavailable")).toBe(true);
+    expect(isTransientMergeError("504 Gateway Time-out")).toBe(true);
+    expect(isTransientMergeError("ECONNRESET")).toBe(true);
+    expect(isTransientMergeError("request timed out")).toBe(true);
+  });
+  test("real refusals are NOT transient (a retry would just hit them again)", () => {
+    expect(isTransientMergeError("Pull request is not mergeable: merge conflict")).toBe(false);
+    expect(isTransientMergeError("Required status check 'ci' is expected")).toBe(false);
+    expect(isTransientMergeError("Head branch was modified. Review and try the merge again.")).toBe(false);
+    expect(isTransientMergeError("branch protection: review required")).toBe(false);
+  });
+});
 
 describe("classifyPaths — guarded-path detection", () => {
   test("guards factory governance directories at root and nested", () => {

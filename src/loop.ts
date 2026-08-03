@@ -2,7 +2,14 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, headSha, fetchBase, commitsBehindBase, mergeBaseIntoBranch, DIFF_FAILED, type Workspace } from "./repos.ts";
+import { ensureWorkspace, repoFromTicket, commitAll, hasCommitsAheadOfBase, diffAgainstBase, guardedPathsTouched, uiFilesTouched, testFilesRemoved, pushBranch, createPr, mergePr, isTransientMergeError, headSha, fetchBase, commitsBehindBase, mergeBaseIntoBranch, DIFF_FAILED, type Workspace } from "./repos.ts";
+
+// Bounded retry for a transient auto-merge failure (GitHub 502/503, gateway,
+// network). IN-CODE constants, not env knobs (CLAUDE.md safety-cap discipline).
+// 3 → two retries after the first attempt, ~1.5s then 3s apart — enough to ride
+// out a brief GitHub blip without stalling the tick on a genuine outage.
+const MERGE_RETRY_ATTEMPTS = 3;
+const MERGE_RETRY_BASE_MS = 1500;
 import { ensureDeps, detectGates, baseline, verify, gateSummary, hasPlaywright, requiresBrowserEvidence, testCountRatchet, repoFacts } from "./verify.ts";
 import { routeStage, factTerms, type RepoFacts, type StageRoute } from "./routing.ts";
 import { runStage, untrusted, redactSecrets, isTransientStageError, type StageResult, type DelegateRoster, CLAIM_LOST } from "./agents.ts";
@@ -1333,6 +1340,17 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     let merged: { ok: boolean; out: string; headMoved: boolean } | null = null;
     if (!config.dryRun && finalDecision.act && prUrl && integrity?.ok) {
       merged = mergePr(repo, prUrl, integrity.pinnedHeadSha);
+      // Retry a TRANSIENT GitHub/network failure (502/503/504, gateway, timeout)
+      // — the merge already passed every gate; a flaky merge call must not
+      // abandon it to pr_open (live-found 2026-08-03: FAC-90's auto-merge decided
+      // but the gh call hit a 502). headMoved is NEVER retried (the pin was
+      // refused — the new head was never gated). Pinned to the SAME gated SHA
+      // each attempt, so a retry can only ever merge the exact gated commit.
+      for (let mAttempt = 1; !merged.ok && !merged.headMoved && isTransientMergeError(merged.out) && mAttempt < MERGE_RETRY_ATTEMPTS; mAttempt++) {
+        console.error(`[${issue.identifier}] auto-merge hit a transient error (attempt ${mAttempt}/${MERGE_RETRY_ATTEMPTS - 1}) — retrying: ${redactSecrets(merged.out).clean.slice(0, 120)}`);
+        await new Promise((r) => setTimeout(r, MERGE_RETRY_BASE_MS * mAttempt));
+        merged = mergePr(repo, prUrl, integrity.pinnedHeadSha);
+      }
       if (!merged.ok && merged.headMoved) {
         // GitHub refused the pin: the branch moved between gate time and merge
         // (steward follow-up, sibling task, human push). The new head's code
