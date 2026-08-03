@@ -440,7 +440,12 @@ export function isTransientStageError(error: string): boolean {
   // budget (RETRY_ATTEMPTS + one fallback leg) before parking exactly as
   // before, so classifying it transient is strictly better than parking on the
   // first blip.
-  return /\b429\b|rate.?limit(ed)?|cooling down|overloaded|too many requests|service unavailable|temporarily unavailable|\bECONNRESET\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|\bENOTFOUND\b|\bEPIPE\b|fetch failed|socket hang up|network (error|timeout)|error_during_execution|\[ede_diagnostic\]/i.test(error);
+  // "stream error: stream disconnected before completion" / "stream
+  // disconnected" — the SDK/proxy dropping the SSE mid-response. Pure
+  // infrastructure (live-found 2026-08-03: FAC-87's design review died on this
+  // on both attempts and stranded the ticket in needs-human). Retrying is
+  // strictly better than parking on the first drop.
+  return /\b429\b|rate.?limit(ed)?|cooling down|overloaded|too many requests|service unavailable|temporarily unavailable|\bECONNRESET\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|\bENOTFOUND\b|\bEPIPE\b|fetch failed|socket hang up|network (error|timeout)|stream (error|disconnected)|disconnected before|error_during_execution|\[ede_diagnostic\]/i.test(error);
 }
 
 function backoffMs(attempt: number): number {

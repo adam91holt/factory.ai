@@ -446,6 +446,23 @@ export function prHeadSha(repo: string, prUrl: string): string | null {
   return r.status === 0 && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
 }
 
+/** A PR's lifecycle state as GitHub sees it: "merged" | "closed" (closed
+ *  WITHOUT merge) | "open" | null (gh failure / unreadable). Used by the
+ *  reconcile tick to retire pending approval-inbox rows whose PR was resolved
+ *  OUTSIDE the inbox (merged by the ladder or a human, or closed on a pivot) —
+ *  otherwise the row orphans forever (hit 3× on 2026-08-03). null → leave the
+ *  row alone (never resolve on an unread state). */
+export function prState(repo: string, prUrl: string): "merged" | "closed" | "open" | null {
+  const r = spawnSync("gh", ["pr", "view", prUrl, "--repo", repo, "--json", "state,mergedAt", "-q", "[.state, (.mergedAt // \"\")] | @tsv"],
+    { encoding: "utf8", timeout: 30_000 });
+  if (r.status !== 0) return null;
+  const [state, mergedAt] = (r.stdout ?? "").trim().split("\t");
+  if ((state ?? "").toUpperCase() === "MERGED" || (mergedAt ?? "") !== "") return "merged";
+  if ((state ?? "").toUpperCase() === "CLOSED") return "closed";
+  if ((state ?? "").toUpperCase() === "OPEN") return "open";
+  return null;
+}
+
 /** Build the `gh pr merge` argv. PINNED-BY-CONSTRUCTION (same pattern as
  * ghRepoCreateArgs): --match-head-commit is always present and the SHA is
  * validated, so no code path can produce an UNPINNED merge argv — merging

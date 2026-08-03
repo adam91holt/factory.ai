@@ -489,20 +489,25 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   }
 
   // (c2) SERIAL PER REPO — never file NEW work for this card's repo while a
-  // ticket for it is already IN FLIGHT (Todo / In-Progress / In-Review). The
-  // card cadence (e.g. */15) is faster than a build, so without this the
-  // groundskeeper re-files similar work before the last finishes — producing
-  // DUPLICATES, not just conflicts (live-found 2026-08-03: FAC-84 and FAC-85
-  // were the same detail panel, a wasted opus build). Scoped to the card's own
-  // repo (via the ticket meta `repo:`) so a multi-repo team's other work never
-  // blocks this card. One-in-flight-per-repo makes the card truly serial.
+  // ticket for it is still OPEN in ANY non-terminal lane: Todo / In-Progress /
+  // In-Review AND Parked / Needs-Human. The card cadence (e.g. */15) is faster
+  // than a build, so without this the groundskeeper re-files similar work before
+  // the last finishes — producing DUPLICATES, not just conflicts. TWO live
+  // repeats proved both legs are needed: FAC-84/85 (a claimed ticket wasn't
+  // counted) drove the In-Progress leg; FAC-87/88 (a ticket PARKED on a
+  // transient design-review flake wasn't counted) drove the Parked/Needs-Human
+  // leg — the groundskeeper re-filed the same quick-views feature. Counting the
+  // stuck lanes too means a repo with an unresolved ticket blocks NEW work until
+  // a human (or a retry) clears it — the right "don't pile on" behaviour, and it
+  // never loses the window (the card re-checks every tick). Scoped to the card's
+  // own repo via the ticket meta `repo:`.
   const myRepo = card.repos[0] ?? "";
   if (myRepo) {
     const executing = await linear.fetchByLabel(linear.EXECUTING_LABEL, [card.team]).catch(() => [] as linear.Issue[]);
-    const inFlight = [...queue, ...inReview, ...executing.filter(open)]
+    const inFlight = [...queue, ...inReview, ...executing.filter(open), ...needsHuman, ...parked]
       .filter((i) => repoFromTicket(i.description) === myRepo);
     if (inFlight.length > 0) {
-      console.log(`[gk:${card.name}] ${inFlight.length} ticket(s) already in flight for ${myRepo} (${[...new Set(inFlight.map((i) => i.identifier))].join(", ")}) — serial, skipping`);
+      console.log(`[gk:${card.name}] ${inFlight.length} ticket(s) still open for ${myRepo} (${[...new Set(inFlight.map((i) => i.identifier))].join(", ")}) — serial, skipping`);
       return false;
     }
   }

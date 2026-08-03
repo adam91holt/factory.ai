@@ -2,9 +2,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { repoFromTicket } from "./repos.ts";
+import { repoFromTicket, prState } from "./repos.ts";
 import { childrenAllTerminal } from "./steward.ts";
 import { abortIssueStages, redactSecrets } from "./agents.ts";
+import { listPendingApprovals, finalizeApproval } from "./db.ts";
+import { bus } from "./events.ts";
 
 const execFileP = promisify(execFile);
 
@@ -125,7 +127,31 @@ export async function reconcileTick(inFlightKeys: ReadonlySet<string> = new Set(
     }
   }
 
-  // (3) Claim-loss sweep — see claimLossSweep above. Uses the started-type
+  // (3) Stale approval-inbox rows. A PR can be merged (by the ladder, the
+  // steward, or a human on GitHub) or closed (a pivot/cancel) OUTSIDE the
+  // approvals inbox, leaving its pending row orphaned in the review queue
+  // forever (hit 3× on 2026-08-03 — the operator saw "4 items" that were all
+  // already resolved). Retire each pending row whose PR GitHub reports as
+  // terminal: merged → approved (the merge already happened), closed-unmerged →
+  // stale. An OPEN PR or an unreadable state (prState null) is left untouched —
+  // this only ever RESOLVES rows the world already resolved, never merges.
+  if (!config.dryRun) {
+    for (const item of await listPendingApprovals().catch(() => [])) {
+      if (!item.prUrl || !item.repo) continue;
+      const state = prState(item.repo, item.prUrl);
+      if (state === "open" || state === null) continue;
+      const status = state === "merged" ? "approved" as const : "stale" as const;
+      const reason = state === "merged"
+        ? `PR already merged outside the inbox — retiring orphaned approval (${item.prUrl})`
+        : `PR closed without merge outside the inbox — retiring stale approval (${item.prUrl})`;
+      await finalizeApproval(item.id, status, reason);
+      if (status === "approved") bus.emit({ type: "approval_granted", issueKey: item.issueKey, approvalId: item.id, prUrl: item.prUrl, sha: item.gatedHeadSha ?? "external" });
+      else bus.emit({ type: "approval_stale", issueKey: item.issueKey, approvalId: item.id, reason });
+      console.log(`[reconcile] ${item.issueKey} approval #${item.id} → ${status} (PR ${state} outside inbox)`);
+    }
+  }
+
+  // (4) Claim-loss sweep — see claimLossSweep above. Uses the started-type
   // fetch pass (1) already paid for; no additional Linear calls. Dry-run has
   // no live claims and must never abort anything.
   if (!config.dryRun && inFlightKeys.size > 0) {

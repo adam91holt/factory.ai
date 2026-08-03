@@ -112,6 +112,9 @@ describe("isTransientStageError", () => {
     expect(isTransientStageError("fetch failed: ECONNRESET")).toBe(true);
     expect(isTransientStageError("upstream overloaded, please retry")).toBe(true);
     expect(isTransientStageError("503 service unavailable")).toBe(true);
+    // FAC-87: the SDK/proxy dropping the SSE mid-response — infrastructure.
+    expect(isTransientStageError("Claude Code returned an error result: API Error: stream error: stream disconnected before completion")).toBe(true);
+    expect(isTransientStageError("stream disconnected before end")).toBe(true);
   });
 
   test("our own abort reasons are never transient — must fail immediately", () => {
