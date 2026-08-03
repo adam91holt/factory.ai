@@ -59,6 +59,10 @@ interface StageOptions {
   /** Materialized-skill pins: relPath → "name@version" (skillReadDetail). */
   skillPins?: Record<string, string>;
   resume?: string;                               // resume a prior session (interrupted-run recovery)
+  /** In-process SDK hooks (e.g. the PreToolUse write guard, write-guard.ts).
+   *  DAEMON-AUTHORED ONLY: hook configs are code, never register/card data, so
+   *  a card cannot author capability through this seam. */
+  hooks?: Partial<Record<import("@anthropic-ai/claude-agent-sdk").HookEvent, import("@anthropic-ai/claude-agent-sdk").HookCallbackMatcher[]>>;
   // Fired ONCE per stage on the system/init message, before any tool call —
   // persist for resume. May be async (the store is Postgres now): runStage
   // AWAITS it rather than firing-and-forgetting, because this row exists
@@ -112,6 +116,48 @@ const MIN_STAGE_BUDGET_USD = 0.5;
  * without ever inflating a small-but-positive remainder above what was asked. */
 export function stageBudgetUsd(requestedUsd: number): number {
   return requestedUsd > 0 ? requestedUsd : MIN_STAGE_BUDGET_USD;
+}
+
+// Per-stage COST CEILINGS — IN-CODE constants, never env knobs (CLAUDE.md cap
+// discipline). Telemetry 2026-08-03: the top 3 implementer invocations cost
+// $52.87/$47.97/$44.94 = 27% of ALL-TIME spend, because maxBudgetUsd only
+// carried the per-issue REMAINDER — one stage could legally eat the whole
+// issue budget. These caps bound any single stage's run (including its
+// retry/failover attempts, see runStage) at ~10x its telemetry AVERAGE
+// (implementer avg ≈ $1.10), so a legitimately expensive stage still has deep
+// headroom while a runaway parks early with a lesson instead of burning $50.
+// Keyed by NORMALIZED label (stageCostCapUsd below strips round suffixes);
+// unknown labels get DEFAULT_STAGE_COST_CAP_USD rather than failing open.
+const STAGE_COST_CAPS_USD: Readonly<Record<string, number>> = {
+  implementer: 12,
+  fixer: 6,
+  "verify-repair": 6,
+  "design-fixer": 4,
+  "reviewer-claude": 4,
+  "reviewer-repo": 4,
+  "reviewer-fallback": 4,
+  "design-reviewer": 4,
+  tester: 4,
+  "security-reviewer": 3,
+  scout: 4,
+  decomposer: 6,
+  planner: 6,
+  steward: 4,
+  groundskeeper: 3,
+  distiller: 1,
+  intake: 4,
+  scaffolder: 6,
+};
+const DEFAULT_STAGE_COST_CAP_USD = 8;
+
+/** The cost ceiling for a stage label. Round-suffixed labels normalize to their
+ * family ("design-fixer-2" → "design-fixer", "verify-repair-3" → "verify-repair")
+ * so every round of a loop shares one family cap per RUN of that stage — the
+ * repair loop's own round count is bounded separately by caps.verifierIterations
+ * and tasteRounds. Exported for tests. */
+export function stageCostCapUsd(label: string): number {
+  const base = label.replace(/-\d+$/, "");
+  return STAGE_COST_CAPS_USD[base] ?? STAGE_COST_CAPS_USD[label] ?? DEFAULT_STAGE_COST_CAP_USD;
 }
 
 // Orchestration/team tools the ambient harness injects into SDK workers and that
@@ -589,6 +635,14 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   let last = await runOneAttempt(label, prompt, opts, primaryModel, deps, transcript);
   accumulate(last);
   while (last.error && isTransientStageError(last.error) && attempt < 1 + RETRY_ATTEMPTS) {
+    // Cumulative retry/failover spend for this stage RUN is bounded by the same
+    // in-code stage ceiling — an issue with recurring transient errors must not
+    // multiply the cap by the retry count (each attempt is separately capped by
+    // maxBudgetUsd, so without this the run total could reach attempts × cap).
+    if (totalCost >= stageCostCapUsd(label)) {
+      console.error(`[agents] ${label}: cumulative retry spend $${totalCost.toFixed(2)} reached the stage ceiling $${stageCostCapUsd(label)} — not retrying further`);
+      break;
+    }
     const waitMs = backoffMs(attempt);
     // Don't retry into a window that's already gone — leave enough runway
     // (the wait itself, plus a floor for the attempt) or stop trying.
@@ -600,7 +654,7 @@ export async function runStage(label: string, prompt: string, opts: StageOptions
   }
   if (last.error && isTransientStageError(last.error)) {
     const fallbackModel = opts.fallbackModel ?? config.fallbackModel;
-    if (fallbackModel && fallbackModel !== primaryModel && Date.now() < opts.deadlineMs) {
+    if (fallbackModel && fallbackModel !== primaryModel && Date.now() < opts.deadlineMs && totalCost < stageCostCapUsd(label)) {
       console.error(`[agents] ${label}: ${attempt} attempt(s) on ${primaryModel} all transient (${last.error}); failing over to ${fallbackModel}`);
       bus.emit({ type: "provider_failover", stage: label, fromModel: primaryModel, toModel: fallbackModel, reason: last.error });
       const fromFallback = await runOneAttempt(label, prompt, opts, fallbackModel, deps, transcript);
@@ -694,9 +748,13 @@ async function runOneAttempt(label: string, prompt: string, opts: StageOptions, 
         ...(orchestrate ? { agents: { ...(opts.delegates?.agents ?? {}), worker: WORKER_AGENT } } : {}),
         permissionMode: "dontAsk", // enforces the allowlist (triage-agent lesson)
         maxTurns: opts.maxTurns,
-        maxBudgetUsd: stageBudgetUsd(opts.budgetUsd),
+        // Clamped TWICE: the per-issue remainder (what the caller can still
+        // afford) AND the in-code per-stage ceiling (what any single stage is
+        // ever allowed to burn — the runaway-implementer fix).
+        maxBudgetUsd: Math.min(stageBudgetUsd(opts.budgetUsd), stageCostCapUsd(label)),
         ...(opts.effort ? { effort: opts.effort } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
+        ...(opts.hooks ? { hooks: opts.hooks } : {}),
         mcpServers: {},
         strictMcpConfig: true,
         settingSources: [], // explicit always; client-repo .claude/ never loads

@@ -194,6 +194,27 @@ const NON_TEST_GUARDED_RES = [/(^|\/)\.github\//, /(^|\/)CLAUDE\.md$/, /(^|\/)\.
 const TEST_PATH_RE = /\.test\.|\.spec\.|(^|\/)tests?\//;
 const GUARDED_PATH_RES = [...NON_TEST_GUARDED_RES, TEST_PATH_RE];
 
+/** WRITE-TIME guard policy (the PreToolUse hook's brain, SDK-leverage item 2):
+ * given a worktree-relative path an agent is about to Write/Edit, return the
+ * DENIAL REASON string, or null to allow. Mirrors the delivery-time
+ * classifyStatusPaths policy so the hook is an EARLY WARNING for the same
+ * rules, never a second policy: non-test guarded paths always deny; test paths
+ * deny only when the file already EXISTS (modifying/rewriting existing tests is
+ * the gamed-gate risk — ADDING new tests is exempt, same as the delivery #1
+ * exemption); factory scratch paths are the daemon's own output channel and
+ * always allowed. Pure — existence is passed in so tests need no fs. */
+export function writeGuardVerdict(relPath: string, fileExists: boolean): string | null {
+  if (isFactoryScratchPath(relPath)) return null;
+  const nonTestGuarded = NON_TEST_GUARDED_RES.some((re) => re.test(relPath));
+  if (nonTestGuarded) {
+    return `"${relPath}" is a factory-guarded path (CI/workflows, CLAUDE.md, .claude/, skills/, groundskeepers/, agents/, projects/): changes here force human review and will strand this run. Do NOT modify it — implement the ticket without touching guarded files.`;
+  }
+  if (TEST_PATH_RE.test(relPath) && fileExists) {
+    return `"${relPath}" is an EXISTING test file: modifying or rewriting existing tests forces human review (gamed-gate protection). ADD a new test file instead, or leave the existing tests untouched.`;
+  }
+  return null;
+}
+
 /** Pure guarded-path classifier: the subset of `files` that any guard regex
  * matches. Extracted from guardedPathsTouched so the policy is unit-testable
  * without shelling out to git — behavior identical. Status-blind (used where

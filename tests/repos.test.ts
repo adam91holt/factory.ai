@@ -3,7 +3,32 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPaths, classifyStatusPaths, commitsBehindBase, fetchBase, ghRepoCreateArgs, guardedPathsTouched, headSha, isAdditiveTestExtension, isTransientMergeError, mergeBaseIntoBranch, mergePrArgs, mergeRefusedBecauseHeadMoved, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+import { classifyPaths, classifyStatusPaths, commitsBehindBase, fetchBase, ghRepoCreateArgs, guardedPathsTouched, headSha, isAdditiveTestExtension, isTransientMergeError, writeGuardVerdict, mergeBaseIntoBranch, mergePrArgs, mergeRefusedBecauseHeadMoved, parseNameStatus, redactRevertWhy, repoFromTicket, revertMerge, type Workspace } from "../src/repos.ts";
+
+describe("writeGuardVerdict — the PreToolUse write guard's brain (early warning for delivery policy)", () => {
+  test("non-test guarded paths always deny, regardless of existence", () => {
+    expect(writeGuardVerdict(".github/workflows/ci.yml", true)).toContain("factory-guarded");
+    expect(writeGuardVerdict("CLAUDE.md", false)).toContain("factory-guarded");
+    expect(writeGuardVerdict(".claude/settings.json", true)).toContain("factory-guarded");
+    expect(writeGuardVerdict("skills/foo/SKILL.md", false)).toContain("factory-guarded");
+  });
+  test("EXISTING test files deny; NEW test files are allowed (additive-test exemption)", () => {
+    expect(writeGuardVerdict("src/thing.test.ts", true)).toContain("EXISTING test");
+    expect(writeGuardVerdict("tests/old.spec.ts", true)).toContain("EXISTING test");
+    expect(writeGuardVerdict("src/new-feature.test.ts", false)).toBeNull();
+    expect(writeGuardVerdict("tests/added.spec.ts", false)).toBeNull();
+  });
+  test("ordinary source files are always allowed", () => {
+    expect(writeGuardVerdict("src/main.ts", true)).toBeNull();
+    expect(writeGuardVerdict("index.html", false)).toBeNull();
+  });
+  test("factory scratch paths are the daemon's own channel — always allowed", () => {
+    expect(writeGuardVerdict(".factory/handoff.json", false)).toBeNull();
+  });
+  test("a test file under a guarded dir gets the guarded denial, not the test exemption", () => {
+    expect(writeGuardVerdict(".claude/tests/x.test.ts", false)).toContain("factory-guarded");
+  });
+});
 
 describe("isTransientMergeError — retry only flaky GitHub/network merge failures", () => {
   test("GitHub 5xx / gateway / network shapes are transient", () => {

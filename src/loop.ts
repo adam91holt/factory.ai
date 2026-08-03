@@ -29,6 +29,7 @@ import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./even
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 import { projectOwningRepo } from "./db.ts";
 import { projectModelOverrides } from "./project-config.ts";
+import { buildWriteGuardHooks } from "./write-guard.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
 // budget threaded cumulatively (C11), deadline before every stage + abort (C12),
@@ -549,6 +550,26 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const gates = detectGates(ws);
     const baselines = await baseline(ws, gates);
 
+    // The guard-bypass grant for this repo, computed ONCE and reused at both
+    // ends: (a) here — a full-auto project gets NO write guard (it may change
+    // any files); everyone else's write stages get the PreToolUse hook that
+    // denies guarded-path writes AT TOOL TIME (write-guard.ts — before this
+    // hook, a guarded touch was discovered only at delivery, after the entire
+    // pipeline's spend); (b) at delivery — the same grant decides whether
+    // guarded touches / test deletions park or auto-merge. One computation,
+    // one policy, both seams agree by construction.
+    const metaMerge = parseFactoryMeta(issue.description).merge;
+    const humanReview = metaMerge === "review" || metaMerge === "shadow";
+    const policyMerge = await activeMergePolicyForRepo(repo);
+    const guardBypass = guardBypassAllowed({
+      autoMergeAll: config.autoMergeAll,
+      policyMergeAuto: policyMerge === "auto",
+      guardedOverride: policyMerge === "auto" ? await activeGuardedOverrideForRepo(repo) : false,
+      humanReview,
+      selfRepo: isSelfRepo(repo),
+    });
+    const writeGuardHooks = guardBypass ? undefined : buildWriteGuardHooks(ws.dir);
+
     // ---- agent routing (routing.ts): which CARD runs each stage, and which
     // TOOLS that stage is granted.
     //
@@ -769,7 +790,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const implPrompt = ownerFeedbackBlock + lessonsBlock + renderPrompt(implRoute.card, { repo, spec: implSpec },
         `You are the implementer in an automated software factory. Work ONLY inside the current directory (a fresh git worktree of ${repo}). Implement the ticket below. Follow the repo's existing conventions. Sanity-check your work with the repo's own scripts where cheap. Do not create unrelated files; do not touch tests/CI/workflows unless the ticket explicitly asks. When done, reply with a one-paragraph summary of the change.\n\n${implSpec}`);
     const implDelegates = delegatesFor(implRoute);
-    const implOpts = { model: implModel, effort: implEffort, cwd: ws.dir, allowedTools: implRoute.tools, maxTurns: config.caps.turnsImplementer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+    const implOpts = { model: implModel, effort: implEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: implRoute.tools, maxTurns: config.caps.turnsImplementer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
       ...(implDelegates ? { delegates: implDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "implementer", id) };
     // Resume an interrupted implementer: a lingering session row means the prior
@@ -890,7 +911,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     const fixPrompt = ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec: specForFixer, reviews: untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`) },
         `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${specForFixer}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`);
     const fixDelegates = delegatesFor(fixerRoute);
-    const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+    const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
       ...(fixDelegates ? { delegates: fixDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
     const priorFixSession = await getStageSession(issue.identifier, "fixer");
@@ -958,7 +979,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       for (let round = 1; round < maxTasteRounds && tasteFixRoundWarranted(designGate) && !budget.expired; round++) {
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
           `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${gateStageText(designGate, design)}`)}`,
-          { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
         commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
@@ -1021,7 +1042,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     for (let i = 0; !summary.green && i < config.caps.verifierIterations && !budget.expired; i++) {
       const repair = await runStage(`verify-repair-${i + 1}`,
         `Gates are failing in this worktree. Fix ONLY what the failures indicate — never weaken or delete tests (that requires a human). Failures:\n${summary.failures.map((f) => `## ${f.name}\n${f.output}`).join("\n")}`,
-        { model: fixModel, effort: fixEffort, cwd: ws.dir, allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+        { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
       stages.push(repair);
     await postStageComment(issue, repair);
       commitAll(ws, `${issue.identifier}: fix gate failures (round ${i + 1})`);
@@ -1063,7 +1084,7 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       const testerPrompt = renderPrompt(testerRoute.card, { spec: specForTester, playwright: "Playwright IS installed in this repo — use it for browser/visual items." },
           `You are the verification agent. Execute the ticket's ## Verifications section against this worktree and report what actually happened (evidence, not opinion); do not edit source. Automated items: run the repo's own scripts via Bash. Visual/browser items: Playwright IS installed — drive the screen(s) and report what you observe. Manual items: state they need a human. End with exactly one line: "VERDICT: pass", "VERDICT: partial", or "VERDICT: fail".\n\n${specForTester}`);
       const testerDelegates = delegatesFor(testerRoute);
-      const testerOpts = { model: resolveModelForRisk("tester", meta, risk.class, projModels), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card), projEfforts), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT,
+      const testerOpts = { ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), model: resolveModelForRisk("tester", meta, risk.class, projModels), effort: resolveEffort("tester", meta, cardEffort(testerRoute.card), projEfforts), cwd: ws.dir, allowedTools: testerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent, outputFormat: GATE_STAGE_OUTPUT_FORMAT,
         ...(testerDelegates ? { delegates: testerDelegates } : {}), ...skillPinsOpt,
         onSessionId: (id: string) => recordStageSession(issue.identifier, "tester", id) };
       const priorTesterSession = await getStageSession(issue.identifier, "tester");
@@ -1148,16 +1169,8 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // diff (DIFF_FAILED below — we never merge blind). Quality gates (red tests,
     // security/taste FAIL, test-count ratchet) are untouched — this only relaxes
     // the "human by design" file guards, never a real failure.
-    const metaMerge = parseFactoryMeta(issue.description).merge;
-    const humanReview = metaMerge === "review" || metaMerge === "shadow";
-    const policyMerge = await activeMergePolicyForRepo(repo);
-    const guardBypass = guardBypassAllowed({
-      autoMergeAll: config.autoMergeAll,
-      policyMergeAuto: policyMerge === "auto",
-      guardedOverride: policyMerge === "auto" ? await activeGuardedOverrideForRepo(repo) : false,
-      humanReview,
-      selfRepo: isSelfRepo(repo),
-    });
+    // (guardBypass itself is computed ONCE near the top of the run — it also
+    // decides whether the PreToolUse write guard is attached to write stages.)
 
     // ---- deliver (guarded paths / test deletion stop auto-advance — C17,
     // unless the project's explicit auto-grant bypasses the human-by-design guards)

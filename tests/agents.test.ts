@@ -1,5 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { stageBudgetUsd } from "../src/agents.ts";
+import { stageBudgetUsd, stageCostCapUsd } from "../src/agents.ts";
+
+// Per-stage cost ceilings (in-code caps, telemetry-calibrated 2026-08-03: the
+// runaway-implementer tail was 27% of all-time spend because a stage's
+// maxBudgetUsd only carried the per-issue remainder).
+describe("stageCostCapUsd — in-code per-stage ceilings", () => {
+  test("known stages have their calibrated caps", () => {
+    expect(stageCostCapUsd("implementer")).toBe(12);
+    expect(stageCostCapUsd("fixer")).toBe(6);
+    expect(stageCostCapUsd("security-reviewer")).toBe(3);
+    expect(stageCostCapUsd("distiller")).toBe(1);
+  });
+  test("round-suffixed labels normalize to their family cap", () => {
+    expect(stageCostCapUsd("design-fixer-2")).toBe(stageCostCapUsd("design-fixer"));
+    expect(stageCostCapUsd("design-reviewer-3")).toBe(stageCostCapUsd("design-reviewer"));
+    expect(stageCostCapUsd("verify-repair-4")).toBe(stageCostCapUsd("verify-repair"));
+  });
+  test("unknown labels get the bounded default, never fail open", () => {
+    expect(stageCostCapUsd("some-future-stage")).toBe(8);
+  });
+  test("the ceiling composes with the issue remainder: min() of both", () => {
+    // a huge remainder is clamped by the stage cap...
+    expect(Math.min(stageBudgetUsd(100), stageCostCapUsd("implementer"))).toBe(12);
+    // ...and a small remainder is NOT inflated up to the cap
+    expect(Math.min(stageBudgetUsd(0.2), stageCostCapUsd("implementer"))).toBe(0.2);
+  });
+});
 
 // B8: two parallel reviewers (loop.ts) now split budget.remainingUsd instead of
 // each getting it in full — but that split only matters if the per-stage floor
