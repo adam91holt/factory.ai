@@ -12,6 +12,7 @@ import { postStageComment, markNeedsHuman } from "./loop.ts";
 import { globsOverlap } from "./dag.ts";
 import { bus, toStageMeta, type AgentStreamEvent } from "./events.ts";
 import { projectOwningRepo } from "./db.ts";
+import { projectModelOverrides } from "./project-config.ts";
 
 // PLAN stage (plan v1.1, promoted 2026-07-20 by owner decision): Factory-Epic
 // tickets route here instead of the implementer pipeline.
@@ -233,6 +234,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     return;
   }
   bus.emit({ type: "run_started", issueKey: issue.identifier, title: `[plan] ${issue.title}`, repo, dryRun: config.dryRun });
+  const { models: projModels, efforts: projEfforts } = await projectModelOverrides(repo);
   const deadline = Date.now() + config.caps.wallMinutesPerIssue * 60_000;
   const spec = untrusted(`# ${issue.title}\n\n${issue.description}`);
   const onEvent = forwardStage(issue.identifier, new Map<string, StagePin>([
@@ -260,7 +262,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
     const scout = await runStage("scout",
       renderPrompt("scout", { spec },
         `You are the research scout in a software factory's planning stage. Investigate everything needed to break the epic below into parallel implementation tickets: read the repo in the current directory (structure, stack, conventions, reference/ material if present), and use WebSearch/WebFetch for anything external the epic depends on. Return a dense research brief: what exists, what must be built, data sources/APIs with concrete endpoints or file paths, risks, and a suggested split into independent work areas.\n\n${spec}`),
-      { model: resolveModel("scout", epicMeta), effort: resolveEffort("scout", epicMeta, cardEffort("scout")), cwd: ws.dir, allowedTools: roleTools("scout", listRoutableCards()).tools, maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("scout", epicMeta, projModels), effort: resolveEffort("scout", epicMeta, cardEffort("scout"), projEfforts), cwd: ws.dir, allowedTools: roleTools("scout", listRoutableCards()).tools, maxTurns: config.caps.turnsImplementer, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(scout);
     await postStageComment(issue, scout);
     if (scout.error) throw new Error(`scout: ${scout.error}`);
@@ -281,7 +283,7 @@ export async function planIssue(issue: linear.Issue): Promise<void> {
           'OUTPUT PROTOCOL: write each child as a separate file children/<NN>-<slug>.md in your working directory (NN = 01, 02, ... in build order — a ## Depends-on edge always points to a lower NN). First line: "# <title>". Rest of file: the full description (the sections above). Write the files, then reply with just the list of filenames.',
           "", spec, "", untrusted(`SCOUT RESEARCH BRIEF:\n${scout.text}`),
         ].join("\n")),
-      { model: resolveModel("planner", epicMeta), effort: resolveEffort("planner", epicMeta, cardEffort("decomposer")), cwd: scratch, allowedTools: roleTools("decomposer", listRoutableCards()).tools, maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
+      { model: resolveModel("planner", epicMeta, projModels), effort: resolveEffort("planner", epicMeta, cardEffort("decomposer"), projEfforts), cwd: scratch, allowedTools: roleTools("decomposer", listRoutableCards()).tools, maxTurns: 16, budgetUsd: config.caps.budgetUsdPerIssue, deadlineMs: deadline, onEvent });
     stages.push(decomposer);
     await postStageComment(issue, decomposer);
     if (decomposer.error) throw new Error(`decomposer: ${decomposer.error}`);

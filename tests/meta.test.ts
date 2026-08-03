@@ -232,6 +232,43 @@ describe("resolveModel precedence (execution-profiles)", () => {
   });
 });
 
+// Per-project PG model overrides (Models page): a TRUSTED operator layer that
+// sits BETWEEN ticket meta and the env roster for non-gate stages, and can
+// never touch a cross-vendor gate stage.
+describe("resolveModel: per-project override layer", () => {
+  test("a project override routes a non-gate stage when meta is silent", () => {
+    expect(resolveModel("implementer", {}, { implementer: ROSTER_MODEL_2 })).toBe(ROSTER_MODEL_2);
+  });
+
+  test("ticket meta outranks the project override (meta > project > env)", () => {
+    const meta: FactoryMeta = { models: { implementer: ROSTER_MODEL } };
+    expect(resolveModel("implementer", meta, { implementer: ROSTER_MODEL_2 })).toBe(ROSTER_MODEL);
+  });
+
+  test("the project override outranks the env default", () => {
+    expect(resolveModel("scout", {}, { scout: ROSTER_MODEL_2 })).toBe(ROSTER_MODEL_2);
+    expect(resolveModel("scout", {})).toBe(config.models.scout);
+  });
+
+  test("a project override for a gate stage is IGNORED — gates stay on the boot-checked env roster", () => {
+    for (const stage of ["reviewerClaude", "reviewerCodex", "securityReviewer"] as const) {
+      const override = ROSTER_VALUES.find((m) => m !== config.models[stage]) ?? ROSTER_MODEL;
+      expect(resolveModel(stage, {}, { [stage]: override })).toBe(config.models[stage]);
+    }
+  });
+
+  test("an empty/undefined project map is a no-op — identical to today's resolution", () => {
+    expect(resolveModel("implementer", {}, {})).toBe(config.models.implementer);
+    expect(resolveModel("implementer", {})).toBe(config.models.implementer);
+  });
+
+  test("resolveModelForRisk: a project pin outranks the risk-tier adjustment, like a meta pin", () => {
+    // With no tier vars declared, resolveTierModel returns base anyway; the pin
+    // guard is what guarantees the project's choice survives even if tiers exist.
+    expect(resolveModelForRisk("fixer", {}, "critical", { fixer: ROSTER_MODEL_2 })).toBe(ROSTER_MODEL_2);
+  });
+});
+
 // The cross-vendor safety gates (reviewerClaude/reviewerCodex form the
 // adversarial review pair; securityReviewer is cross-vendor by design so a
 // Claude author is never the sole security judge of its own diff) must be

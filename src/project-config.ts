@@ -8,7 +8,7 @@ import {
   upsertProjectModel, deleteProjectModel, listProjectModels,
   upsertProjectGroundskeeper, listProjectGroundskeepers,
   insertPendingPolicy, getProjectPolicy, listProjectPolicies,
-  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo, listCatalogModels, listModelCatalogRows,
+  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo, listCatalogModels, listModelCatalogRows, projectOwningRepo,
   type ProjectModelRow, type ProjectRow,
 } from "./db.ts";
 
@@ -270,6 +270,29 @@ async function resolveProject(nameRaw: unknown): Promise<{ row: ProjectRow } | {
     row = await getProjectRowByName(name);
   }
   return row ? { row } : { error: bad(503, "project store unavailable") };
+}
+
+/** Per-project stage model/effort overrides for the repo being worked, resolved
+ *  and validated (roster ∪ catalog) — the map loop.ts/plan.ts/steward.ts pass
+ *  into resolveModel/resolveModelForRisk/resolveEffort. A repo not owned by an
+ *  active project, a closed store, or a project with no model rows all yield
+ *  empty maps: the routing then falls back to ticket meta > env roster exactly
+ *  as before this existed (additive-only). Gate-stage rows, if any, are still
+ *  ignored downstream (meta.ts GATE_STAGES) — belt to that suspenders. */
+export async function projectModelOverrides(repo: string): Promise<{ models: Record<string, string>; efforts: Record<string, string> }> {
+  const own = await projectOwningRepo(repo);
+  if (own.status !== "registered") return { models: {}, efforts: {} };
+  const row = await getProjectRowByName(own.project);
+  if (!row) return { models: {}, efforts: {} };
+  const [catalog, rawRows] = await Promise.all([listCatalogModels(), listProjectModels(row.id)]);
+  const rows = validateProjectModels(rawRows, config.models, catalog);
+  const models: Record<string, string> = {};
+  const efforts: Record<string, string> = {};
+  for (const r of rows) {
+    models[r.role] = r.model;
+    if (r.effort) efforts[r.role] = r.effort;
+  }
+  return { models, efforts };
 }
 
 /** GET /models — the Models area's payload: the PG model catalog (proxy-served

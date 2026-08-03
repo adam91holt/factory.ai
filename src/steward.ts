@@ -11,6 +11,7 @@ import { liftPreconditions } from "./precondition.ts";
 import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
 import { bus, toStageMeta } from "./events.ts";
 import { lastParkReasonForIssue } from "./db.ts";
+import { projectModelOverrides } from "./project-config.ts";
 
 // Steward (owner request 2026-07-20): when all children of a planned epic reach
 // terminal state, a Fable session reviews the whole outcome — PR mergeability
@@ -106,6 +107,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
   // meta can route the steward stage itself, same precedence as every other
   // stage now uses.
   const epicMeta = parseFactoryMeta(epic.description);
+  const { models: projModels, efforts: projEfforts } = await projectModelOverrides(repo);
   bus.emit({ type: "run_started", issueKey: epic.identifier, title: `[steward] ${epic.title}`, repo, dryRun: config.dryRun });
 
   const childReports = (await Promise.all(detail.children.map((c) =>
@@ -136,7 +138,7 @@ export async function stewardEpic(epic: linear.Issue): Promise<void> {
         "",
         untrusted(`CHILDREN STATUS + PRS:\n${childReports}`),
       ].join("\n")),
-    { model: resolveModel("steward", epicMeta), effort: resolveEffort("steward", epicMeta, cardEffort("steward")), cwd: scratch,
+    { model: resolveModel("steward", epicMeta, projModels), effort: resolveEffort("steward", epicMeta, cardEffort("steward"), projEfforts), cwd: scratch,
       // Agent routing: agents/steward.md's `tools:` selection over the
       // STEWARD_TOOLS ceiling. No specialist exists for this role (it is not
       // in SPECIALIST_ROLES), so this is tool resolution only — and it is

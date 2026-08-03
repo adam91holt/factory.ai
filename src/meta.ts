@@ -303,9 +303,18 @@ const GATE_STAGES: ReadonlySet<keyof typeof config.models> = new Set([
  * isKnownModel at parse time (meta.models / meta.model) or was set directly
  * by the operator (config.models). An unrecognized key in meta.models (one
  * that doesn't match any `stage` ever passed here) is simply never read. */
-export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta): string {
+export function resolveModel(stage: keyof typeof config.models, meta: FactoryMeta, projectModels?: Readonly<Record<string, string>>): string {
+  // GATE stages are ALWAYS the boot-checked env roster: the vendor-diversity
+  // assertion runs over config.models at load, so letting a per-project row
+  // swap a cross-vendor reviewer could silently collapse that independence
+  // without re-checking. Project overrides are therefore non-gate-only.
   if (GATE_STAGES.has(stage)) return config.models[stage];
-  return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? config.models[stage];
+  // Precedence: ticket meta (per-stage > "*" > legacy scalar) > per-project PG
+  // override > env default. Project models are a TRUSTED operator source (the
+  // audited /projects/model PG path, never ticket text) and are pre-validated
+  // (project-config.ts projectModelOverrides → validateProjectModels against
+  // roster ∪ catalog), so like config.models they need no re-validation here.
+  return meta.models?.[stage] ?? meta.models?.["*"] ?? meta.model ?? projectModels?.[stage] ?? config.models[stage];
 }
 
 /** Did the TICKET explicitly request a model for this stage (models: entry,
@@ -339,9 +348,12 @@ export function metaPinsModel(stage: keyof typeof config.models, meta: FactoryMe
  *  RISK_MODEL_TIERS never maps a gate stage below "standard", so it can only
  *  ever be a STRONGER one. `risk === undefined` (caller has no evidence yet)
  *  returns resolveModel verbatim — the additive path. */
-export function resolveModelForRisk(stage: RiskRoutedStage, meta: FactoryMeta, risk: RiskClass | undefined): string {
-  const base = resolveModel(stage, meta);
-  if (risk === undefined || metaPinsModel(stage, meta)) return base;
+export function resolveModelForRisk(stage: RiskRoutedStage, meta: FactoryMeta, risk: RiskClass | undefined, projectModels?: Readonly<Record<string, string>>): string {
+  const base = resolveModel(stage, meta, projectModels);
+  // An explicit per-project model pin is an operator decision (audited PG path)
+  // and, like a ticket pin, outranks the risk-tier adjustment — the risk router
+  // must not silently override a model a human chose for this project.
+  if (risk === undefined || metaPinsModel(stage, meta) || projectModels?.[stage] !== undefined) return base;
   return resolveTierModel(stage, risk, config.modelTiers, base);
 }
 
@@ -374,14 +386,19 @@ export function resolveModelForRisk(stage: RiskRoutedStage, meta: FactoryMeta, r
  * agents/reviewer-repo.md, agents/security-reviewer.md — so this pinning
  * path itself no longer downgrades the gate; it only stops a ticket from
  * reaching it.) */
-export function resolveEffort(stage: keyof typeof config.models, meta: FactoryMeta, cardEffort?: string): Effort | undefined {
+export function resolveEffort(stage: keyof typeof config.models, meta: FactoryMeta, cardEffort?: string, projectEfforts?: Readonly<Record<string, string>>): Effort | undefined {
   const trustedCardEffort = cardEffort && isKnownEffort(cardEffort) ? cardEffort : undefined;
   if (GATE_STAGES.has(stage)) return trustedCardEffort ?? config.defaultEffort;
   const metaMap = typeof meta.effort === "object" ? meta.effort : undefined;
   const metaScalar = typeof meta.effort === "string" ? meta.effort : undefined;
   const metaStageValue = metaMap?.[stage];
+  // Precedence mirrors resolveModel: meta (per-stage > scalar) > per-project PG
+  // effort > trusted card effort > config default. Project efforts are pre-
+  // validated to the effort allowlist on the write path (project-config.ts).
+  const projectEffort = projectEfforts?.[stage];
   return (metaStageValue && isKnownEffort(metaStageValue) ? metaStageValue : undefined)
     ?? (metaScalar && isKnownEffort(metaScalar) ? metaScalar : undefined)
+    ?? (projectEffort && isKnownEffort(projectEffort) ? projectEffort : undefined)
     ?? trustedCardEffort
     ?? config.defaultEffort;
 }
