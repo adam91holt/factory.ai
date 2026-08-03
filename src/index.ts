@@ -18,7 +18,7 @@ import { selectRunnable, deriveImplicitDeps, type Schedulable } from "./dag.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
-import { startEventStore, flushEvents, listAgentRegisterRows, listSkillRegisterRows } from "./db.ts";
+import { startEventStore, flushEvents, listAgentRegisterRows, listSkillRegisterRows, syncModelCatalog } from "./db.ts";
 import { importRegistersFromFiles } from "./register-io.ts";
 import { isDraining } from "./control.ts";
 import { startAlerts } from "./alerts.ts";
@@ -252,6 +252,28 @@ async function seedRegistersIfEmpty(): Promise<void> {
   }
 }
 
+/** Sync the model catalog from the proxy's /v1/models into Postgres — the
+ *  dashboard's per-project model PICK LIST (project-config.ts), refreshed every
+ *  boot. Best-effort and non-fatal: an unreachable proxy keeps the previous
+ *  catalog (syncModelCatalog no-ops on an empty list), and routing never
+ *  depends on this — the env roster stays the authority for defaults. */
+async function syncModelCatalogFromProxy(): Promise<void> {
+  if (!config.proxyAuthToken) return;
+  try {
+    const res = await fetch(`${config.proxyBaseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${config.proxyAuthToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`GET /v1/models -> HTTP ${res.status}`);
+    const body = (await res.json()) as { data?: Array<{ id?: string }> };
+    const models = (body.data ?? []).map((m) => m.id ?? "").filter(Boolean);
+    await syncModelCatalog(models);
+    console.log(`[models] catalog synced: ${models.length} model(s) from the proxy`);
+  } catch (error) {
+    console.error(`[models] catalog sync failed (previous catalog stays): ${error instanceof Error ? error.message : error}`);
+  }
+}
+
 async function main(): Promise<void> {
   if (config.serverOnly) {
     // Dashboard-only mode: serve mission control, never touch Linear. No
@@ -286,6 +308,7 @@ async function main(): Promise<void> {
   // (deliberate edits must not be silently overwritten at boot), and the
   // importer stays reachable for an operator refresh via register-io.ts.
   await seedRegistersIfEmpty();
+  await syncModelCatalogFromProxy();
   // Self-heal orphaned claims from a prior process (restart mid-run) before we
   // start ticking, so in-flight tickets resume instead of stranding In-Progress.
   const recovered = await recoverOrphanedClaims().catch(() => [] as string[]);

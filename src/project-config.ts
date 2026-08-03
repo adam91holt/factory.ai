@@ -8,7 +8,7 @@ import {
   upsertProjectModel, deleteProjectModel, listProjectModels,
   upsertProjectGroundskeeper, listProjectGroundskeepers,
   insertPendingPolicy, getProjectPolicy, listProjectPolicies,
-  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo,
+  approveProjectPolicy, rejectProjectPolicy, listProjectAudit, getLadderState, activeMergePolicyForRepo, listCatalogModels,
   type ProjectModelRow, type ProjectRow,
 } from "./db.ts";
 
@@ -99,12 +99,15 @@ export function validatePolicyValue(key: string, value: unknown): { ok: true; va
   }
 }
 
-/** Drop model rows that no longer resolve against config.models — the meta.ts
+/** Drop model rows that no longer resolve against the vetted set — the meta.ts
  *  isKnownModel discipline applied on READ, so a stale row can never hand an
- *  unvetted model id to the SDK. Unknown efforts degrade to null (the SDK
- *  default), not a rejection of the whole row. Pure; exported for tests. */
-export function validateProjectModels(rows: ProjectModelRow[], roster: Record<string, string> = config.models): ProjectModelRow[] {
-  const knownModels = new Set(Object.values(roster));
+ *  unvetted model id to the SDK. The vetted set is the env roster's values
+ *  PLUS the PG model catalog (ids the proxy itself serves — factory-controlled
+ *  via docker/cliproxy config, never ticket-reachable). Unknown efforts degrade
+ *  to null (the SDK default), not a rejection of the whole row. Pure; exported
+ *  for tests. */
+export function validateProjectModels(rows: ProjectModelRow[], roster: Record<string, string> = config.models, catalog: readonly string[] = []): ProjectModelRow[] {
+  const knownModels = new Set([...Object.values(roster), ...catalog]);
   const knownRoles = new Set(Object.keys(roster));
   const out: ProjectModelRow[] = [];
   for (const r of rows) {
@@ -113,7 +116,7 @@ export function validateProjectModels(rows: ProjectModelRow[], roster: Record<st
       continue;
     }
     if (!knownModels.has(r.model)) {
-      console.warn(`[projects] dropping model config for role "${r.role}": unknown model "${r.model}" (not in config.models)`);
+      console.warn(`[projects] dropping model config for role "${r.role}": unknown model "${r.model}" (not in the env roster or the model catalog)`);
       continue;
     }
     out.push(r.effort !== null && !EFFORT_VALUES.has(r.effort) ? { ...r, effort: null } : r);
@@ -187,10 +190,12 @@ async function repoLadder(repos: string[]): Promise<ProjectView["ladder"]> {
   }));
 }
 
-function rosterView(): ProjectsPayload["roster"] {
+/** Dropdown allowlist: env roster ∪ PG model catalog. `catalog` is passed in
+ *  by projectsView (one read per payload, not per row). */
+function rosterView(catalog: readonly string[] = []): ProjectsPayload["roster"] {
   return {
     roles: Object.keys(config.models),
-    models: [...new Set(Object.values(config.models))].sort(),
+    models: [...new Set([...Object.values(config.models), ...catalog])].sort(),
   };
 }
 
@@ -198,8 +203,9 @@ export async function projectsView(): Promise<ProjectsPayload> {
   await syncProjectsFromCards();
   const cards = new Map(loadProjects().map((c) => [c.name, c]));
   const rows = await listProjectRows();
+  const catalog = await listCatalogModels();
   const shared = {
-    roster: rosterView(),
+    roster: rosterView(catalog),
     groundskeepersEnabled: config.groundskeepersEnabled,
     drain: drainInfo(),
   };
@@ -232,7 +238,7 @@ export async function projectsView(): Promise<ProjectsPayload> {
       createdAt: row.createdAt, updatedAt: row.updatedAt,
       repos, ladder: await repoLadder(repos), card,
       effective: card ? applyPolicyOverlay(card, activeOverlay) : null,
-      models: validateProjectModels(models),
+      models: validateProjectModels(models, config.models, catalog),
       groundskeepers,
       policies: policies.map((p) => ({ id: p.id, key: p.key, value: p.value, state: p.state, approvedBy: p.approvedBy, approvedAt: p.approvedAt, createdAt: p.createdAt })),
       audit: audit.map((a) => ({ id: a.id, field: a.field, oldValue: a.oldValue, newValue: a.newValue, actor: a.actor, at: a.at })),
@@ -333,7 +339,12 @@ export async function setProjectModel(body: unknown): Promise<HandlerResult> {
     return { status: 200, json: { ok: true, name: resolved.row.name, role, cleared: deleted } };
   }
   const model = typeof b.model === "string" ? b.model : "";
-  if (!new Set(Object.values(config.models)).has(model)) return bad(400, "model is not in config.models — the dropdown roster is the allowlist, never free text");
+  // Allowlist = env roster ∪ PG model catalog (proxy-served ids synced at boot).
+  // Still never free text: an id neither the env nor the proxy vouches for is
+  // refused at the door, same as before the catalog existed.
+  if (!new Set([...Object.values(config.models), ...(await listCatalogModels())]).has(model)) {
+    return bad(400, "model is not in the env roster or the model catalog — the dropdown roster is the allowlist, never free text");
+  }
   let effort: string | null = null;
   if (b.effort !== undefined && b.effort !== null) {
     if (typeof b.effort !== "string" || !EFFORT_VALUES.has(b.effort)) return bad(400, "effort must be one of low | medium | high | xhigh | max");

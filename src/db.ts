@@ -266,6 +266,19 @@ const DDL: string[] = [
   `CREATE OR REPLACE TRIGGER trg_project_config_audit_guard
      BEFORE UPDATE OR DELETE ON project_config_audit
      FOR EACH ROW EXECUTE FUNCTION project_config_audit_guard()`,
+  // Model catalog: every model id the proxy currently serves (GET /v1/models),
+  // synced at daemon boot. This is the PICK LIST for per-project model config —
+  // rosterView and the /projects/model allowlist read it — NOT a routing
+  // authority: the env roster (config.models) keeps its role as the default,
+  // and ticket text still can't reach any of it (meta.ts isKnownModel is
+  // deliberately NOT widened to the catalog). available=false rows are kept
+  // for history when a model disappears from the proxy.
+  `CREATE TABLE IF NOT EXISTS model_catalog (
+    model TEXT PRIMARY KEY,
+    source TEXT NOT NULL DEFAULT 'proxy',
+    available BOOLEAN NOT NULL DEFAULT TRUE,
+    first_seen BIGINT NOT NULL,
+    last_seen BIGINT NOT NULL)`,
   // ---------------------------------------------------------------------------
   // Issue #16 WP1: agent + skill REGISTERS — versioned prompt/skill content in
   // Postgres, consulted PG-first by catalog.ts with the files as seed/fallback.
@@ -2115,6 +2128,34 @@ export async function activePoliciesByProjectName(): Promise<Array<{ name: strin
   });
 }
 
+/** Replace the model catalog with what the proxy serves right now: listed
+ *  models are upserted available=true, previously-seen models NOT in the list
+ *  flip available=false (kept for history, dropped from pick lists). A closed
+ *  store or empty list is a no-op — an unreachable proxy at boot must not
+ *  blank the catalog the dashboard is using. */
+export async function syncModelCatalog(models: string[], source = "proxy"): Promise<void> {
+  if (!store || models.length === 0) return;
+  const now = Date.now();
+  const unique = [...new Set(models.filter((m) => typeof m === "string" && m !== ""))];
+  for (const model of unique) {
+    await store.exec(
+      `INSERT INTO model_catalog (model, source, available, first_seen, last_seen) VALUES ($1, $2, TRUE, $3, $3)
+       ON CONFLICT (model) DO UPDATE SET available = TRUE, last_seen = EXCLUDED.last_seen, source = EXCLUDED.source`,
+      [model, source, now]);
+  }
+  await store.exec(
+    "UPDATE model_catalog SET available = FALSE WHERE source = $1 AND last_seen < $2",
+    [source, now]);
+}
+
+/** The currently-available catalog model ids (the dashboard pick list). */
+export async function listCatalogModels(): Promise<string[]> {
+  if (!store) return [];
+  const rows = await store.query<{ model: string }>(
+    "SELECT model FROM model_catalog WHERE available ORDER BY model");
+  return rows.map((r) => r.model);
+}
+
 /** The ACTIVE human-approved merge policy governing `repo` (via its owning
  *  active project), for effectiveMergeTier's policyMerge leg. Absence, a closed
  *  store, a malformed value, or a query failure all degrade to null — which the
@@ -2646,7 +2687,7 @@ export { num as coerceNumeric };
 
 let testEngine: Store | null = null;
 
-const TEST_TABLES ="events, stage_transcript, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit, agent_register, skill_register, jsonb_migration_quarantine";
+const TEST_TABLES ="events, stage_transcript, stage_sessions, lessons, merge_ladder, merge_shadow_log, deploys, approvals, pushback_feedback, projects, project_repos, project_models, project_groundskeepers, project_policy, project_config_audit, agent_register, skill_register, jsonb_migration_quarantine, model_catalog";
 
 export interface TestStoreOptions {
   /** Also wire the write-behind queue to the event bus, exactly as
