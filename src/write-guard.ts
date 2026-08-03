@@ -36,12 +36,40 @@ import { writeGuardVerdict } from "./repos.ts";
 //  - The guarded-path policy is checked FIRST and always wins — scope can
 //    only take away access scope would otherwise grant, never restore access
 //    the guarded-path policy denies.
+//
+// KNOWN LIMITATION: this hook, like the pre-existing guarded-path hook it is
+// modeled on, only fires for the Write/Edit/NotebookEdit tool matcher below —
+// a fixer round's Bash access (bun/node/npm/git etc.) is not intercepted, so
+// a fixer could in principle mutate a file outside scope via Bash instead of
+// Edit. The guarded-path policy tolerates the same gap because it has a
+// delivery-time backstop (classifyStatusPaths re-checks the final diff); the
+// write-SCOPE added by ticket #7 has no equivalent backstop today. Closing
+// that gap needs a genuine second enforcement layer (e.g. a post-stage diff
+// check against the computed scope) — out of scope for this ticket, which is
+// about prompt construction and PreToolUse scoping, not a full mutation-
+// boundary system. Recorded here rather than silently left implicit.
 
-/** Strip a leading "./" so "./src/a.ts" and "src/a.ts" compare equal — the
- *  set-merge below must not let a cosmetic path difference cause a false
- *  deny (a genuinely scoped file rejected because of formatting alone). */
+/** Normalize a candidate/scope path so cosmetic and origin differences never
+ *  cause a false deny: strips a leading "./", a git-diff "a/"/"b/" prefix,
+ *  and any leading "/" (an absolute-looking path, e.g. one a reviewer might
+ *  copy verbatim from a ticket's own Area listing). */
 function normalizeScopePath(p: string): string {
-  return p.startsWith("./") ? p.slice(2) : p;
+  return p.replace(/^\.\//, "").replace(/^[ab]\//, "").replace(/^\/+/, "");
+}
+
+/** Path-boundary match: exact after normalization, or one path is a "/"-
+ *  bounded suffix of the other. Suffix matching (rather than requiring an
+ *  exact relative-path match) lets a finding's `file` be recognized even
+ *  when it arrived as a full absolute path or with different leading
+ *  segments than this worktree's own relative path — without ever matching
+ *  an unrelated file that merely shares a trailing filename fragment. */
+function scopeContains(scope: ReadonlySet<string>, relPath: string): boolean {
+  const norm = normalizeScopePath(relPath);
+  if (scope.has(norm)) return true;
+  for (const entry of scope) {
+    if (norm === entry || norm.endsWith(`/${entry}`) || entry.endsWith(`/${norm}`)) return true;
+  }
+  return false;
 }
 
 /** Pure set-merge: the fixer/design-fixer's writable set for one round is
@@ -59,15 +87,19 @@ export function buildFixerWritableScope(
   return scope;
 }
 
-/** Pure scope check for one candidate write. `scope === undefined` means no
- *  scoping is configured at all (every stage except a scoped fixer/design-
- *  fixer round) — always writable, identical to pre-ticket-#7 behavior. A
- *  file that does not yet exist is always writable regardless of scope: scope
- *  narrows what may be RE-WRITTEN, never blocks a genuinely new addition. */
+/** Pure scope check for one candidate write. `scope === undefined` OR an
+ *  EMPTY scope both mean "no usable scoping information" — always writable,
+ *  identical to pre-ticket-#7 behavior. An empty scope is not "nothing is
+ *  writable": it means the implementer touched nothing and no finding named
+ *  a file (e.g. the diff was unavailable), so there is nothing trustworthy to
+ *  restrict to — the guard's documented shape is fail-OPEN, never a silent
+ *  full lockout manufactured from an absence of information. A file that
+ *  does not yet exist is always writable regardless of scope: scope narrows
+ *  what may be RE-WRITTEN, never blocks a genuinely new addition. */
 export function withinFixerWriteScope(relPath: string, fileExists: boolean, scope: ReadonlySet<string> | undefined): boolean {
-  if (scope === undefined) return true;
+  if (scope === undefined || scope.size === 0) return true;
   if (!fileExists) return true;
-  return scope.has(normalizeScopePath(relPath));
+  return scopeContains(scope, relPath);
 }
 
 export interface WriteGuardOptions {
