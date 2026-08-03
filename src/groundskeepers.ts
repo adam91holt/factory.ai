@@ -505,11 +505,17 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     }
   }
 
-  // Read tools ∩ card list, PLUS Write SCOPED to the scratch dir (`//` = absolute
-  // path in permission-rule syntax). A bare "Write" under dontAsk would let a
-  // prompt-injected run rewrite groundskeepers/*.md (self-arming), the state
-  // file, or factory src — output files only, no Bash ever.
-  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), `Write(/${outDir}/**)`])];
+  // Read tools ∩ card list, PLUS Write SCOPED to the scratch dir. outDir is
+  // ALREADY an absolute path (join(config.workRoot, ...)), so the rule is
+  // `Write(<abs>/**)` — a SINGLE leading slash. (Live-found 2026-08-03: the old
+  // `Write(/${outDir}/**)` produced a DOUBLE slash `//home/...` that the SDK's
+  // dontAsk matcher never matched, so every groundskeeper Write was denied and
+  // no card could ever file a ticket — the first real groundskeeper run
+  // surfaced it; the factory's own card ships disabled so it was never
+  // exercised.) A bare "Write" under dontAsk would let a prompt-injected run
+  // rewrite groundskeepers/*.md (self-arming), the state file, or factory src —
+  // output files only, no Bash ever.
+  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), `Write(${outDir}/**)`])];
 
   const tel = await getTelemetry();
   const telSummary = [
