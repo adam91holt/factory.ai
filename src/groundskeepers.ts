@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import * as linear from "./linear.ts";
-import { ensureWorkspace, resetWorkspaceToBase } from "./repos.ts";
+import { ensureWorkspace, resetWorkspaceToBase, repoFromTicket } from "./repos.ts";
 import { isEligible } from "./loop.ts";
 import { runStage, untrusted, redactSecrets } from "./agents.ts";
 import { withFactoryMeta } from "./meta.ts";
@@ -476,6 +476,25 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   if (attention.size > 5) {
     console.log(`[gk:${card.name}] attention pile ${attention.size} > 5 — skipping`);
     return false;
+  }
+
+  // (c2) SERIAL PER REPO — never file NEW work for this card's repo while a
+  // ticket for it is already IN FLIGHT (Todo / In-Progress / In-Review). The
+  // card cadence (e.g. */15) is faster than a build, so without this the
+  // groundskeeper re-files similar work before the last finishes — producing
+  // DUPLICATES, not just conflicts (live-found 2026-08-03: FAC-84 and FAC-85
+  // were the same detail panel, a wasted opus build). Scoped to the card's own
+  // repo (via the ticket meta `repo:`) so a multi-repo team's other work never
+  // blocks this card. One-in-flight-per-repo makes the card truly serial.
+  const myRepo = card.repos[0] ?? "";
+  if (myRepo) {
+    const executing = await linear.fetchByLabel(linear.EXECUTING_LABEL, [card.team]).catch(() => [] as linear.Issue[]);
+    const inFlight = [...queue, ...inReview, ...executing.filter(open)]
+      .filter((i) => repoFromTicket(i.description) === myRepo);
+    if (inFlight.length > 0) {
+      console.log(`[gk:${card.name}] ${inFlight.length} ticket(s) already in flight for ${myRepo} (${[...new Set(inFlight.map((i) => i.identifier))].join(", ")}) — serial, skipping`);
+      return false;
+    }
   }
 
   // (d) Parks-spike — a struggling factory files repair tickets, not ambitions.
