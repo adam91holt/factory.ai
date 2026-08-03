@@ -5,15 +5,30 @@
 // freshness) into WORLD freshness (PR state, path/text existence) — the fix for
 // the FAC-20 incident (grinding on an already-merged/closed PR).
 //
-// SEMANTICS: falsity of a precondition ALWAYS means "work no longer needed"
-// (moot), NEVER "wait" — the wait-for-a-dependency case is Gap 1's depends_on,
-// deliberately NOT modeled here. So a precondition can only ever STOP work
-// (cancel/park), never GRANT authority — the same trust rule meta.ts gives the
-// `merge` field ("may only withhold"). Preconditions ride the trusted, START-
-// ANCHORED factory metadata block (meta.ts), so an injected one in prose is
-// ignored (not start-anchored) and a steward-lifted one must pass the
+// SEMANTICS: falsity of a SELF-CANCEL-kind precondition ALWAYS means "work no
+// longer needed" (moot), NEVER "wait" — the wait-for-a-dependency case is
+// Gap 1's depends_on, deliberately not modeled by evaluateOne/decideFreshness
+// below. So a self-cancel precondition can only ever STOP work (cancel/park),
+// never GRANT authority — the same trust rule meta.ts gives the `merge` field
+// ("may only withhold"). Preconditions ride the trusted, START-ANCHORED
+// factory metadata block (meta.ts), so an injected one in prose is ignored
+// (not start-anchored) and a steward-lifted one must pass the
 // parsePrecondition allowlist — worst case a low-severity DoS-cancel of one
 // reversible ticket, never an escalation.
+//
+// EXCEPTION (FAC-75): `pr-merged` is the one deliberate WAIT-kind precondition
+// — a steward follow-up whose work only makes sense AFTER a specific PR lands
+// must not start while it's still open (FAC-74: a "verify main is green after
+// PR #6 lands" follow-up raced #6's merge by two hours and faithfully rebuilt
+// ~1650 lines of it). It intentionally lives OUTSIDE the self-cancel-only
+// contract above: `decidePendingMerge`/`checkPendingMerge` are its own
+// combinator, evaluated PRE-CLAIM (index.ts, alongside depends_on) so holding
+// costs nothing (no workspace, no label, automatic re-check next tick) —
+// never routed through decideFreshness's proceed/cancel/park action space,
+// whose "park" would wrongly require a human to clear a plain "not yet".
+// evaluateOne still carries a `pr-merged` case for TypeScript exhaustiveness
+// and as a defence-in-depth fallback (see its comment) — never the primary
+// mechanism.
 //
 // This module is pure given its injected probes (mirrors steward.ghPr + repos.ts
 // git()): the combinator/policy (decideFreshness) is the primary unit-test
@@ -28,6 +43,7 @@ import { parseFactoryMeta } from "./meta.ts";
 export type PreconditionKind =
   | "undelivered"   // <branch>  implicit, loop-synthesized: holds if no PR yet OR PR open; moot only if MERGED/CLOSED
   | "pr-open"       // <org/repo#N | #N | url>  holds if OPEN; moot if MERGED/CLOSED
+  | "pr-merged"      // <org/repo#N | #N | url>  WAIT-kind (see header EXCEPTION): hold while OPEN/UNKNOWN, run once MERGED, cancel if CLOSED unmerged
   | "path-missing"  // <relpath>  holds if absent; moot if present
   | "path-exists"   // <relpath>  holds if present; moot if absent
   | "text-present"  // <relpath>::<needle>  holds if file has needle; moot if gone (already fixed)
@@ -36,7 +52,7 @@ export type PreconditionKind =
 export interface Precondition { kind: PreconditionKind; arg: string; raw: string; }
 
 const KNOWN_KINDS: readonly PreconditionKind[] = [
-  "undelivered", "pr-open", "path-missing", "path-exists", "text-present", "text-absent",
+  "undelivered", "pr-open", "pr-merged", "path-missing", "path-exists", "text-present", "text-absent",
 ];
 
 // Cap on how many preconditions a single ticket may carry — injected junk in an
@@ -46,6 +62,11 @@ const MAX_PRECONDITIONS = 16;
 // A PR reference embeds a number: "org/repo#N", "#N", "N", or a URL.
 const PR_FULL = /^[\w.-]+\/[\w.-]+#\d+$/;
 const PR_SHORT = /^#?\d+$/;
+
+/** Shared arg validator for the two PR-referencing kinds (`pr-open`, `pr-merged`). */
+function isPrRefArg(arg: string): boolean {
+  return /^https?:\/\/\S+$/.test(arg) || PR_FULL.test(arg) || PR_SHORT.test(arg);
+}
 
 /** A safe RELATIVE worktree path: not absolute, no `..` traversal, non-empty. A
  * malformed/escaping path is DROPPED (returns false) so an injected precondition
@@ -78,8 +99,8 @@ export function parsePrecondition(raw: string): Precondition | null {
       // "undelivered factory/<key>".
       return { kind, arg, raw: trimmed };
     case "pr-open":
-      if (/^https?:\/\/\S+$/.test(arg) || PR_FULL.test(arg) || PR_SHORT.test(arg)) return { kind, arg, raw: trimmed };
-      return null;
+    case "pr-merged":
+      return isPrRefArg(arg) ? { kind, arg, raw: trimmed } : null;
     case "path-missing":
     case "path-exists":
       return isSafeRelPath(arg) ? { kind, arg, raw: trimmed } : null;
@@ -180,6 +201,20 @@ export function evaluateOne(
       if (state === "MERGED" || state === "CLOSED") return { status: "moot", reason: `${tag}: PR is ${state}` };
       return { status: "unknown", reason: `${tag}: PR state UNKNOWN (gh unavailable / not found)` };
     }
+    case "pr-merged": {
+      // Defence-in-depth only — the PRIMARY gate for this kind is
+      // decidePendingMerge/checkPendingMerge below, evaluated PRE-CLAIM
+      // (index.ts) so a ticket never even reaches this post-claim self-cancel
+      // check while its PR is still open. If it somehow does anyway (a race
+      // the pre-claim gate should make unreachable in practice), fail toward
+      // the safe "unknown" -> park path rather than ever proceeding on a
+      // stale premise or silently cancelling live work.
+      const { ref, repo } = prTarget(p.arg, ctx.repo);
+      const state = probes.prState(ref, repo);
+      if (state === "MERGED") return { status: "hold", reason: `${tag}: PR is MERGED — safe to proceed` };
+      if (state === "CLOSED") return { status: "moot", reason: `${tag}: PR CLOSED without merging — premise no longer holds` };
+      return { status: "unknown", reason: `${tag}: PR still ${state} — should have been held pre-claim` };
+    }
     case "path-missing": {
       if (!ctx.worktreeDir) return { status: "unknown", reason: `${tag}: no worktree to check` };
       const present = probes.pathExists(ctx.worktreeDir, p.arg);
@@ -261,9 +296,123 @@ export async function checkFreshness(
   issueKey: string, description: string, ctx: PreconditionContext, probes: PreconditionProbes = defaultProbes,
 ): Promise<{ action: FreshnessAction; reason: string }> {
   const implicit = parsePrecondition(`undelivered factory/${issueKey.toLowerCase()}`)!;
-  const all = [implicit, ...parsePreconditions(description)];
+  // `pr-merged` is EXCLUDED here on purpose (repair, FAC-75 review round 1): the
+  // header EXCEPTION says this kind never routes through decideFreshness's
+  // proceed/cancel/park space, because its "park" would turn a plain "not yet"
+  // (PR still OPEN, or a transient gh UNKNOWN between the pre-claim gate and
+  // this check) into a human-blocking state — exactly the fail-safe direction
+  // Outcome #2 forbids. The pre-claim gate (decidePendingMerge/checkPendingMerge,
+  // index.ts) is the ONLY place `pr-merged` can hold/cancel; once a ticket has
+  // passed it, MERGED is a terminal PR state (a PR cannot un-merge back to
+  // CLOSED), so there is no legitimate post-claim cancellation left to detect —
+  // dropping it here costs nothing and removes the unreachable-in-theory,
+  // reachable-in-practice park path a gh hiccup could trigger.
+  const authored = parsePreconditions(description).filter((p) => p.kind !== "pr-merged");
+  const all = [implicit, ...authored];
   const evaluated = all.map((p) => ({ p, ...evaluateOne(p, ctx, probes) }));
   return decideFreshness(evaluated);
+}
+
+// ---------------------------------------------------------------------------
+// `pr-merged` scheduling gate (FAC-75) — the WAIT-kind exception documented in
+// the header comment. A SEPARATE combinator from decideFreshness on purpose:
+// its action space (proceed / hold / cancel) has no "park", because "hold"
+// here means "not yet — stay queued, re-check next tick" and must never
+// require a human to clear it (unlike decideFreshness's park). Called
+// PRE-CLAIM, before a workspace is ever built, so holding is free.
+// ---------------------------------------------------------------------------
+
+export type MergeGateAction = "proceed" | "hold" | "cancel";
+
+/** Pure combinator (the primary unit-test target, mirrors decideFreshness).
+ * Only `pr-merged` preconditions participate; every other kind is ignored
+ * here (it is decideFreshness's business, not this gate's).
+ *
+ *   any referenced PR CLOSED (unmerged) -> cancel: the premise this follow-up
+ *     was filed under can never be satisfied now — reuses the same terminal
+ *     self-cancel path (resolveStale) every other precondition kind uses.
+ *   else any PR OPEN, or its state UNKNOWN            -> hold: fail-safe in
+ *     the same direction — an unreadable PR state must never be read as
+ *     "merged, go ahead" any more than an OPEN one should be.
+ *   else (no `pr-merged` declared, or every one MERGED) -> proceed. */
+export function decidePendingMerge(
+  evaluated: Array<{ p: Precondition; state: PrState }>,
+): { action: MergeGateAction; reason: string } {
+  const gates = evaluated.filter((e) => e.p.kind === "pr-merged");
+  if (gates.length === 0) return { action: "proceed", reason: "no pr-merged gate declared" };
+  const closed = gates.find((e) => e.state === "CLOSED");
+  if (closed) return { action: "cancel", reason: `pr-merged ${closed.p.arg}: PR CLOSED without merging — premise no longer holds` };
+  const notMerged = gates.find((e) => e.state !== "MERGED");
+  if (notMerged) {
+    return { action: "hold", reason: `pr-merged ${notMerged.p.arg}: PR ${notMerged.state === "OPEN" ? "still OPEN" : "state UNKNOWN"} — waiting for merge` };
+  }
+  return { action: "proceed", reason: "every pr-merged gate is satisfied (PR(s) MERGED)" };
+}
+
+/** Convenience the tick loop calls PRE-CLAIM (index.ts, alongside depends_on):
+ * reads only the ticket's `pr-merged` preconditions (every other kind is
+ * untouched — decideFreshness still owns those, post-claim, unchanged) and
+ * resolves each against `gh`. Async so it slots in beside the existing
+ * depends_on Linear-state fetch. */
+export async function checkPendingMerge(
+  description: string, ctx: PreconditionContext, probes: PreconditionProbes = defaultProbes,
+): Promise<{ action: MergeGateAction; reason: string }> {
+  const gates = parsePreconditions(description).filter((p) => p.kind === "pr-merged");
+  const evaluated = gates.map((p) => {
+    const { ref, repo } = prTarget(p.arg, ctx.repo);
+    return { p, state: probes.prState(ref, repo) };
+  });
+  return decidePendingMerge(evaluated);
+}
+
+/** Minimal shape the scheduling wiring (index.ts) needs from a queue issue —
+ * kept narrow so this stays testable with plain fixture objects, no linear.ts
+ * Issue import here. */
+export interface MergeGateIssue { identifier: string; description: string; }
+
+/** Result of applying the pre-claim `pr-merged` gate to a batch of candidates.
+ *  `schedulable` is EVERY candidate minus the cancelled ones — including held
+ *  ones — so DAG derivation and the file mutex (dag.ts, index.ts) still see a
+ *  held ticket's `touches`/position and order/serialize real siblings around
+ *  it correctly; the caller is responsible for excluding `heldIds` from the
+ *  final CLAIM batch (after selectRunnable), not from scheduling itself.
+ *  Repair (FAC-75 review round 1, high #1 dag.ts/index.ts): dropping a held
+ *  candidate out of the schedulable set entirely — the pre-repair behavior —
+ *  made it invisible to deriveImplicitDeps, so a later sibling with
+ *  overlapping `touches` could jump ahead of it with no ordering edge. */
+export interface MergeGatePartition<T extends MergeGateIssue> {
+  schedulable: T[];
+  heldIds: Set<string>;
+  cancelled: Array<{ issue: T; reason: string }>;
+}
+
+/** Apply the `pr-merged` pre-claim gate to a batch of already-eligible,
+ * NOT-in-flight candidates (the caller MUST exclude in-flight issues before
+ * calling this — an issue whose run is currently executing must never be
+ * re-probed or resolved here; see index.ts's FAC-75 repair note). Extracted
+ * from index.ts's tick() so the scheduling wiring itself — not just the pure
+ * decidePendingMerge combinator — is unit-testable without mocking Linear/gh
+ * (repair, FAC-75 review round 1, medium #3: the pre-repair gate loop had
+ * zero coverage at this level, which is exactly where the in-flight defect
+ * lived). Pure given injected `probes`; async because checkPendingMerge is. */
+export async function applyMergeGate<T extends MergeGateIssue>(
+  issues: T[],
+  repoOf: (issue: T) => string,
+  probes: PreconditionProbes = defaultProbes,
+): Promise<MergeGatePartition<T>> {
+  const schedulable: T[] = [];
+  const heldIds = new Set<string>();
+  const cancelled: Array<{ issue: T; reason: string }> = [];
+  for (const issue of issues) {
+    const gate = await checkPendingMerge(issue.description, { repo: repoOf(issue) }, probes).catch((error) => ({
+      action: "hold" as const,
+      reason: `pr-merged gate check errored — holding (fail-safe): ${error instanceof Error ? error.message : error}`,
+    }));
+    if (gate.action === "cancel") { cancelled.push({ issue, reason: gate.reason }); continue; }
+    schedulable.push(issue);
+    if (gate.action === "hold") heldIds.add(issue.identifier);
+  }
+  return { schedulable, heldIds, cancelled };
 }
 
 /** Lift model-authored preconditions (a "## Precondition" section, or inline
@@ -288,9 +437,26 @@ export function liftPreconditions(followupBody: string): string[] {
       if (body) candidates.push(body);
     }
   }
+  // A model echoing this module's own vocabulary docs (agents/steward.md
+  // wraps every DSL example in a code span, e.g. `pr-merged acme/w#6`) is a
+  // very plausible steward output shape. Left unstripped, the leading/
+  // trailing backtick makes the KIND token unrecognizable ("`pr-merged" is
+  // not a known kind), so parsePrecondition silently drops the WHOLE line —
+  // for a self-cancel kind that's a minor missed DoS-immunity (module header),
+  // but for `pr-merged` it defeats the very gate this ticket adds: the
+  // follow-up is stamped with NO precondition at all and proceeds immediately,
+  // recreating the FAC-74 race (repair, FAC-75 review round 1, high). Strip
+  // ONE matched pair of surrounding backticks (a single code span around the
+  // whole line) before parsing; anything else malformed still drops, same as
+  // before.
+  const stripCodeSpan = (s: string): string => {
+    const m = s.match(/^`([^`]+)`$/);
+    return m ? m[1]!.trim() : s;
+  };
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const c of candidates) {
+  for (const raw of candidates) {
+    const c = stripCodeSpan(raw);
     const p = parsePrecondition(c);
     if (!p) continue;
     const dsl = serialize(p);

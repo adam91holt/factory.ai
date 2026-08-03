@@ -2,8 +2,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
-import { fetchQueue, fetchStatesByIdentifiers, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
-import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
+import { fetchQueue, fetchStatesByIdentifiers, LinearRateLimited, recoverOrphanedClaims, stillUnclaimed } from "./linear.ts";
+import { processIssue, markNeedsHuman, isEligible, resolveStale } from "./loop.ts";
 import { repoFromTicket } from "./repos.ts";
 import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
@@ -15,6 +15,7 @@ import { bootstrapProject } from "./bootstrap.ts";
 import { EPIC_LABEL, INTAKE_LABEL, BOOTSTRAP_LABEL } from "./linear.ts";
 import { parseFactoryMeta, resolveTicketRoute } from "./meta.ts";
 import { selectRunnable, deriveImplicitDeps, type Schedulable } from "./dag.ts";
+import { applyMergeGate } from "./precondition.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
@@ -174,6 +175,77 @@ async function tick(): Promise<boolean> {
     return false;
   }
 
+  // `pr-merged` scheduling gate (FAC-75, precondition.ts): a steward follow-up
+  // whose work only makes sense AFTER a specific PR lands must not be claimed
+  // while that PR is still open — the FAC-74 shape (a "verify main is green
+  // after #6 lands" follow-up raced #6's merge by two hours and rebuilt
+  // ~1650 lines of it). Unlike depends_on (topological order among an epic's
+  // OWN children, below) and unlike every other precondition kind (self-
+  // cancel liveness premises, evaluated post-claim in loop.ts's freshness
+  // gate), `pr-merged` is checked HERE, pre-claim: holding costs nothing (no
+  // workspace, no label) and the ticket is simply re-checked next tick;
+  // "cancel" (its PR closed unmerged) resolves the ticket the same terminal
+  // way any other self-cancelled precondition does. Cheap for the common case
+  // — checkPendingMerge is a no-op (no gh call) for a ticket with no
+  // `pr-merged` precondition.
+  //
+  // Repair (FAC-75 review round 1):
+  //   high  — MUST exclude in-flight issues. `eligible` is not filtered by
+  //     inFlight, so probing/cancelling it here could resolveStale a ticket
+  //     whose run is CURRENTLY EXECUTING (its own gh re-probe going stale
+  //     mid-run, e.g. a revert): Done + skip-set + claim release out from
+  //     under a live worker. Gate only the non-in-flight slice.
+  //   high  — a HELD (still-OPEN-PR) candidate must stay VISIBLE to DAG
+  //     derivation/the file mutex below, not disappear from the schedulable
+  //     set — otherwise a later sibling whose `touches` overlap it loses its
+  //     implicit depends_on edge and can jump ahead while the held ticket is
+  //     still (eventually) going to run. applyMergeGate keeps held issues in
+  //     `schedulable`; only `heldIds` is excluded from the final claim batch,
+  //     after selectRunnable has already accounted for them.
+  //   low   — skipped entirely while draining: nothing gets claimed either
+  //     way (capacity 0 below), so there is no reason to spend gh calls (or
+  //     resolve tickets to Done) during a drain; the gate simply re-runs once
+  //     draining ends.
+  const gateable = eligible.filter((i) => !inFlight.has(i.identifier));
+  const gateResult = isDraining()
+    ? { schedulable: gateable, heldIds: new Set<string>(), cancelled: [] as Array<{ issue: (typeof gateable)[number]; reason: string }> }
+    : await applyMergeGate(gateable, (issue) => repoFromTicket(issue.description) ?? "" /* isEligible guarantees non-null */);
+  // Repair (FAC-75 review round 1, high): resolveStale here mutates an issue
+  // this tick fetched into `queue`/`eligible` — potentially seconds ago, and
+  // longer once the gh probe above is factored in — without ever having
+  // claimed it (unlike the post-claim freshness gate in loop.ts, which only
+  // runs after claim() has already fresh-verified+labeled the issue). A human
+  // manually starting or otherwise moving the ticket inside that window must
+  // not have the intervention silently overwritten by a decision made against
+  // stale data. stillUnclaimed re-reads immediately before mutating; anything
+  // other than a clean "still unstarted, still unclaimed" read — including a
+  // read failure — leaves the issue queued for next tick instead of resolving
+  // it (fail-safe: never guess, never overwrite).
+  for (const { issue, reason } of gateResult.cancelled) {
+    const repo = repoFromTicket(issue.description) ?? "";
+    const safe = await stillUnclaimed(issue).catch((error) => {
+      console.error(`[${issue.identifier}] pr-merged cancel guard check failed — leaving queued (fail-safe): ${error instanceof Error ? error.message : error}`);
+      return false;
+    });
+    if (!safe) { console.log(`[dag] ${issue.identifier} pr-merged gate: skipping cancel — issue state changed since fetch, leaving for next tick`); continue; }
+    console.log(`[dag] ${issue.identifier} pr-merged gate cancelling: ${reason}`);
+    // Repair (FAC-75 review round 2, medium — Review 1): resolveStale emits
+    // run_finished; without a paired run_started, an event consumer that
+    // tracks a per-issueKey run lifecycle (db.ts's "newest event that carries
+    // one" pairing, server.ts's dashboard) would see a finish with no start
+    // for this pre-claim cancellation. Emit the pair here, exactly as every
+    // post-claim path already does before its own resolveStale/park call.
+    bus.emit({ type: "run_started", issueKey: issue.identifier, title: issue.title, repo, dryRun: config.dryRun });
+    await resolveStale(issue, repo, [], reason).catch((error) => console.error(`[${issue.identifier}] pr-merged cancel failed: ${error instanceof Error ? error.message : error}`));
+  }
+  for (const id of gateResult.heldIds) console.log(`[dag] ${id} pr-merged gate holding — not yet claimable`);
+  const schedulableIssues = gateResult.schedulable;
+  if (schedulableIssues.length === 0) {
+    bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: 0 });
+    await runBackgroundPasses();
+    return false;
+  }
+
   // Rolling WIP semaphore (owner request): claim whenever capacity exists —
   // never barrier a fast issue behind a slow sibling's completion. Gap 1 layers
   // DAG scheduling on top: a candidate is claimed only when its declared
@@ -183,13 +255,18 @@ async function tick(): Promise<boolean> {
   // Draining → zero capacity: selectRunnable defers every candidate, so the
   // batch below is empty and nothing new gets claimed (B6/T5, control.ts).
   const capacity = isDraining() ? 0 : config.caps.wipLimit - inFlight.size;
-  const candidates = eligible
-    .filter((i) => !inFlight.has(i.identifier))
-    .map((issue) => {
-      const meta = parseFactoryMeta(issue.description);
-      const schedulable: Schedulable = { identifier: issue.identifier, dependsOn: meta.depends_on ?? [], touches: meta.touches ?? [] };
-      return { issue, schedulable };
-    });
+  // schedulableIssues already excludes in-flight (gateable, above) and
+  // cancelled (gateResult.cancelled) issues; a held one (heldIds) is DELIBERATELY
+  // still included here — see the gate comment above — so it keeps its place
+  // in deriveImplicitDeps (a later overlapping sibling still gets the implicit
+  // depends_on edge). It is EXCLUDED further down, before selectRunnable, so
+  // it never consumes a WIP slot — see that comment for why (repair, FAC-75
+  // review round 2, high).
+  const candidates = schedulableIssues.map((issue) => {
+    const meta = parseFactoryMeta(issue.description);
+    const schedulable: Schedulable = { identifier: issue.identifier, dependsOn: meta.depends_on ?? [], touches: meta.touches ?? [] };
+    return { issue, schedulable };
+  });
   // Implicit depends_on (issue #6 Part 2, dag.ts): when the decomposer gave
   // two queued siblings overlapping `touches` but omitted the edge between
   // them, derive the ordering (later ticket waits for the earlier one) instead
@@ -211,9 +288,36 @@ async function tick(): Promise<boolean> {
   const depIds = [...new Set(augmented.flatMap((c) => c.dependsOn))];
   const depTypes = depIds.length > 0 ? await fetchStatesByIdentifiers(depIds) : new Map<string, string>();
   const busyTouches = [...inFlight.values()];
-  const { run } = selectRunnable(augmented, (id) => depTypes.get(id), busyTouches, capacity);
+  // Repair (FAC-75 review round 2, high — both reviewers, independently):
+  // held ids MUST be excluded from what selectRunnable is asked to admit, not
+  // just from `batch` afterward. selectRunnable is capacity-bounded (see the
+  // draining comment above) and admits candidates FIFO into `run` up to
+  // `capacity` — a held candidate left in that list gets admitted first
+  // (occupying a slot that is then thrown away when `batch` drops it below),
+  // so with wipLimit=1 a single held ticket — or wipLimit=4 with four held
+  // FIFO-head tickets, the default — silently stalls EVERY unrelated
+  // candidate for the entire hold window (hours for an open PR; forever for
+  // an unresolvable ref). This is the exact bug the prior round's own
+  // "holding costs nothing" comment asserted did NOT exist.
+  //
+  // The held ticket's dependsOn EDGE (derived above, into `augmented`, from
+  // the FULL schedulableIssues set including held ones) must still exist so a
+  // later overlapping sibling waits on it — but the held ticket itself does
+  // not need a `run` slot to make that edge work: depTypes is a LIVE Linear
+  // state lookup keyed by identifier (fetchStatesByIdentifiers, above), not a
+  // lookup into `augmented`/`run` — a held ticket's real Linear state is
+  // still "unstarted" (never claimed), so selectRunnable correctly reports
+  // any dependent as `blocked` (not "completed"/"canceled") regardless of
+  // whether the held ticket itself is in the list passed to it.
+  const runnable = augmented.filter((c) => !gateResult.heldIds.has(c.identifier));
+  const { run } = selectRunnable(runnable, (id) => depTypes.get(id), busyTouches, capacity);
   const runSet = new Set(run);
-  const batch = candidates.filter((c) => runSet.has(c.schedulable.identifier));
+  // Held ids can no longer appear in `run` at all (they were excluded from
+  // `runnable` above, before selectRunnable ever saw them) — the extra
+  // `!gateResult.heldIds.has(...)` here is now belt-and-braces, not the
+  // primary defense: even if a future edit fed the wrong list into
+  // selectRunnable, a held ticket still could not slip into the claim batch.
+  const batch = candidates.filter((c) => runSet.has(c.schedulable.identifier) && !gateResult.heldIds.has(c.schedulable.identifier));
   if (batch.length > 0) console.log(`[tick] claiming ${batch.length} (in-flight ${inFlight.size}/${config.caps.wipLimit})`);
   for (const { issue, schedulable } of batch) {
     inFlight.set(issue.identifier, schedulable.touches);
