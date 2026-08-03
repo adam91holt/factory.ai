@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   parsePrecondition, parsePreconditions, evaluateOne, decideFreshness, checkFreshness, liftPreconditions,
+  decidePendingMerge, checkPendingMerge,
   type Precondition, type PreconditionProbes, type PrState, type PerCheck,
 } from "../src/precondition.ts";
 import { withFactoryMeta } from "../src/meta.ts";
@@ -28,6 +29,9 @@ describe("parsePrecondition", () => {
     expect(parsePrecondition("pr-open acme/w#4")).toMatchObject({ kind: "pr-open", arg: "acme/w#4" });
     expect(parsePrecondition("pr-open #12")).toMatchObject({ kind: "pr-open", arg: "#12" });
     expect(parsePrecondition("pr-open https://github.com/acme/w/pull/4")).toMatchObject({ kind: "pr-open" });
+    expect(parsePrecondition("pr-merged acme/w#6")).toMatchObject({ kind: "pr-merged", arg: "acme/w#6" });
+    expect(parsePrecondition("pr-merged #6")).toMatchObject({ kind: "pr-merged", arg: "#6" });
+    expect(parsePrecondition("pr-merged https://github.com/acme/w/pull/6")).toMatchObject({ kind: "pr-merged" });
     expect(parsePrecondition("path-missing src/x.ts")).toMatchObject({ kind: "path-missing", arg: "src/x.ts" });
     expect(parsePrecondition("path-exists src/x.ts")).toMatchObject({ kind: "path-exists", arg: "src/x.ts" });
     expect(parsePrecondition("text-present src/a.ts::TODO")).toMatchObject({ kind: "text-present", arg: "src/a.ts::TODO" });
@@ -42,6 +46,8 @@ describe("parsePrecondition", () => {
   test("malformed args are dropped", () => {
     expect(parsePrecondition("pr-open acme/w")).toBeNull();        // no #N, not a url
     expect(parsePrecondition("pr-open")).toBeNull();               // no arg at all
+    expect(parsePrecondition("pr-merged acme/w")).toBeNull();      // same arg contract as pr-open
+    expect(parsePrecondition("pr-merged")).toBeNull();
     expect(parsePrecondition("text-present src/a.ts")).toBeNull(); // no ::needle
     expect(parsePrecondition("text-present ::needle")).toBeNull(); // empty path
     expect(parsePrecondition("text-absent src/a.ts::")).toBeNull();// empty needle
@@ -94,6 +100,13 @@ describe("evaluateOne (pure via fake probes)", () => {
     const probe = probes({ prState: (_ref: string, repo: string): PrState => { seenRepo = repo; return "OPEN"; } });
     evaluateOne(p("pr-open other/lib#7"), ctx, probe);
     expect(seenRepo).toBe("other/lib");
+  });
+
+  test("pr-merged defensive fallback (the primary gate is decidePendingMerge, pre-claim): MERGED holds (proceed), CLOSED is moot (cancel), OPEN/UNKNOWN are unknown (park, never proceed)", () => {
+    expect(evaluateOne(p("pr-merged acme/w#6"), ctx, probes({ prState: () => "MERGED" })).status).toBe("hold");
+    expect(evaluateOne(p("pr-merged acme/w#6"), ctx, probes({ prState: () => "CLOSED" })).status).toBe("moot");
+    expect(evaluateOne(p("pr-merged acme/w#6"), ctx, probes({ prState: () => "OPEN" })).status).toBe("unknown");
+    expect(evaluateOne(p("pr-merged acme/w#6"), ctx, probes({ prState: () => "UNKNOWN" })).status).toBe("unknown");
   });
 
   test("undelivered: OPEN holds, MERGED is moot, no-PR (UNKNOWN) HOLDS (rebuild)", () => {
@@ -174,7 +187,26 @@ describe("decideFreshness precedence", () => {
   });
 });
 
-describe("FAC-20 regression (the exact incident)", () => {
+describe("checkPendingMerge (probe wiring)", () => {
+  test("reads only the ticket's pr-merged preconditions — a co-declared pr-open is invisible to this gate", async () => {
+    const desc = withFactoryMeta("## Goal\nx", { type: "task", repo: "acme/w", preconditions: ["pr-open acme/w#4", "pr-merged acme/w#6"] });
+    const queried: string[] = [];
+    const probe = probes({ prState: (ref: string): PrState => { queried.push(ref); return ref === "6" ? "MERGED" : "OPEN"; } });
+    const d = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(queried).toEqual(["6"]);
+    expect(d.action).toBe("proceed");
+  });
+
+  test("a ticket with no pr-merged precondition -> proceed WITHOUT probing gh at all (zero cost for the common case)", async () => {
+    let called = false;
+    const probe = probes({ prState: (): PrState => { called = true; return "OPEN"; } });
+    const d = await checkPendingMerge("## Goal\nplain", { repo: "acme/w" }, probe);
+    expect(d.action).toBe("proceed");
+    expect(called).toBe(false);
+  });
+});
+
+describe("FAC-74 regression (the exact incident)", () => {
   test("a ticket carrying `precondition: pr-open acme/w#4` with the PR MERGED -> cancel", async () => {
     const desc = withFactoryMeta("## Goal\nmake PR #4 mergeable", { type: "task", repo: "acme/w", preconditions: ["pr-open acme/w#4"] });
     // The PR is merged; the fresh follow-up branch has no PR of its own (UNKNOWN).
@@ -190,6 +222,94 @@ describe("FAC-20 regression (the exact incident)", () => {
     const desc = withFactoryMeta("## Goal\nmake PR #4 mergeable", { type: "task", repo: "acme/w", preconditions: ["pr-open acme/w#4"] });
     const probe = probes({ prState: (ref: string): PrState => (ref === "4" ? "OPEN" : "UNKNOWN") });
     expect((await checkFreshness("FAC-99", desc, { repo: "acme/w", worktreeDir: "/wt" }, probe)).action).toBe("proceed");
+  });
+});
+
+describe("decidePendingMerge precedence (pure combinator)", () => {
+  test("no pr-merged gate declared -> proceed", () => {
+    expect(decidePendingMerge([{ p: p("path-missing src/x.ts"), state: "OPEN" }]).action).toBe("proceed");
+    expect(decidePendingMerge([]).action).toBe("proceed");
+  });
+
+  test("PR OPEN -> hold", () => {
+    expect(decidePendingMerge([{ p: p("pr-merged acme/w#6"), state: "OPEN" }]).action).toBe("hold");
+  });
+
+  test("PR state UNKNOWN -> hold (fail-safe: unreadable never reads as merged)", () => {
+    expect(decidePendingMerge([{ p: p("pr-merged acme/w#6"), state: "UNKNOWN" }]).action).toBe("hold");
+  });
+
+  test("PR MERGED -> proceed", () => {
+    expect(decidePendingMerge([{ p: p("pr-merged acme/w#6"), state: "MERGED" }]).action).toBe("proceed");
+  });
+
+  test("PR CLOSED without merging -> cancel", () => {
+    const d = decidePendingMerge([{ p: p("pr-merged acme/w#6"), state: "CLOSED" }]);
+    expect(d.action).toBe("cancel");
+    expect(d.reason).toContain("acme/w#6");
+  });
+
+  test("multiple gates: any CLOSED cancels even if another is still OPEN", () => {
+    expect(decidePendingMerge([
+      { p: p("pr-merged acme/w#5"), state: "OPEN" },
+      { p: p("pr-merged acme/w#6"), state: "CLOSED" },
+    ]).action).toBe("cancel");
+  });
+
+  test("multiple gates: all MERGED -> proceed; one still OPEN -> hold", () => {
+    expect(decidePendingMerge([
+      { p: p("pr-merged acme/w#5"), state: "MERGED" },
+      { p: p("pr-merged acme/w#6"), state: "MERGED" },
+    ]).action).toBe("proceed");
+    expect(decidePendingMerge([
+      { p: p("pr-merged acme/w#5"), state: "MERGED" },
+      { p: p("pr-merged acme/w#6"), state: "OPEN" },
+    ]).action).toBe("hold");
+  });
+});
+
+describe("FAC-74 regression (the exact incident, wait-until-merged shape)", () => {
+  // A steward follow-up filed against a still-open PR, mirroring FAC-74's
+  // "verify main is green after PR #6 lands" ticket. Pins the full life cycle
+  // the ticket demands: NOT claimed while open, runs after merge, self-cancels
+  // if the PR is closed without merging.
+  const desc = withFactoryMeta("## Goal\nverify main is green after PR #6 lands", { type: "task", repo: "acme/w", preconditions: ["pr-merged acme/w#6"] });
+
+  test("PR still OPEN -> hold (NOT claimed) — the FAC-74 race this ticket fixes", async () => {
+    const probe = probes({ prState: (ref: string): PrState => (ref === "6" ? "OPEN" : "UNKNOWN") });
+    const d = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(d.action).toBe("hold");
+  });
+
+  test("gh unreadable (UNKNOWN) -> hold, never proceeds and never cancels", async () => {
+    const probe = probes({ prState: () => "UNKNOWN" });
+    const d = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(d.action).toBe("hold");
+  });
+
+  test("PR MERGED -> proceed (runs, now safe against a main that has the content)", async () => {
+    const probe = probes({ prState: (ref: string): PrState => (ref === "6" ? "MERGED" : "UNKNOWN") });
+    const d = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(d.action).toBe("proceed");
+  });
+
+  test("PR CLOSED without merging -> cancel (self-cancels; the premise can never be satisfied)", async () => {
+    const probe = probes({ prState: (ref: string): PrState => (ref === "6" ? "CLOSED" : "UNKNOWN") });
+    const d = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(d.action).toBe("cancel");
+  });
+
+  test("a bare pr-open (the OLD, backwards-for-post-merge kind) would have cancelled on merge — pr-merged does not", async () => {
+    // Documents the exact bug this ticket fixes: decideFreshness treats a
+    // MERGED pr-open as moot -> cancel, which is backwards for a post-merge
+    // follow-up. decidePendingMerge (pr-merged) reads the SAME merged state as
+    // the green light to proceed.
+    const oldStyleDesc = withFactoryMeta("## Goal\nverify main is green after PR #6 lands", { type: "task", repo: "acme/w", preconditions: ["pr-open acme/w#6"] });
+    const probe = probes({ prState: (ref: string): PrState => (ref === "6" ? "MERGED" : "UNKNOWN") });
+    const oldVerdict = await checkFreshness("FAC-75", oldStyleDesc, { repo: "acme/w", worktreeDir: "/wt" }, probe);
+    expect(oldVerdict.action).toBe("cancel"); // the FAC-74 bug, preserved on purpose for the OLD kind
+    const newVerdict = await checkPendingMerge(desc, { repo: "acme/w" }, probe);
+    expect(newVerdict.action).toBe("proceed"); // the fix
   });
 });
 

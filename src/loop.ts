@@ -353,8 +353,11 @@ async function abortExternal(issue: linear.Issue, stages: StageResult[], where: 
  *  skip-set so it never requeues), moves the ticket to Done, and releases the
  *  claim. Reversible by construction — a human removes the label / reopens to
  *  requeue. NOT park: the goal already exists, so there is nothing for a human
- *  to unblock. */
-async function resolveStale(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
+ *  to unblock. Exported: index.ts's PRE-CLAIM `pr-merged` gate (FAC-75) also
+ *  resolves through here — its "PR closed unmerged" verdict is the same shape
+ *  of terminal resolution (goal can never happen now), just decided before a
+ *  workspace/claim ever exists, so `stages` is always [] for that caller. */
+export async function resolveStale(issue: linear.Issue, repo: string, stages: StageResult[], reason: string): Promise<void> {
   void repo; // (kept in the signature for symmetry with park/abortExternal; no repo-scoped lesson — a clean idempotent no-op is not a failure to learn from)
   bus.emit({ type: "run_finished", issueKey: issue.identifier, outcome: "stale",
     reason: redactSecrets(reason).clean.slice(0, 500), prUrl: null,

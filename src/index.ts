@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.ts";
 import { fetchQueue, fetchStatesByIdentifiers, LinearRateLimited, recoverOrphanedClaims } from "./linear.ts";
-import { processIssue, markNeedsHuman, isEligible } from "./loop.ts";
+import { processIssue, markNeedsHuman, isEligible, resolveStale } from "./loop.ts";
 import { repoFromTicket } from "./repos.ts";
 import { planIssue } from "./plan.ts";
 import { stewardTick } from "./steward.ts";
@@ -15,6 +15,7 @@ import { bootstrapProject } from "./bootstrap.ts";
 import { EPIC_LABEL, INTAKE_LABEL, BOOTSTRAP_LABEL } from "./linear.ts";
 import { parseFactoryMeta, resolveTicketRoute } from "./meta.ts";
 import { selectRunnable, deriveImplicitDeps, type Schedulable } from "./dag.ts";
+import { checkPendingMerge } from "./precondition.ts";
 import { redactSecrets } from "./agents.ts";
 import { bus } from "./events.ts";
 import { startDashboard } from "./server.ts";
@@ -174,6 +175,39 @@ async function tick(): Promise<boolean> {
     return false;
   }
 
+  // `pr-merged` scheduling gate (FAC-75, precondition.ts): a steward follow-up
+  // whose work only makes sense AFTER a specific PR lands must not be claimed
+  // while that PR is still open — the FAC-74 shape (a "verify main is green
+  // after #6 lands" follow-up raced #6's merge by two hours and rebuilt
+  // ~1650 lines of it). Unlike depends_on (topological order among an epic's
+  // OWN children, below) and unlike every other precondition kind (self-
+  // cancel liveness premises, evaluated post-claim in loop.ts's freshness
+  // gate), `pr-merged` is checked HERE, pre-claim: holding costs nothing (no
+  // workspace, no label) and the ticket is simply re-checked next tick;
+  // "cancel" (its PR closed unmerged) resolves the ticket the same terminal
+  // way any other self-cancelled precondition does. Cheap for the common case
+  // — checkPendingMerge is a no-op (no gh call) for a ticket with no
+  // `pr-merged` precondition.
+  const claimable = [];
+  for (const issue of eligible) {
+    const repo = repoFromTicket(issue.description) ?? ""; // isEligible guarantees non-null
+    const gate = await checkPendingMerge(issue.description, { repo }).catch((error) => {
+      console.error(`[${issue.identifier}] pr-merged gate check failed — holding (fail-safe): ${error instanceof Error ? error.message : error}`);
+      return { action: "hold" as const, reason: "pr-merged gate check errored" };
+    });
+    if (gate.action === "hold") { console.log(`[dag] ${issue.identifier} pr-merged gate holding: ${gate.reason}`); continue; }
+    if (gate.action === "cancel") {
+      await resolveStale(issue, repo, [], gate.reason).catch((error) => console.error(`[${issue.identifier}] pr-merged cancel failed: ${error instanceof Error ? error.message : error}`));
+      continue;
+    }
+    claimable.push(issue);
+  }
+  if (claimable.length === 0) {
+    bus.emit({ type: "tick_finished", queued: queue.length, eligible: eligible.length, markedNeedsHuman: queue.length - eligible.length, processed: 0 });
+    await runBackgroundPasses();
+    return false;
+  }
+
   // Rolling WIP semaphore (owner request): claim whenever capacity exists —
   // never barrier a fast issue behind a slow sibling's completion. Gap 1 layers
   // DAG scheduling on top: a candidate is claimed only when its declared
@@ -183,7 +217,7 @@ async function tick(): Promise<boolean> {
   // Draining → zero capacity: selectRunnable defers every candidate, so the
   // batch below is empty and nothing new gets claimed (B6/T5, control.ts).
   const capacity = isDraining() ? 0 : config.caps.wipLimit - inFlight.size;
-  const candidates = eligible
+  const candidates = claimable
     .filter((i) => !inFlight.has(i.identifier))
     .map((issue) => {
       const meta = parseFactoryMeta(issue.description);
