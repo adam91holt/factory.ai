@@ -23,13 +23,13 @@ import { fileApproval, shouldFileApproval } from "./approvals.ts";
 import { decideMerge, effectiveMergeTier, buildMergeEvidence, deferMergeForDeps, guardBypassAllowed, isSelfRepo, type BrowserEvidence, type MergeDecision } from "./merge-ladder.ts";
 import { renderPrompt, cardEffort, cardPin, listRoutableCards } from "./catalog.ts";
 import { selectSkills, buildSkillBlock, type SkillSelection, type StagePin } from "./skills.ts";
-import { GATE_OUTPUT_SCHEMA, resolveGateOutput, renderFindings, type GateOutput, type GateVerdict } from "./gate.ts";
+import { GATE_OUTPUT_SCHEMA, resolveGateOutput, renderFindings, collectFindings, findingsFiles, buildFixerFindingsBlock, type GateOutput, type GateVerdict, type FindingsLeg } from "./gate.ts";
 import { buildReport, type ReportInput, type RoutingEntry, type GateVerdictEntry } from "./report.ts";
 import { bus, toStageMeta, type AgentStreamEvent, type RunOutcome } from "./events.ts";
 import { captureLesson, buildLessonsBlock, lessonsForRepo } from "./lessons.ts";
 import { projectOwningRepo } from "./db.ts";
 import { projectModelOverrides } from "./project-config.ts";
-import { buildWriteGuardHooks } from "./write-guard.ts";
+import { buildWriteGuardHooks, buildFixerWritableScope } from "./write-guard.ts";
 
 // Per-issue pipeline, hardened per code-review verdict 2026-07-20:
 // budget threaded cumulatively (C11), deadline before every stage + abort (C12),
@@ -845,9 +845,13 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // today, so this is pure telemetry until the operator opts into tiers.
     // NOT a merge input: nothing here reaches buildMergeEvidence/decideMerge.
     const guardedForRisk = guardedPathsTouched(ws);
+    // Reused below (ticket #7) as half of the fixer's write-scope: the union
+    // of every file the implementer touched and every file a fixer round's
+    // own findings name (write-guard.ts buildFixerWritableScope).
+    const implementerTouchedFiles = diffFilePaths(diff);
     const risk = deriveRiskClass({
       diffLines: countDiffLines(diff),
-      paths: diffFilePaths(diff),
+      paths: implementerTouchedFiles,
       guardedPaths: guardedForRisk.filter((p) => p !== DIFF_FAILED),
       diffUnavailable: guardedForRisk.includes(DIFF_FAILED),
       testFilesRemoved: testFilesRemoved(ws).length > 0,
@@ -921,10 +925,42 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
     // design — they are cheap to rerun and their independence is the point.
     pinStage("fixer", fixerRoute.card, "fixer");
     const specForFixer = indexBlockForStage(fixerRoute.tools, refreshSkillsBefore("fixer")) + skillBlockFor("fixer") + spec;
-    const fixPrompt = ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec: specForFixer, reviews: untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`) },
-        `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${specForFixer}\n\n${untrusted(`REVIEW 1:\n${reviewSpecText}\n\nREVIEW 2:\n${reviewRepoText}`)}`);
+    // Ticket #7: the fixer prompt is built FROM the two reviewers' structured
+    // findings (grouped by file, most severe first) instead of injecting raw
+    // review prose — paired with the write-guard scope below so the fixer's
+    // write access is restricted to exactly the files findings named (plus
+    // whatever the implementer already touched). Findings still originated
+    // from untrusted ticket/diff-derived review text, so the whole block stays
+    // untrusted()-wrapped; a leg with no structured findings from a genuine
+    // fail/uncertain (or unresolved) falls back to its labeled raw text so
+    // nothing real is silently dropped — a leg that simply PASSED never does.
+    //
+    // agents/fixer.md is a factory-guarded path this run cannot edit (denied
+    // at tool-call time; guarded files force human review), and renderPrompt
+    // (catalog.ts) uses that card's own body whenever the card exists — the
+    // 3rd/fallback argument below is DEAD on the normal path. So the "edit
+    // only named files" instruction is prepended, as trusted operator text
+    // OUTSIDE the untrusted() wrapper, onto the value substituted for
+    // {{reviews}} itself, reaching the model on both the card and fallback
+    // paths instead of living only in prose renderPrompt will never use.
+    const reviewLegs: FindingsLeg[] = [
+      { label: "reviewer-spec", gate: reviewSpecGate, rawText: reviewSpecText },
+      { label: "reviewer-repo", gate: reviewRepoGate, rawText: reviewRepoText },
+    ];
+    const reviewFindings = collectFindings(reviewLegs);
+    const reviewsForFixer = buildFixerFindingsBlock(reviewLegs);
+    const FIXER_SCOPE_INSTRUCTION = "EDIT ONLY the files named in the findings below — do not restyle or refactor anything beyond what a finding names, even if you notice something else you'd change; your write access this round is scoped to exactly those files plus what the implementer already touched.\n\n";
+    const reviewsBlockForFixer = FIXER_SCOPE_INSTRUCTION + untrusted(reviewsForFixer);
+    // A leg that fell back to raw, unstructured text names no file the scope
+    // can trust — scoping writes then would deny the very fix being asked
+    // for, so the whole round stays unscoped (pre-ticket-#7 behavior).
+    const anyUnstructuredFixerLeg = reviewLegs.some((l) => l.gate === null || (l.gate.verdict !== "pass" && l.gate.findings.length === 0));
+    const fixerWritableScope = anyUnstructuredFixerLeg ? undefined : buildFixerWritableScope(implementerTouchedFiles, findingsFiles(reviewFindings));
+    const fixerWriteGuardHooks = guardBypass ? undefined : buildWriteGuardHooks(ws.dir, fixerWritableScope ? { writableScope: fixerWritableScope } : {});
+    const fixPrompt = ownerFeedbackBlock + renderPrompt(fixerRoute.card, { spec: specForFixer, reviews: reviewsBlockForFixer },
+        `You are the fixer in an automated pipeline. Two independent reviewers examined the latest change in this worktree against the ticket; their findings are grouped below BY FILE, most severe (blocker) first. Evaluate each finding, fix the real ones, reject ones that contradict the ticket. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${specForFixer}\n\n${reviewsBlockForFixer}`);
     const fixDelegates = delegatesFor(fixerRoute);
-    const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
+    const fixOpts = { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(fixerWriteGuardHooks ? { hooks: fixerWriteGuardHooks } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent,
       ...(fixDelegates ? { delegates: fixDelegates } : {}), ...skillPinsOpt,
       onSessionId: (id: string) => recordStageSession(issue.identifier, "fixer", id) };
     // Resume order: this fixer's OWN interrupted session first (recovery), else
@@ -997,9 +1033,25 @@ export async function processIssue(issue: linear.Issue): Promise<void> {
       let designGate = resolveGateOutput(design, tasteTokenVerdict);
       await postStageComment(issue, design, gateStageText(designGate, design));
       for (let round = 1; round < maxTasteRounds && tasteFixRoundWarranted(designGate) && !budget.expired; round++) {
+        // Same findings-driven-prompt + write-scope treatment as the fixer
+        // above (ticket #7): the design-fixer has no card file (its prompt is
+        // fully inline), so the "edit only named files" instruction lives
+        // directly in this prompt string. touchedSoFar is recomputed from the
+        // CURRENT designDiff each round (not the implementer's original diff,
+        // which goes stale once a prior design-fixer round itself touches
+        // files) so a later round's scope also covers what an earlier round
+        // legitimately added.
+        const designLegs: FindingsLeg[] = [{ label: "design-reviewer", gate: designGate, rawText: gateStageText(designGate, design) }];
+        const designFindings = collectFindings(designLegs);
+        const designFindingsBlock = buildFixerFindingsBlock(designLegs);
+        const touchedSoFar = diffFilePaths(designDiff);
+        // A fail verdict with zero structured findings names no file the
+        // scope can trust — stay unscoped rather than deny the fix requested.
+        const designWritableScope = designFindings.length === 0 ? undefined : buildFixerWritableScope(touchedSoFar, findingsFiles(designFindings));
+        const designFixWriteGuardHooks = guardBypass ? undefined : buildWriteGuardHooks(ws.dir, designWritableScope ? { writableScope: designWritableScope } : {});
         const designFix = await runStage(round === 1 ? "design-fixer" : `design-fixer-${round}`,
-          `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${gateStageText(designGate, design)}`)}`,
-          { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(writeGuardHooks ? { hooks: writeGuardHooks } : {}), ...(warmLineage.sessionId ? { resume: warmLineage.sessionId } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
+          `You are the fixer in an automated pipeline, addressing the design/taste review of a UI change in this worktree; its findings are grouped below by file, most severe first. Apply the findings below as real moves — motion, feedback, density, distinctiveness — not renames. Follow docs/design-language.md and skills/game-feel/SKILL.md. Edit ONLY the files named in the findings below — do not restyle or refactor beyond them; your write access this round is scoped to exactly those files plus what the implementer already touched. Never weaken or delete tests. Sanity-check with the repo's own scripts. Reply with one line per finding: fixed / rejected (why).\n\n${spec}\n\n${untrusted(`DESIGN REVIEW (taste gate) — address these:\n${designFindingsBlock}`)}`,
+          { model: fixModel, effort: fixEffort, cwd: ws.dir, ...(designFixWriteGuardHooks ? { hooks: designFixWriteGuardHooks } : {}), ...(warmLineage.sessionId ? { resume: warmLineage.sessionId } : {}), allowedTools: fixerRoute.tools, maxTurns: config.caps.turnsFixer, issueKey: issue.identifier, budgetUsd: budget.remainingUsd, deadlineMs: budget.deadlineMs, onEvent });
         stages.push(designFix);
         await postStageComment(issue, designFix);
         commitAll(ws, `${issue.identifier}: apply design-review feedback (round ${round})`);
