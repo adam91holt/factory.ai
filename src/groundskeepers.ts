@@ -483,17 +483,14 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
   const parkSpike = parksLast24h > 3;
 
   const repo = card.repos[0] ?? "";
-  const outDir = join(config.workRoot, ".groundskeeper-scratch", card.name);
-  rmSync(outDir, { recursive: true, force: true });
-  mkdirSync(join(outDir, "tickets"), { recursive: true });
 
   // cwd = a throwaway worktree of the first repo (read-only; never pushed),
   // hard-reset to origin's CURRENT head each run — a reused worktree must not
   // review the frozen snapshot it was created from. Workspace failure SKIPS the
   // run: reviewing an empty scratch dir would file tickets grounded in nothing.
-  // No repo configured → the scratch dir, so a board/telemetry-only
+  // No repo configured → a scratch dir under workRoot, so a board/telemetry-only
   // groundskeeper still runs.
-  let cwd = outDir;
+  let cwd: string;
   if (repo) {
     try {
       const ws = await ensureWorkspace(repo, `${card.name}-gk`);
@@ -503,19 +500,35 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
       console.error(`[gk:${card.name}] workspace for ${repo} failed — skipping run: ${error instanceof Error ? error.message : error}`);
       return false;
     }
+  } else {
+    cwd = join(config.workRoot, ".groundskeeper-scratch", card.name);
+    mkdirSync(cwd, { recursive: true });
   }
 
-  // Read tools ∩ card list, PLUS Write SCOPED to the scratch dir. outDir is
-  // ALREADY an absolute path (join(config.workRoot, ...)), so the rule is
-  // `Write(<abs>/**)` — a SINGLE leading slash. (Live-found 2026-08-03: the old
-  // `Write(/${outDir}/**)` produced a DOUBLE slash `//home/...` that the SDK's
-  // dontAsk matcher never matched, so every groundskeeper Write was denied and
-  // no card could ever file a ticket — the first real groundskeeper run
-  // surfaced it; the factory's own card ships disabled so it was never
-  // exercised.) A bare "Write" under dontAsk would let a prompt-injected run
-  // rewrite groundskeepers/*.md (self-arming), the state file, or factory src —
-  // output files only, no Bash ever.
-  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), `Write(${outDir}/**)`])];
+  // Output dir lives INSIDE cwd. Claude Code Write permissions are matched
+  // RELATIVE TO THE WORKING DIRECTORY, so the old out-of-tree scratch dir
+  // (workRoot/.groundskeeper-scratch/<card>, outside the repo cwd) could NEVER
+  // be granted by any Write(...) rule — every groundskeeper Write was silently
+  // denied and no card could file a ticket (live-found 2026-08-03; the factory's
+  // own card ships disabled so it was never exercised). `.gk-out` under cwd lets
+  // the cwd-relative rule Write(.gk-out/**) actually grant it. Recreated each
+  // run; the groundskeeper never commits, so it stays an untracked dir.
+  const outDir = join(cwd, ".gk-out");
+  rmSync(outDir, { recursive: true, force: true });
+  mkdirSync(join(outDir, "tickets"), { recursive: true });
+
+  // Read tools ∩ card list, PLUS bare "Write". IMPORTANT (live-found
+  // 2026-08-03): under permissionMode "dontAsk" the SDK grants tools by BARE
+  // NAME only — a SCOPED rule like `Write(.gk-out/**)` is NOT recognised as
+  // granting Write, so every groundskeeper Write was denied (the implementer,
+  // which works, uses bare "Write"). Confinement instead comes from the SDK's
+  // built-in workspace boundary: Write/Edit are restricted to the cwd tree, and
+  // cwd is a THROWAWAY worktree that is reset each run and never committed or
+  // pushed. So the prompt-injection concerns the old scope guarded against —
+  // rewriting groundskeepers/*.md (self-arming), the state file, or factory
+  // src — are all OUTSIDE the worktree and remain unreachable; a stray write to
+  // another worktree file is harmless (discarded on reset). No Bash ever.
+  const allowedTools = [...new Set([...card.tools.filter((t) => READONLY_TOOLS.includes(t)), "Write"])];
 
   const tel = await getTelemetry();
   const telSummary = [
@@ -547,9 +560,9 @@ async function runGroundskeeper(card: GroundskeeperCard): Promise<boolean> {
     "",
     "You are a groundskeeper: a scheduled work generator for THIS project. Review the repository in your working directory, the team board, and the telemetry above, then DECIDE what (if anything) is worth building. You have read-only tools only; you cannot change the repo or the board. The daemon files whatever tickets you write.",
     "",
-    "OUTPUT PROTOCOL — write files under this absolute directory (it already exists):",
-    `- To file work: ${ticketsDir}/<NN>-<slug>.md (NN = 01, 02, ...), at MOST ${card.maxTicketsPerRun} file(s). First line: "# <title>". The rest MUST follow the factory ticket contract exactly: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo || "the project repo"}), ## Verifications (Automated / Manual / Visual), ## Area (the file paths this ticket owns).`,
-    `- If nothing clears the bar: write ${join(outDir, "decision.md")} explaining what you reviewed and WHY nothing is worth doing. "Nothing worth doing" is a first-class, respected outcome — never invent low-value work to fill the quota.`,
+    "OUTPUT PROTOCOL — write files under the `.gk-out/` directory in your working directory (it already exists). Use these RELATIVE paths exactly; only `.gk-out/**` is writable (nothing else, and no Bash):",
+    `- To file work: .gk-out/tickets/<NN>-<slug>.md (NN = 01, 02, ...), at MOST ${card.maxTicketsPerRun} file(s). First line: "# <title>". The rest MUST follow the factory ticket contract exactly: ## Goal, ## Why, ## Outcomes (checkbox list), ## Repo (${repo || "the project repo"}), ## Verifications (Automated / Manual / Visual), ## Area (the file paths this ticket owns).`,
+    `- If nothing clears the bar: write .gk-out/decision.md explaining what you reviewed and WHY nothing is worth doing. "Nothing worth doing" is a first-class, respected outcome — never invent low-value work to fill the quota.`,
     "Then reply with one line summarising your decision.",
   ].join("\n");
 
